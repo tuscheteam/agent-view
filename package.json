@@ -1,0 +1,181 @@
+{
+  "name": "agent-view",
+  "displayName": "Agent View",
+  "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
+  "publisher": "tuscheteam",
+  "version": "0.9.0",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "AI"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Open Editors Tools",
+      "properties": {
+        "openEditorsTools.recentFirst": {
+          "type": "boolean",
+          "default": false,
+          "description": "Move the editor you just activated to the top of its group, so OPEN EDITORS reads most-recent-first. Pinned editors keep their own block at the top and are never reordered."
+        },
+        "openEditorsTools.closedChatHours": {
+          "type": "number",
+          "default": 48,
+          "description": "Also list chats whose tab was closed, if their session was active within this many hours. Click a row to reopen it. 0 hides closed chats."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "openEditorsTools.newClaudeChat",
+        "title": "New Claude Chat",
+        "category": "Open Editors",
+        "icon": {
+          "light": "resources/claude.svg",
+          "dark": "resources/claude.svg"
+        }
+      },
+      {
+        "command": "openEditorsTools.newCodexChat",
+        "title": "New Codex Agent",
+        "category": "Open Editors",
+        "icon": {
+          "light": "resources/codex.svg",
+          "dark": "resources/codex.svg"
+        }
+      },
+      {
+        "command": "openEditorsTools.pin",
+        "title": "Pin Active Editor",
+        "category": "Open Editors",
+        "icon": "$(pin)"
+      },
+      {
+        "command": "openEditorsTools.unpin",
+        "title": "Unpin Active Editor",
+        "category": "Open Editors",
+        "icon": "$(pinned)"
+      },
+      {
+        "command": "openEditorsTools.refreshChats",
+        "title": "Refresh Chats",
+        "category": "Open Editors",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "openEditorsTools.focusChat",
+        "title": "Focus Chat",
+        "category": "Open Editors"
+      },
+      {
+        "command": "openEditorsTools.openCodexThread",
+        "title": "Open Codex Conversation in Tab",
+        "category": "Open Editors",
+        "icon": "$(history)"
+      },
+      {
+        "command": "openEditorsTools.openClaudeSession",
+        "title": "Open Claude Session in Tab",
+        "category": "Open Editors",
+        "icon": "$(history)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "openEditorsToolsChats",
+          "title": "Chats",
+          "icon": "resources/claude.svg"
+        }
+      ]
+    },
+    "views": {
+      "openEditorsToolsChats": [
+        {
+          "id": "openEditorsTools.usage",
+          "name": "Usage",
+          "type": "webview",
+          "initialSize": 1
+        },
+        {
+          "id": "openEditorsTools.chats",
+          "name": "Chats",
+          "initialSize": 6
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "openEditorsTools.focusChat",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "openEditorsTools.newClaudeChat",
+          "when": "view == openEditorsTools.chats",
+          "group": "navigation@1"
+        },
+        {
+          "command": "openEditorsTools.openClaudeSession",
+          "when": "view == openEditorsTools.chats",
+          "group": "navigation@2"
+        },
+        {
+          "command": "openEditorsTools.newCodexChat",
+          "when": "view == openEditorsTools.chats",
+          "group": "navigation@3"
+        },
+        {
+          "command": "openEditorsTools.openCodexThread",
+          "when": "view == openEditorsTools.chats",
+          "group": "navigation@4"
+        },
+        {
+          "command": "openEditorsTools.refreshChats",
+          "when": "view == openEditorsTools.chats",
+          "group": "navigation@5"
+        },
+        {
+          "command": "openEditorsTools.newClaudeChat",
+          "when": "view == workbench.explorer.openEditorsView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "openEditorsTools.pin",
+          "when": "view == workbench.explorer.openEditorsView && !activeEditorIsPinned",
+          "group": "navigation@2"
+        },
+        {
+          "command": "openEditorsTools.unpin",
+          "when": "view == workbench.explorer.openEditorsView && activeEditorIsPinned",
+          "group": "navigation@2"
+        }
+      ]
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tuscheteam/agent-view"
+  },
+  "keywords": [
+    "claude",
+    "claude code",
+    "codex",
+    "chatgpt",
+    "agent",
+    "usage",
+    "tokens"
+  ],
+  "extensionKind": [
+    "workspace"
+  ]
+}
