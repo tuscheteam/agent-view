@@ -68,11 +68,21 @@ function claudeConfigDir() {
 // Streamed line by line: long-running sessions grow transcripts into the
 // tens of megabytes, and
 // reading those whole would spike memory every refresh.
+function stampOf(record, fallback) {
+	const ms = Date.parse(record.timestamp || '');
+	return Number.isNaN(ms) ? fallback : ms;
+}
+
 async function readTranscript(file) {
 	const totals = { input: 0, output: 0, cacheRead: 0, write5m: 0, write1h: 0 };
 	// tool_use id -> tool name, cleared when the matching tool_result lands.
 	// Whatever is still here at EOF is what the agent is waiting on.
 	const pending = new Map();
+	// Every title the session ever carried. A rename appends a new record, but
+	// resume can replay stale ones after it — one real transcript ended on the
+	// OLD title while its tab showed the new one. The last record is therefore
+	// not authoritative; any recorded title may be the one on the tab.
+	const titles = new Set();
 	let customTitle = null;
 	let aiTitle = null;
 	let model = null;
@@ -80,6 +90,11 @@ async function readTranscript(file) {
 	let cost = 0;
 	let messages = 0;
 	let lastStop = null;
+	// When the agent last finished speaking, and when you last spoke. Both drive
+	// the unread mark: a reply newer than your own last turn is one you have not
+	// answered, and typing is proof you had read what came before it.
+	let lastReplyAt = 0;
+	let lastUserAt = 0;
 
 	const rl = readline.createInterface({
 		input: fs.createReadStream(file, { encoding: 'utf8' }),
@@ -91,8 +106,8 @@ async function readTranscript(file) {
 		let record;
 		try { record = JSON.parse(line); } catch (_) { continue; }
 
-		if (record.type === 'custom-title' && record.customTitle) customTitle = record.customTitle;
-		else if (record.type === 'ai-title' && record.aiTitle) aiTitle = record.aiTitle;
+		if (record.type === 'custom-title' && record.customTitle) { customTitle = record.customTitle; titles.add(record.customTitle); }
+		else if (record.type === 'ai-title' && record.aiTitle) { aiTitle = record.aiTitle; titles.add(record.aiTitle); }
 
 		const message = record.message;
 		if (message && Array.isArray(message.content)) {
@@ -103,6 +118,13 @@ async function readTranscript(file) {
 		}
 		if (message && message.role === 'assistant' && message.stop_reason !== undefined) {
 			lastStop = message.stop_reason;
+			if (message.stop_reason === 'end_turn') lastReplyAt = stampOf(record, lastReplyAt);
+		}
+		// A real turn you typed. Tool results and injected context also arrive as
+		// role "user", so they are excluded — they prove nothing about reading.
+		if (record.type === 'user' && !record.isMeta && !record.isSidechain && message
+			&& !(Array.isArray(message.content) && message.content.some((b) => b.type === 'tool_result'))) {
+			lastUserAt = stampOf(record, lastUserAt);
 		}
 
 		const usage = message && message.usage;
@@ -143,6 +165,7 @@ async function readTranscript(file) {
 
 	return {
 		title: customTitle || aiTitle,
+		titles,
 		model,
 		contextTokens,
 		contextLimit: ratesFor(model).ctx,
@@ -150,6 +173,8 @@ async function readTranscript(file) {
 		messages,
 		totals,
 		lastStop,
+		lastReplyAt,
+		lastUserAt,
 		pendingTools: [...pending.values()],
 	};
 }
@@ -316,17 +341,17 @@ function liveSessionIds() {
 	return ids;
 }
 
-// Only two states earn a dot — the ones that want something from you. A
-// finished chat is the resting state and stays unmarked, or every row would
-// carry a badge and none of them would mean anything.
-function stateOf(entry, live) {
+// Only states that want something from you earn a dot. A chat you have already
+// read is the resting state and stays unmarked, or every row would carry a
+// badge and none of them would mean anything.
+function stateOf(entry, live, seen) {
 	if (!entry) return 'unknown';
-	if (!live) return 'idle';
+	if (!live) return seen && seen.isUnread(entry) ? 'unread' : 'idle';
 	// An aborted turn leaves its tool_use blocks unanswered forever, so a
 	// non-empty pending list is not on its own proof of work in flight. The
 	// last assistant message's stop_reason is: `tool_use` means the turn is
 	// still mid-flight, `end_turn` means it closed and the leftovers are stale.
-	if (entry.lastStop !== 'tool_use') return 'idle';
+	if (entry.lastStop !== 'tool_use') return seen && seen.isUnread(entry) ? 'unread' : 'idle';
 	if (entry.pendingTools.includes('AskUserQuestion')) return 'question';
 	return 'running';
 }
@@ -376,12 +401,14 @@ class TranscriptIndex {
 			}
 			entry.lastActivity = stat.mtimeMs;
 
-			if (!entry.title) continue;
-			const key = entry.title.trim().toLowerCase();
-			// A title can be reused across sessions — the newest wins, since
-			// that is the one the open tab is actually running.
-			const existing = titles.get(key);
-			if (!existing || entry.lastActivity > existing.lastActivity) titles.set(key, entry);
+			// Index under every title the session ever carried, so a tab whose
+			// label is an earlier name still finds its transcript. Newest entry
+			// wins when sessions share a title.
+			for (const t of entry.titles || (entry.title ? [entry.title] : [])) {
+				const key = t.trim().toLowerCase();
+				const existing = titles.get(key);
+				if (!existing || entry.lastActivity > existing.lastActivity) titles.set(key, entry);
+			}
 		}
 		this.byTitle = titles;
 	}
@@ -390,16 +417,21 @@ class TranscriptIndex {
 		return label ? this.byTitle.get(label.trim().toLowerCase()) : undefined;
 	}
 
-	// A brand-new chat has a transcript from its first message, but no title
-	// record until the session names itself — so a title lookup misses and the
-	// row reads "no transcript yet". Match those by recency instead: the newest
-	// untitled transcript that no other row has claimed.
-	untitledSince(cutoffMs, claimed) {
+	// Fallback for tabs the title index cannot place: a brand-new chat has no
+	// title record yet, and a just-renamed chat has a label no record carries.
+	// Candidates are unclaimed transcripts that are either running right now
+	// (their session id appears in ~/.claude/sessions) or untitled and recent.
+	// Live beats recent: a running session's transcript belongs to SOME open
+	// tab, however old its last write.
+	unclaimedSince(cutoffMs, claimed, live) {
 		let best = null;
+		const rank = (entry) => (live && live.has(entry.sessionId) ? 1 : 0);
 		for (const entry of this.byFile.values()) {
-			if (entry.title || entry.lastActivity < cutoffMs) continue;
 			if (claimed.has(entry.sessionId)) continue;
-			if (!best || entry.lastActivity > best.lastActivity) best = entry;
+			const isLive = live && live.has(entry.sessionId);
+			if (!isLive && (entry.title || entry.lastActivity < cutoffMs)) continue;
+			if (!best || rank(entry) > rank(best)
+				|| (rank(entry) === rank(best) && entry.lastActivity > best.lastActivity)) best = entry;
 		}
 		if (best) claimed.add(best.sessionId);
 		return best;
@@ -632,6 +664,11 @@ const DECORATION = {
 		color: 'charts.blue',
 		tooltip: 'Agent is working',
 	},
+	unread: {
+		badge: '●',
+		color: 'charts.green',
+		tooltip: 'New reply you have not read',
+	},
 };
 
 class ChatDecorations {
@@ -674,14 +711,65 @@ class ChatDecorations {
 	}
 }
 
+// What you have already read, per session, surviving reloads and restarts in
+// globalState. VS Code exposes no "user looked at this webview" event, so the
+// panel infers it: a chat is read while its tab is the active one in the
+// active group and the window has focus. Two more things count as reading —
+// your own last turn in the transcript (you cannot type a reply to something
+// you did not read), and first sight of a session, since a fresh install must
+// not light up every chat in the history at once.
+const SEEN_KEY = 'openEditorsTools.seen';
+const SEEN_MAX = 500;
+
+class SeenStore {
+	constructor(memento) {
+		this.memento = memento;
+		this.map = new Map(Object.entries(memento ? memento.get(SEEN_KEY, {}) : {}));
+		this.dirty = false;
+	}
+
+	// Called for every session the panel knows about, so an unseen id gets its
+	// baseline before it can ever count as unread.
+	seed(entry) {
+		if (!entry || this.map.has(entry.sessionId)) return;
+		this.map.set(entry.sessionId, entry.lastActivity || Date.now());
+		this.dirty = true;
+	}
+
+	mark(sessionId, when) {
+		if (!sessionId) return;
+		const at = when || Date.now();
+		if ((this.map.get(sessionId) || 0) >= at) return;
+		this.map.set(sessionId, at);
+		this.dirty = true;
+	}
+
+	isUnread(entry) {
+		if (!entry || !entry.lastReplyAt) return false;
+		const floor = Math.max(this.map.get(entry.sessionId) || 0, entry.lastUserAt || 0);
+		return entry.lastReplyAt > floor;
+	}
+
+	flush() {
+		if (!this.dirty || !this.memento) return;
+		this.dirty = false;
+		// Newest first, capped — the store would otherwise grow for the life of
+		// the install, one entry per session ever opened.
+		const kept = [...this.map.entries()].sort((a, b) => b[1] - a[1]).slice(0, SEEN_MAX);
+		this.map = new Map(kept);
+		this.memento.update(SEEN_KEY, Object.fromEntries(kept));
+	}
+}
+
 function uriFor(sessionId) {
 	return vscode.Uri.parse(`${CHAT_SCHEME}:/${sessionId}`);
 }
 
 class ChatsProvider {
-	constructor(index, extensionUri, decorations) {
+	constructor(index, extensionUri, decorations, seen) {
 		this.index = index;
 		this.decorations = decorations;
+		this.seen = seen;
 		// The Claude asterisk, so a row reads the same as the tab it points at.
 		// A codicon would render monochrome and look nothing like OPEN EDITORS.
 		this.icon = vscode.Uri.joinPath(extensionUri, 'resources', 'claude.svg');
@@ -689,11 +777,20 @@ class ChatsProvider {
 		this.codex = new CodexIndex();
 		this._onDidChangeTreeData = new vscode.EventEmitter();
 		this.onDidChangeTreeData = this._onDidChangeTreeData.event;
+		// Rendered top-level items, and the tab each one stands for. The tree
+		// selection is driven from these — see syncSelection() in register().
+		this.items = [];
+		this.itemByTab = new Map();
+		this._onDidRender = new vscode.EventEmitter();
+		this.onDidRender = this._onDidRender.event;
 	}
 
 	refresh() { this._onDidChangeTreeData.fire(); }
 
 	getTreeItem(element) { return element; }
+
+	// reveal() walks upward from the target, so children must name their row.
+	getParent(element) { return element.parentItem || null; }
 
 	async getChildren(element) {
 		// Child level: the running subagents attached to a chat row.
@@ -715,10 +812,16 @@ class ChatsProvider {
 		}
 		const untitledCutoff = Date.now() - 3600000;
 
+		// The one chat you are actually looking at right now, if any.
+		const activeGroup = vscode.window.tabGroups.all.find((g) => g.isActive);
+		const activeTab = vscode.window.state.focused && activeGroup ? activeGroup.activeTab : null;
+
 		const rows = claudeTabs().map((t) => {
 			const data = this.index.lookup(t.tab.label)
-				|| this.index.untitledSince(untitledCutoff, claimed);
-			const state = stateOf(data, data && live.has(data.sessionId));
+				|| this.index.unclaimedSince(untitledCutoff, claimed, live);
+			this.seen.seed(data);
+			if (data && t.tab === activeTab) this.seen.mark(data.sessionId);
+			const state = stateOf(data, data && live.has(data.sessionId), this.seen);
 			// Every chat gets the subagent scan, not just running ones: their
 			// tokens count towards the chat's total whether or not they are
 			// still working. Summaries are cached by mtime+size, so a settled
@@ -730,6 +833,7 @@ class ChatsProvider {
 		});
 		this.hasRunningSubagents = rows.some((r) => r.subs && r.subs.length);
 		this.decorations.replace(rows.map((r) => [r.data && r.data.sessionId, r.state]));
+		this.seen.flush();
 
 		// Codex threads carry no pending-tool or liveness signal, so they never
 		// take a status dot — only Claude rows do.
@@ -751,12 +855,19 @@ class ChatsProvider {
 			const newestByTitle = new Map();
 			for (const entry of this.index.byFile.values()) {
 				if (!entry.title || entry.lastActivity < cutoff) continue;
+				// A transcript claimed by an open tab is not a closed chat, even
+				// when its stored title differs from the tab label — the rename
+				// case produced a phantom closed row of the chat's old name.
+				if (claimed.has(entry.sessionId)) continue;
 				const key = entry.title.trim().toLowerCase();
 				if (openTitles.has(key)) continue;
 				const seen = newestByTitle.get(key);
 				if (!seen || entry.lastActivity > seen.lastActivity) newestByTitle.set(key, entry);
 			}
 			for (const entry of newestByTitle.values()) {
+				// Seeded but never marked unread: you closed the tab, so a dot on
+				// a closed row would be noise rather than news.
+				this.seen.seed(entry);
 				rows.push({ kind: 'claude-closed', data: entry });
 			}
 			const openCodexIds = new Set(rows.filter((r) => r.kind === 'codex').map((r) => r.conversationId));
@@ -782,16 +893,23 @@ class ChatsProvider {
 			|| (b.data ? b.data.lastActivity : 0) - (a.data ? a.data.lastActivity : 0));
 
 		// Usage lives in its own webview above this tree — see usageView.js.
-		return rows.map((row) => {
-			if (row.kind === 'codex') return this._codexItem(row);
-			if (row.kind === 'claude-closed') return this._closedClaudeItem(row.data);
-			if (row.kind === 'codex-closed') return this._closedCodexItem(row);
-			return this._item(row);
+		const items = rows.map((row) => {
+			const item = row.kind === 'codex' ? this._codexItem(row)
+				: row.kind === 'claude-closed' ? this._closedClaudeItem(row.data)
+				: row.kind === 'codex-closed' ? this._closedCodexItem(row)
+				: this._item(row);
+			item.expandable = Boolean(item.subagentItems && item.subagentItems.length);
+			return { item, tab: row.tab };
 		});
+		this.items = items.map((x) => x.item);
+		this.itemByTab = new Map(items.filter((x) => x.tab).map((x) => [x.tab, x.item]));
+		this._onDidRender.fire();
+		return this.items;
 	}
 
 	_closedClaudeItem(data) {
 		const item = new vscode.TreeItem(data.title, vscode.TreeItemCollapsibleState.None);
+		item.id = `closed:${data.sessionId}`;
 		// Codicon, not the logo — closed rows should read as a different class
 		// of thing at a glance.
 		item.iconPath = new vscode.ThemeIcon('history');
@@ -808,6 +926,7 @@ class ChatsProvider {
 
 	_closedCodexItem(row) {
 		const item = new vscode.TreeItem(row.data.title, vscode.TreeItemCollapsibleState.None);
+		item.id = `codex-closed:${row.conversationId}`;
 		item.iconPath = new vscode.ThemeIcon('history');
 		item.contextValue = 'closedCodexChat';
 		item.description = [formatAge(row.data.lastActivity), 'closed', row.data.model].filter(Boolean).join(' · ');
@@ -823,6 +942,9 @@ class ChatsProvider {
 	_codexItem(row) {
 		const { tab, groupIndex, tabIndex, data, conversationId } = row;
 		const item = new vscode.TreeItem(tab.label, vscode.TreeItemCollapsibleState.None);
+		// Identity is the thread, or the tab's position for an agent that has no
+		// thread yet — never the label, which two chats can share.
+		item.id = `codex:${conversationId || `new:${groupIndex}:${tabIndex}`}`;
 		item.iconPath = this.codexIcon;
 		item.contextValue = 'codexChat';
 		item.command = {
@@ -873,12 +995,12 @@ class ChatsProvider {
 			? vscode.TreeItemCollapsibleState.Expanded
 			: vscode.TreeItemCollapsibleState.None;
 		const item = new vscode.TreeItem(tab.label, collapse);
+		// A stable id is what keeps the tree's selection pinned to a chat. Without
+		// one VS Code identifies a row by its position, and this list re-sorts on
+		// every refresh — so the highlight stayed on slot 4 while the chat that
+		// had been there moved, and it ended up marking a chat nobody opened.
+		item.id = `chat:${data ? data.sessionId : `${groupIndex}:${tabIndex}`}`;
 		if (subs && subs.length) {
-			// VS Code remembers expansion per item id, so a stable id would keep
-			// the row collapsed after the user ever folded it — and a chat that
-			// gains an agent would stay shut. Fold the running count into the id
-			// so each change is a new item, which honours Expanded again.
-			item.id = `chat:${data ? data.sessionId : tab.label}:${subs.length}`;
 			item.subagentItems = subs.map((sub) => {
 				const child = new vscode.TreeItem(sub.name || `agent ${sub.id.slice(0, 8)}`, vscode.TreeItemCollapsibleState.None);
 				child.iconPath = new vscode.ThemeIcon('sync~spin');
@@ -901,6 +1023,8 @@ class ChatsProvider {
 				md.appendMarkdown(`| Last write | ${formatAge(sub.mtimeMs)} |\n\n`);
 				md.appendMarkdown(`_The row disappears once this transcript is idle for 2 minutes._`);
 				child.tooltip = md;
+				child.id = `${item.id}:agent:${sub.id}`;
+				child.parentItem = item;
 				return child;
 			});
 		}
@@ -960,10 +1084,43 @@ class ChatsProvider {
 function register(context) {
 	const index = new TranscriptIndex();
 	const decorations = new ChatDecorations();
-	const provider = new ChatsProvider(index, context.extensionUri, decorations);
+	const seen = new SeenStore(context.globalState);
+	const provider = new ChatsProvider(index, context.extensionUri, decorations, seen);
 	// One cache feeds the bars; it repaints them itself whenever a lookup lands.
 	const usage = new UsageCache(() => usageView.render());
 	const usageView = new UsageViewProvider(usage);
+
+	// A real TreeView rather than registerTreeDataProvider, because the panel has
+	// to drive its own selection: the grey highlight is the tree's selection, and
+	// VS Code never moves it when you switch tabs by any other route — clicking
+	// the tab itself, a keyboard shortcut, a new chat opening. It then read as a
+	// claim about which chat was open while pointing at a different one.
+	const view = vscode.window.createTreeView('openEditorsTools.chats', {
+		treeDataProvider: provider,
+		showCollapseAll: false,
+	});
+
+	// Point the selection at the chat that is actually open. Selection is not
+	// moved for a non-chat tab: the last chat stays marked, which is still the
+	// truth about which chat is in play.
+	let lastRevealed = null;
+	const syncSelection = () => {
+		const group = vscode.window.tabGroups.all.find((g) => g.isActive);
+		const active = group && group.activeTab;
+		const item = active && provider.itemByTab.get(active);
+		if (!item) return;
+		// Expanding here rather than through a changing item id: an id that moves
+		// with the running-subagent count would reintroduce the drift this whole
+		// mechanism exists to fix.
+		const expand = item.expandable || undefined;
+		if (lastRevealed === item.id && !expand) return;
+		lastRevealed = item.id;
+		// focus stays where the user put it — revealing must never steal the
+		// caret out of a chat's input box.
+		Promise.resolve(view.reveal(item, { select: true, focus: false, expand }))
+			.then(undefined, () => { lastRevealed = null; });
+	};
+	provider.onDidRender(syncSelection);
 
 	// Debounced: an active session rewrites its transcript on every message,
 	// and fs.watch fires several times per write.
@@ -1009,7 +1166,7 @@ function register(context) {
 	const usageTick = setInterval(() => usageView.render(), 60000);
 
 	context.subscriptions.push(
-		vscode.window.registerTreeDataProvider('openEditorsTools.chats', provider),
+		view,
 		vscode.window.registerWebviewViewProvider('openEditorsTools.usage', usageView, {
 			// Cheap to keep alive, and it avoids a blank flash every time the
 			// container is revealed.
@@ -1109,6 +1266,10 @@ function register(context) {
 		}),
 		vscode.window.tabGroups.onDidChangeTabs(scheduleRefresh),
 		vscode.window.tabGroups.onDidChangeTabGroups(scheduleRefresh),
+		// Switching tabs is what clears an unread mark, and it has to feel
+		// instant — the 1.5s transcript debounce is for file writes, not clicks.
+		vscode.window.tabGroups.onDidChangeTabs(() => provider.refresh()),
+		vscode.window.onDidChangeWindowState(() => provider.refresh()),
 		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); clearInterval(usageTick); watchers.forEach((w) => w.close()); } }
 	);
 }

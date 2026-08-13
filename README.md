@@ -14,6 +14,7 @@ your account's rate-limit windows drawn as bars above them.
 | `$12.34` | What the session's tokens (subagents included) would bill at list API rates. A Claude subscription is not billed this way; it is a what-if figure |
 | blue `●` badge | The agent is working right now |
 | orange `?` badge | The agent asked a question and is blocked on your answer |
+| green `●` badge | The agent replied and you have not read it yet. Clears when you look at the tab, or when you reply |
 | `⟳` child rows | Subagents whose transcripts were written in the last 2 minutes, with per-agent model, tokens and cost |
 | `🕘` rows | Chats whose tab was closed; click to reopen the session |
 
