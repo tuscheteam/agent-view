@@ -1081,7 +1081,23 @@ class ChatsProvider {
 	}
 }
 
+async function arrangeLeft() {
+	await vscode.commands.executeCommand('workbench.action.positionPanelLeft');
+	await vscode.commands.executeCommand('workbench.view.extension.openEditorsToolsChats');
+}
+
+// Once per install: without this the container sat in a collapsed panel and
+// the user had to know to look for it. Later reloads leave the layout alone —
+// it is theirs to change from then on.
+const FIRST_RUN_KEY = 'openEditorsTools.firstRunDone';
+async function firstRun(context) {
+	if (context.globalState.get(FIRST_RUN_KEY)) return;
+	await context.globalState.update(FIRST_RUN_KEY, true);
+	try { await arrangeLeft(); } catch (_) { /* layout commands are best effort */ }
+}
+
 function register(context) {
+	firstRun(context);
 	const index = new TranscriptIndex();
 	const decorations = new ChatDecorations();
 	const seen = new SeenStore(context.globalState);
@@ -1246,6 +1262,17 @@ function register(context) {
 				vscode.window.showErrorMessage(`Could not reopen session ${sessionId} — ${err.message}`);
 			}
 		}),
+		// One palette entry that always brings the panel back, wherever the user
+		// dragged the container: VS Code registers workbench.view.extension.<id>
+		// for every contributed container, and it opens the container in place.
+		vscode.commands.registerCommand('openEditorsTools.showChats', () =>
+			vscode.commands.executeCommand('workbench.view.extension.openEditorsToolsChats')),
+		// The layout this panel is built for: file tree, then chats, then the
+		// chat itself. The panel is the one location VS Code lets us stand up as
+		// a column, so the container defaults there and this moves the panel to
+		// the left of the editor. Undo is one palette entry away
+		// (View: Move Panel to Bottom).
+		vscode.commands.registerCommand('openEditorsTools.arrangeLeft', arrangeLeft),
 		vscode.commands.registerCommand('openEditorsTools.refreshChats', () => {
 			usage.refreshAll();
 			usageView.render();

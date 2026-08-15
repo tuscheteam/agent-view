@@ -20,6 +20,15 @@ your account's rate-limit windows drawn as bars above them.
 
 Hover any row for the full breakdown (model, turns, cache reads/writes, reset times).
 
+## Layout
+
+On first run the extension moves the panel to the left of the editor and opens
+itself there — files, then chats, then the chat you are working in. That is a
+one-time move; drag things wherever you like afterwards. Two palette commands
+cover the rest: **Agent View: Show Chats Panel** brings the view back if it
+gets closed, and **Agent View: Arrange as Left Column** restores the layout.
+*View: Move Panel to Bottom* undoes it.
+
 ## Buttons
 
 Claude logo — new Claude chat as an editor tab. History icon beside it — reopen any past Claude
@@ -41,6 +50,31 @@ code --install-extension agent-view-*.vsix
 ```
 
 Or in VS Code: Extensions view → `···` menu → *Install from VSIX…*
+
+## Updating
+
+Same command, any time — it replaces the installed version in place:
+
+```sh
+gh release download -R tuscheteam/agent-view -p "*.vsix" --clobber
+code --install-extension agent-view-*.vsix
+```
+
+Sideloaded extensions do not auto-update. To hear about new versions, click
+*Watch → Custom → Releases* on the repo.
+
+## Remote-SSH
+
+The extension runs where the chats run, so in a Remote-SSH window it has to be
+installed on the remote. Either use the Extensions view → `···` → *Install from
+VSIX…* while connected, or from a shell on the remote:
+
+```sh
+~/.vscode-server/bin/*/bin/code-server --install-extension agent-view-*.vsix
+```
+
+It then reads that machine's `~/.claude` and `~/.codex`, and shows only chats
+running there.
 
 ## Settings
 

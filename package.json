@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -17,7 +17,7 @@
   ],
   "contributes": {
     "configuration": {
-      "title": "Open Editors Tools",
+      "title": "Agent View",
       "properties": {
         "openEditorsTools.recentFirst": {
           "type": "boolean",
@@ -33,9 +33,19 @@
     },
     "commands": [
       {
+        "command": "openEditorsTools.showChats",
+        "title": "Show Chats Panel",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.arrangeLeft",
+        "title": "Arrange as Left Column",
+        "category": "Agent View"
+      },
+      {
         "command": "openEditorsTools.newClaudeChat",
         "title": "New Claude Chat",
-        "category": "Open Editors",
+        "category": "Agent View",
         "icon": {
           "light": "resources/claude.svg",
           "dark": "resources/claude.svg"
@@ -44,7 +54,7 @@
       {
         "command": "openEditorsTools.newCodexChat",
         "title": "New Codex Agent",
-        "category": "Open Editors",
+        "category": "Agent View",
         "icon": {
           "light": "resources/codex.svg",
           "dark": "resources/codex.svg"
@@ -53,44 +63,44 @@
       {
         "command": "openEditorsTools.pin",
         "title": "Pin Active Editor",
-        "category": "Open Editors",
+        "category": "Agent View",
         "icon": "$(pin)"
       },
       {
         "command": "openEditorsTools.unpin",
         "title": "Unpin Active Editor",
-        "category": "Open Editors",
+        "category": "Agent View",
         "icon": "$(pinned)"
       },
       {
         "command": "openEditorsTools.refreshChats",
         "title": "Refresh Chats",
-        "category": "Open Editors",
+        "category": "Agent View",
         "icon": "$(refresh)"
       },
       {
         "command": "openEditorsTools.focusChat",
         "title": "Focus Chat",
-        "category": "Open Editors"
+        "category": "Agent View"
       },
       {
         "command": "openEditorsTools.openCodexThread",
         "title": "Open Codex Conversation in Tab",
-        "category": "Open Editors",
+        "category": "Agent View",
         "icon": "$(history)"
       },
       {
         "command": "openEditorsTools.openClaudeSession",
         "title": "Open Claude Session in Tab",
-        "category": "Open Editors",
+        "category": "Agent View",
         "icon": "$(history)"
       }
     ],
     "viewsContainers": {
-      "activitybar": [
+      "panel": [
         {
           "id": "openEditorsToolsChats",
-          "title": "Chats",
+          "title": "Agent View",
           "icon": "resources/claude.svg"
         }
       ]
