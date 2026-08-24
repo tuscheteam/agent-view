@@ -14,22 +14,47 @@ const CODEX_FILL_DARK = '#FFFFFF';
 const CODEX_FILL_LIGHT = '#8E8E8E';
 
 class UsageViewProvider {
-	constructor(usage) {
+	constructor(usage, log) {
 		this.usage = usage;
 		this.view = null;
+		// Injected by register(). A blank panel used to be indistinguishable
+		// from a panel that never got asked to draw, which is a bad place to
+		// debug from — every step now says what it did.
+		this.log = log || (() => {});
 	}
 
 	resolveWebviewView(webviewView) {
 		this.view = webviewView;
 		webviewView.webview.options = { enableScripts: true };
+		this.log('usage view resolved');
+		// A view can be resolved while hidden and again when shown; both paths
+		// have to paint, or the panel keeps whatever emptiness it started with.
+		webviewView.onDidChangeVisibility(() => {
+			this.log(`usage view visibility: ${webviewView.visible}`);
+			if (webviewView.visible) this.render();
+		});
 		this.render();
 	}
 
 	render() {
-		if (!this.view) return;
-		const claude = this.usage.get('claude');
-		const codex = this.usage.get('codex');
-		this.view.webview.html = this._html(claude, codex);
+		if (!this.view) { this.log('render skipped: view not resolved yet'); return; }
+		let claude = null;
+		let codex = null;
+		try {
+			claude = this.usage.get('claude');
+			codex = this.usage.get('codex');
+			this.view.webview.html = this._html(claude, codex);
+			this.log(`rendered claude=${describe(claude)} codex=${describe(codex)}`);
+		} catch (err) {
+			// Whatever went wrong, say so in the panel. An empty webview reads
+			// as "this feature is broken" and carries no way to find out why.
+			this.log(`render failed: ${err && err.stack ? err.stack : err}`);
+			try {
+				this.view.webview.html = `<!DOCTYPE html><html><body style="font:12px var(--vscode-font-family);color:var(--vscode-errorForeground);padding:8px">`
+					+ `Usage could not be drawn: ${escapeHtml(String(err && err.message ? err.message : err))}`
+					+ `</body></html>`;
+			} catch (_) { /* the view went away mid-render */ }
+		}
 	}
 
 	_html(claude, codex) {
@@ -146,6 +171,12 @@ ${lines}
 
 function clamp(pct) {
 	return Math.max(0, Math.min(100, Number(pct) || 0));
+}
+
+function describe(usage) {
+	if (!usage) return 'pending';
+	if (usage.error) return `error(${usage.error})`;
+	return `${usage.windows.length} window(s)`;
 }
 
 function escapeHtml(text) {

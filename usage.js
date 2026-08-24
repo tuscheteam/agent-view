@@ -17,6 +17,9 @@ const { spawn } = require('child_process');
 // a network round trip — neither belongs on a tree refresh.
 
 const TTL_MS = 5 * 60 * 1000;
+// A failed lookup is not worth holding for the full window: an expired token
+// or a dropped connection usually clears in far less than five minutes.
+const ERROR_TTL_MS = 60 * 1000;
 const CODEX_TIMEOUT_MS = 20000;
 
 function claudeConfigDir() {
@@ -33,8 +36,11 @@ async function readClaudeUsage() {
 	}
 	if (!creds || !creds.accessToken) return { error: 'no Claude OAuth token' };
 	if (creds.expiresAt && creds.expiresAt < Date.now()) {
-		// Refreshing is Claude Code's job — open a session and it renews.
-		return { error: 'Claude token expired' };
+		// The stored token lasts 8 hours and only Claude Code can renew it —
+		// it rewrites this file the next time a session runs. Nothing to do
+		// here but say so and wait for the file to change; watchCredentials()
+		// turns that write into an immediate refetch.
+		return { error: 'Claude token expired — runs again once a Claude chat does' };
 	}
 
 	let response;
@@ -245,16 +251,24 @@ function windowLabel(mins) {
 // One cache per provider: served immediately, refreshed in the background when
 // stale so the tree never waits on a network call or a process spawn.
 class UsageCache {
-	constructor(onChange) {
+	constructor(onChange, log) {
 		this.onChange = onChange;
+		this.log = log || (() => {});
 		this.entries = { claude: null, codex: null };
 		this.inFlight = {};
 	}
 
 	get(provider) {
 		const entry = this.entries[provider];
-		if (!entry || Date.now() - entry.at > TTL_MS) this._refresh(provider);
+		const ttl = entry && entry.value && entry.value.error ? ERROR_TTL_MS : TTL_MS;
+		if (!entry || Date.now() - entry.at > ttl) this._refresh(provider);
 		return entry ? entry.value : null;
+	}
+
+	// Drop what is cached for one provider and look it up again now.
+	invalidate(provider) {
+		this.entries[provider] = null;
+		this._refresh(provider);
 	}
 
 	refreshAll() {
@@ -266,12 +280,15 @@ class UsageCache {
 	_refresh(provider) {
 		if (this.inFlight[provider]) return;
 		const read = provider === 'claude' ? readClaudeUsage : readCodexUsage;
+		const startedAt = Date.now();
 		this.inFlight[provider] = Promise.resolve()
 			.then(read)
-			.catch((err) => ({ error: err.message }))
+			.catch((err) => ({ error: err && err.message ? err.message : String(err) }))
 			.then((value) => {
 				this.entries[provider] = { at: Date.now(), value };
 				delete this.inFlight[provider];
+				const took = Date.now() - startedAt;
+				this.log(`${provider} usage: ${value && value.error ? `ERROR ${value.error}` : `${(value && value.windows || []).length} window(s)`} (${took}ms)`);
 				if (this.onChange) this.onChange();
 			});
 	}
@@ -287,4 +304,18 @@ function formatReset(ms) {
 	return `${Math.round(hours / 24)}d`;
 }
 
-module.exports = { UsageCache, formatReset, readClaudeUsage, readCodexUsage, codexExecutable };
+// Claude Code rewrites ~/.claude/.credentials.json every time it renews the
+// token. Watching the directory rather than the file survives an atomic
+// write, where the old inode is replaced and a file watcher would go deaf.
+function watchCredentials(onChange) {
+	try {
+		const watcher = fs.watch(claudeConfigDir(), (_event, name) => {
+			if (name && String(name).includes('.credentials.json')) onChange();
+		});
+		return { dispose: () => watcher.close() };
+	} catch (_) {
+		return { dispose: () => {} };
+	}
+}
+
+module.exports = { UsageCache, formatReset, readClaudeUsage, readCodexUsage, codexExecutable, watchCredentials };

@@ -3,7 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
-const { UsageCache } = require('./usage');
+const { UsageCache, watchCredentials } = require('./usage');
 const { UsageViewProvider } = require('./usageView');
 
 // A CHATS tree of our own, because the built-in OPEN EDITORS rows cannot carry
@@ -1099,12 +1099,19 @@ async function firstRun(context) {
 function register(context) {
 	firstRun(context);
 	const index = new TranscriptIndex();
+	// One channel for everything this extension does that can fail quietly:
+	// usage fetches, webview resolution, layout moves. Opened from
+	// "Agent View: Show Log".
+	const output = vscode.window.createOutputChannel('Agent View');
+	const log = (message) => output.appendLine(`${new Date().toISOString().slice(11, 19)}  ${message}`);
+	log(`activated on ${process.platform}, remote=${vscode.env.remoteName || 'local'}`);
+
 	const decorations = new ChatDecorations();
 	const seen = new SeenStore(context.globalState);
 	const provider = new ChatsProvider(index, context.extensionUri, decorations, seen);
 	// One cache feeds the bars; it repaints them itself whenever a lookup lands.
-	const usage = new UsageCache(() => usageView.render());
-	const usageView = new UsageViewProvider(usage);
+	const usage = new UsageCache(() => usageView.render(), log);
+	const usageView = new UsageViewProvider(usage, log);
 
 	// A real TreeView rather than registerTreeDataProvider, because the panel has
 	// to drive its own selection: the grey highlight is the tree's selection, and
@@ -1181,7 +1188,23 @@ function register(context) {
 	// unless the entry has actually expired.
 	const usageTick = setInterval(() => usageView.render(), 60000);
 
+	// A refreshed token is the one thing that fixes an expired-token panel, and
+	// it arrives as a file write rather than anything we could poll cheaply.
+	let credentialsDebounce = null;
+	const onCredentials = () => {
+		if (credentialsDebounce) clearTimeout(credentialsDebounce);
+		credentialsDebounce = setTimeout(() => {
+			credentialsDebounce = null;
+			log('credentials changed, refetching Claude usage');
+			usage.invalidate('claude');
+			usageView.render();
+		}, 1000);
+	};
+
 	context.subscriptions.push(
+		output,
+		watchCredentials(onCredentials),
+		{ dispose: () => credentialsDebounce && clearTimeout(credentialsDebounce) },
 		view,
 		vscode.window.registerWebviewViewProvider('openEditorsTools.usage', usageView, {
 			// Cheap to keep alive, and it avoids a blank flash every time the
@@ -1265,6 +1288,7 @@ function register(context) {
 		// One palette entry that always brings the panel back, wherever the user
 		// dragged the container: VS Code registers workbench.view.extension.<id>
 		// for every contributed container, and it opens the container in place.
+		vscode.commands.registerCommand('openEditorsTools.showLog', () => output.show(true)),
 		vscode.commands.registerCommand('openEditorsTools.showChats', () =>
 			vscode.commands.executeCommand('workbench.view.extension.openEditorsToolsChats')),
 		// The layout this panel is built for: file tree, then chats, then the

@@ -35,6 +35,16 @@ Claude logo — new Claude chat as an editor tab. History icon beside it — reo
 session. Codex logo — new Codex agent, placed next to your chats. Second history icon — open any
 past Codex conversation in a tab. Refresh — re-read everything and refetch usage.
 
+## When something looks wrong
+
+**Agent View: Show Log** (command palette) opens a log of what the panel did —
+activation, when the usage view was drawn, and every usage lookup with its
+result and timing.
+
+`Claude token expired` in the usage rows is normal after an idle stretch: the
+stored token lasts 8 hours and only Claude Code renews it. The bars come back
+by themselves within a second of your next Claude message.
+
 ## Requirements
 
 - VS Code ≥ 1.90
