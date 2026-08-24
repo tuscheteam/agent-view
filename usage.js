@@ -77,7 +77,7 @@ async function readClaudeUsage() {
 					severity: limit.severity,
 				},
 			]);
-		return { plan: creds.subscriptionType || null, windows };
+		return { plan: planLabel(creds), windows };
 	}
 
 	// Fallback for accounts or versions that do not return `limits` yet.
@@ -94,7 +94,7 @@ async function readClaudeUsage() {
 	// Shortest window first, so 5h sits above the weekly bars.
 	windows.sort((a, b) => (CLAUDE_WINDOW_ORDER.indexOf(a[0]) + 1 || 99) - (CLAUDE_WINDOW_ORDER.indexOf(b[0]) + 1 || 99));
 
-	return { plan: creds.subscriptionType || null, windows };
+	return { plan: planLabel(creds), windows };
 }
 
 // The server names the scoped ones ("Fable"); the two global bars get the short
@@ -144,6 +144,25 @@ function codexExtensionRoot() {
 		for (const dir of dirs.reverse()) roots.push(path.join(root, dir));
 	}
 	return roots;
+}
+
+// "max" alone does not say which Max: the two tiers differ fivefold in what
+// the bars above are a percentage OF. The credentials carry the distinction
+// as a rate-limit tier — `default_claude_max_20x` — which is also the
+// vocabulary Claude Code itself uses ("Max 20x"). Lowercased here to sit with
+// the other plan labels in the panel.
+function planLabel(creds) {
+	const tier = creds.rateLimitTier;
+	if (typeof tier === 'string' && tier) {
+		const known = { default_claude_max_20x: 'max 20x', default_claude_max_5x: 'max 5x' };
+		if (known[tier]) return known[tier];
+		// An unknown tier is still worth showing: strip the prefix the known
+		// ones share and let the rest read as-is, rather than falling back to
+		// a label that hides the difference.
+		const trimmed = tier.replace(/^default_claude_/, '').replace(/_/g, ' ').trim();
+		if (trimmed) return trimmed;
+	}
+	return creds.subscriptionType || null;
 }
 
 function codexExecutable() {
@@ -318,4 +337,4 @@ function watchCredentials(onChange) {
 	}
 }
 
-module.exports = { UsageCache, formatReset, readClaudeUsage, readCodexUsage, codexExecutable, watchCredentials };
+module.exports = { UsageCache, formatReset, planLabel, readClaudeUsage, readCodexUsage, codexExecutable, watchCredentials };
