@@ -463,10 +463,21 @@ function codexConversationId(uri) {
 	return (parts[0] === 'local' || parts[0] === 'remote') ? parts[1] : null;
 }
 
+// Codex records a subagent as a thread of its own, alongside the chat that
+// spawned it: same table, same shape, `thread_source` = "subagent" and a
+// `source` JSON naming the parent. One conversation that fans out to nine
+// helpers therefore stores ten threads, and listing the table as-is showed
+// nine phantom chats, each titled with the parent's first message.
 class CodexIndex {
 	constructor() {
 		this.byId = new Map();
+		this.subagentsByParent = new Map();
 		this.source = 'none';
+	}
+
+	subagentsFor(threadId, activeSince) {
+		const all = this.subagentsByParent.get(threadId) || [];
+		return all.filter((sub) => sub.lastActivity >= activeSince);
 	}
 
 	refresh() {
@@ -482,20 +493,39 @@ class CodexIndex {
 			// Read-only, always: Codex owns this database and may be writing it.
 			db = new DatabaseSync(file, { readOnly: true });
 			const rows = db.prepare(
-				'SELECT id, name, title, tokens_used, model, reasoning_effort, updated_at_ms, archived FROM threads'
+				'SELECT id, name, title, tokens_used, model, reasoning_effort, updated_at_ms, archived,'
+				+ ' thread_source, source, agent_nickname, agent_path FROM threads'
 			).all();
 			const next = new Map();
+			const children = new Map();
 			for (const row of rows) {
-				next.set(row.id, {
+				const entry = {
 					title: row.name || row.title,
 					tokens: Number(row.tokens_used) || 0,
 					model: row.model,
 					effort: row.reasoning_effort,
 					lastActivity: Number(row.updated_at_ms) || 0,
 					archived: !!row.archived,
-				});
+				};
+				if (row.thread_source === 'subagent') {
+					const parent = parentThreadId(row.source);
+					// A subagent with no traceable parent is dropped rather than
+					// listed: it is still not a chat anyone opened.
+					if (!parent) continue;
+					entry.id = row.id;
+					entry.name = row.agent_nickname
+						|| (row.agent_path ? String(row.agent_path).split('/').filter(Boolean).pop() : null)
+						|| (row.model === 'codex-auto-review' ? 'review' : 'agent');
+					const list = children.get(parent) || [];
+					list.push(entry);
+					children.set(parent, list);
+					continue;
+				}
+				next.set(row.id, entry);
 			}
+			for (const list of children.values()) list.sort((a, b) => b.lastActivity - a.lastActivity);
 			this.byId = next;
+			this.subagentsByParent = children;
 			this.source = 'sqlite';
 			return true;
 		} catch (_) {
@@ -591,6 +621,18 @@ async function newCodexInTab() {
 		});
 		return;
 	}
+}
+
+// The spawn record lives in a JSON blob rather than a column:
+//   {"subagent":{"thread_spawn":{"parent_thread_id":"…","agent_nickname":"…"}}}
+// with a second shape, {"subagent":{"other":"guardian"}}, for Codex's own
+// review passes — those name no parent and are simply not listed.
+function parentThreadId(source) {
+	if (typeof source !== 'string' || source[0] !== '{') return null;
+	try {
+		const spawn = JSON.parse(source).subagent;
+		return (spawn && spawn.thread_spawn && spawn.thread_spawn.parent_thread_id) || null;
+	} catch (_) { return null; }
 }
 
 function codexTabs() {
@@ -832,14 +874,20 @@ class ChatsProvider {
 			return { ...t, kind: 'claude', data, state, subagents, subs: subagents.running };
 		});
 		this.hasRunningSubagents = rows.some((r) => r.subs && r.subs.length);
+		// Codex rows are appended below, so re-check after they land.
 		this.decorations.replace(rows.map((r) => [r.data && r.data.sessionId, r.state]));
 		this.seen.flush();
 
 		// Codex threads carry no pending-tool or liveness signal, so they never
 		// take a status dot — only Claude rows do.
 		for (const t of codexTabs()) {
-			rows.push({ ...t, kind: 'codex', data: this.codex.lookup(t.conversationId) });
+			const subs = t.conversationId
+				? this.codex.subagentsFor(t.conversationId, Date.now() - SUBAGENT_ACTIVE_MS)
+				: [];
+			rows.push({ ...t, kind: 'codex', data: this.codex.lookup(t.conversationId), subs });
 		}
+
+		this.hasRunningSubagents = this.hasRunningSubagents || rows.some((r) => r.kind === 'codex' && r.subs && r.subs.length);
 
 		// Chats whose tab was closed. The list above mirrors open tabs, so
 		// closing a tab used to silently drop the chat from the panel even
@@ -940,8 +988,10 @@ class ChatsProvider {
 	}
 
 	_codexItem(row) {
-		const { tab, groupIndex, tabIndex, data, conversationId } = row;
-		const item = new vscode.TreeItem(tab.label, vscode.TreeItemCollapsibleState.None);
+		const { tab, groupIndex, tabIndex, data, conversationId, subs } = row;
+		const item = new vscode.TreeItem(tab.label, subs && subs.length
+			? vscode.TreeItemCollapsibleState.Expanded
+			: vscode.TreeItemCollapsibleState.None);
 		// Identity is the thread, or the tab's position for an agent that has no
 		// thread yet — never the label, which two chats can share.
 		item.id = `codex:${conversationId || `new:${groupIndex}:${tabIndex}`}`;
@@ -965,9 +1015,27 @@ class ChatsProvider {
 			return item;
 		}
 
+		if (subs && subs.length) {
+			item.subagentItems = subs.map((sub) => {
+				const child = new vscode.TreeItem(sub.name, vscode.TreeItemCollapsibleState.None);
+				child.id = `${item.id}:agent:${sub.id}`;
+				child.parentItem = item;
+				child.iconPath = new vscode.ThemeIcon('sync~spin');
+				child.contextValue = 'subagent';
+				child.description = [
+					sub.model,
+					sub.tokens ? `${formatTokens(sub.tokens)} tok` : null,
+					formatAge(sub.lastActivity),
+				].filter(Boolean).join(' · ');
+				child.tooltip = `${sub.name} — Codex subagent of this thread. The row disappears once its thread is idle for 2 minutes.`;
+				return child;
+			});
+		}
+
 		// No cost column: these are OpenAI models and this extension has no
 		// verified price list for them. A made-up rate would be worse than none.
 		item.description = [
+			subs && subs.length ? `${subs.length} agent${subs.length > 1 ? 's' : ''}` : null,
 			formatAge(data.lastActivity),
 			data.tokens ? `${formatTokens(data.tokens)} tok` : null,
 			data.model,
