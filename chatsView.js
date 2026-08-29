@@ -685,6 +685,19 @@ function formatTokens(n) {
 	return String(n);
 }
 
+// How long the agent has been working on the current turn (live), or how long
+// the last one took: your last message to the reply that answered it.
+function turnDuration(data, running) {
+	if (!data || !data.lastUserAt) return null;
+	const end = running ? Date.now() : data.lastReplyAt;
+	if (!end || end <= data.lastUserAt) return null;
+	const secs = Math.round((end - data.lastUserAt) / 1000);
+	if (secs < 60) return `${secs}s`;
+	const mins = Math.floor(secs / 60);
+	if (mins < 60) return `${mins}m ${String(secs % 60).padStart(2, '0')}s`;
+	return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+}
+
 function formatCost(usd) {
 	if (!usd) return '$0';
 	return usd < 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(usd < 100 ? 2 : 0)}`;
@@ -1034,9 +1047,10 @@ class ChatsProvider {
 
 		// No cost column: these are OpenAI models and this extension has no
 		// verified price list for them. A made-up rate would be worse than none.
+		const worked = turnDuration(data, state === 'running');
 		item.description = [
 			subs && subs.length ? `${subs.length} agent${subs.length > 1 ? 's' : ''}` : null,
-			formatAge(data.lastActivity),
+			worked ? (state === 'running' ? `⏱ ${worked}` : `${worked} turn`) : formatAge(data.lastActivity),
 			data.tokens ? `${formatTokens(data.tokens)} tok` : null,
 			data.model,
 		].filter(Boolean).join(' · ');
@@ -1115,9 +1129,10 @@ class ChatsProvider {
 		const pct = data.contextLimit ? Math.round((data.contextTokens / data.contextLimit) * 100) : 0;
 		const subagents = row.subagents || { all: [], cost: 0, messages: 0 };
 		const totalCost = data.cost + subagents.cost;
+		const worked = turnDuration(data, state === 'running');
 		item.description = [
 			subs && subs.length ? `${subs.length} agent${subs.length > 1 ? 's' : ''}` : null,
-			formatAge(data.lastActivity),
+			worked ? (state === 'running' ? `⏱ ${worked}` : `${worked} turn`) : formatAge(data.lastActivity),
 			`${formatTokens(data.contextTokens)}/${formatTokens(data.contextLimit)}`,
 			formatCost(totalCost),
 		].filter(Boolean).join(' · ');
