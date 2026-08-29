@@ -4,6 +4,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { UsageCache, watchCredentials } = require('./usage');
+const restyle = require('./restyle');
 const { UsageViewProvider } = require('./usageView');
 
 // A CHATS tree of our own, because the built-in OPEN EDITORS rows cannot carry
@@ -1189,6 +1190,10 @@ function register(context) {
 	const log = (message) => output.appendLine(`${new Date().toISOString().slice(11, 19)}  ${message}`);
 	log(`activated on ${process.platform}, remote=${vscode.env.remoteName || 'local'}`);
 
+	if (context.globalState.get('openEditorsTools.restyle')) {
+		try { restyle.apply().forEach((r) => log(`restyle: ${r.status} — ${r.cssFile}`)); } catch (err) { log(`restyle failed: ${err.message}`); }
+	}
+
 	const decorations = new ChatDecorations();
 	const seen = new SeenStore(context.globalState);
 	const provider = new ChatsProvider(index, context.extensionUri, decorations, seen);
@@ -1372,6 +1377,20 @@ function register(context) {
 		// dragged the container: VS Code registers workbench.view.extension.<id>
 		// for every contributed container, and it opens the container in place.
 		vscode.commands.registerCommand('openEditorsTools.showLog', () => output.show(true)),
+		// Opt-in, sticky: once turned on it survives Claude Code updates, which
+		// install a fresh directory and silently shed the override.
+		vscode.commands.registerCommand('openEditorsTools.restyleOn', async () => {
+			const results = restyle.apply();
+			await context.globalState.update('openEditorsTools.restyle', true);
+			results.forEach((r) => log(`restyle: ${r.status} — ${r.cssFile}`));
+			vscode.window.showInformationMessage('Claude panel restyled. Reload the window to see it.');
+		}),
+		vscode.commands.registerCommand('openEditorsTools.restyleOff', async () => {
+			const results = restyle.revert();
+			await context.globalState.update('openEditorsTools.restyle', false);
+			results.forEach((r) => log(`restyle: ${r.status} — ${r.cssFile}`));
+			vscode.window.showInformationMessage('Claude panel restored to stock. Reload the window.');
+		}),
 		vscode.commands.registerCommand('openEditorsTools.showChats', () =>
 			vscode.commands.executeCommand('workbench.view.extension.openEditorsToolsChats')),
 		// The layout this panel is built for: file tree, then chats, then the

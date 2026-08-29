@@ -35,6 +35,20 @@ Claude logo — new Claude chat as an editor tab. History icon beside it — reo
 session. Codex logo — new Codex agent, placed next to your chats. Second history icon — open any
 past Codex conversation in a tab. Refresh — re-read everything and refetch usage.
 
+## Quiet timeline (optional)
+
+**Agent View: Restyle Claude Panel** collapses Claude Code's chat timeline the
+way Codex renders it: tool cards (Bash IN/OUT, Write bodies) hidden, thinking
+rows hidden, and only each turn's final message visible, with roomier line
+spacing. It patches the stylesheet inside your installed Claude Code extension
+(a `.bak` sits beside it) and re-applies itself after Claude Code updates.
+**Agent View: Restore Claude Panel** puts everything back. Reload the window
+after either.
+
+How much Claude *writes* per reply is Claude Code configuration, not something
+an extension can reach — see [docs/REPLY-SETUP.md](docs/REPLY-SETUP.md) for
+the output style, CLAUDE.md rule and optional length hook that pair with this.
+
 ## When something looks wrong
 
 **Agent View: Show Log** (command palette) opens a log of what the panel did —

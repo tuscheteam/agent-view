@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -40,6 +40,16 @@
       {
         "command": "openEditorsTools.showLog",
         "title": "Show Log",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.restyleOn",
+        "title": "Restyle Claude Panel (quiet timeline)",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.restyleOff",
+        "title": "Restore Claude Panel (stock look)",
         "category": "Agent View"
       },
       {
