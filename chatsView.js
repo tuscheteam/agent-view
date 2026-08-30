@@ -994,9 +994,9 @@ class ChatsProvider {
 		item.description = [formatAge(row.data.lastActivity), 'closed', row.data.model].filter(Boolean).join(' · ');
 		item.tooltip = `${row.data.title} — closed Codex thread. Click to open it in a tab.`;
 		item.command = {
-			command: 'vscode.openWith',
+			command: 'openEditorsTools.openCodexHere',
 			title: 'Open thread',
-			arguments: [codexUri(row.conversationId), CODEX_VIEW_TYPE],
+			arguments: [row.conversationId],
 		};
 		return item;
 	}
@@ -1048,10 +1048,11 @@ class ChatsProvider {
 
 		// No cost column: these are OpenAI models and this extension has no
 		// verified price list for them. A made-up rate would be worse than none.
-		const worked = turnDuration(data, state === 'running');
+		// And no turn duration either — Codex transcripts expose no
+		// user-message timestamp to measure from.
 		item.description = [
 			subs && subs.length ? `${subs.length} agent${subs.length > 1 ? 's' : ''}` : null,
-			worked ? (state === 'running' ? `⏱ ${worked}` : `${worked} turn`) : formatAge(data.lastActivity),
+			formatAge(data.lastActivity),
 			data.tokens ? `${formatTokens(data.tokens)} tok` : null,
 			data.model,
 		].filter(Boolean).join(' · ');
@@ -1304,6 +1305,16 @@ function register(context) {
 		// webview's router reports location "/" with no component — an empty
 		// page. A conversation URI carries its own route, so opening one
 		// directly is the test of whether the editor host works at all.
+		// Codex tabs land beside the Claude chat, in its group, so both agents
+		// live in one column instead of claiming one each.
+		vscode.commands.registerCommand('openEditorsTools.openCodexHere', async (conversationId) => {
+			const target = claudeTabs()[0];
+			const group = target !== undefined
+				? vscode.window.tabGroups.all[target.groupIndex]
+				: undefined;
+			await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE,
+				group ? group.viewColumn : undefined);
+		}),
 		vscode.commands.registerCommand('openEditorsTools.openCodexThread', async () => {
 			if (!requireCodex()) return;
 			const index = new CodexIndex();
@@ -1332,7 +1343,7 @@ function register(context) {
 			if (!picked) return;
 			const uri = codexUri(picked.id);
 			try {
-				await vscode.commands.executeCommand('vscode.openWith', uri, CODEX_VIEW_TYPE);
+				await vscode.commands.executeCommand('openEditorsTools.openCodexHere', picked.id);
 			} catch (err) {
 				vscode.window.showErrorMessage(`Could not open ${uri.toString()} — ${err.message}`);
 			}
