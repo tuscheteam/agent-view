@@ -445,6 +445,11 @@ class TranscriptIndex {
 // metadata in ~/.codex/state_5.sqlite. Unlike Claude, the tab carries a real
 // URI, so rows key off the conversation id rather than the title.
 const CODEX_VIEW_TYPE = 'chatgpt.conversationEditor';
+// A Codex chat can also run inside Codex's own sidebar view, which is not an
+// editor tab and so invisible to the tab scan. A thread written to this
+// recently with no tab of its own is that case: shown as a live row, not as
+// a closed one.
+const CODEX_LIVE_MS = 5 * 60 * 1000;
 const CODEX_SCHEME = 'openai-codex';
 const CODEX_AUTHORITY = 'route';
 
@@ -601,27 +606,28 @@ async function newCodexInTab() {
 	// ViewColumn.Active — so a new agent lands wherever the last file was open
 	// rather than beside the chats. Note where the Claude chats live first.
 	const target = claudeTabs()[0];
+	const before = new Set(codexTabs().map((t) => t.tab));
 	await vscode.commands.executeCommand('chatgpt.newCodexPanel');
 	if (!target) return;
 
-	// The panel is created asynchronously; wait for it to become the active tab.
-	for (let attempt = 0; attempt < 20; attempt++) {
-		await new Promise((r) => setTimeout(r, 100));
-		const groups = vscode.window.tabGroups.all;
-		const activeIndex = groups.findIndex((g) => g.isActive);
-		const active = activeIndex >= 0 && groups[activeIndex].activeTab;
-		if (!active || !active.input || active.input.viewType !== CODEX_VIEW_TYPE) continue;
-		if (activeIndex === target.groupIndex) return;
-
-		// moveActiveEditor takes a direction and a count of groups, not an index.
-		const distance = Math.abs(activeIndex - target.groupIndex);
-		await vscode.commands.executeCommand('moveActiveEditor', {
-			to: activeIndex > target.groupIndex ? 'left' : 'right',
-			by: 'group',
-			value: distance,
-		});
-		return;
+	// The panel is created asynchronously and, since the 26.59 build, can take
+	// several seconds to register as a tab. Wait for a Codex tab that was not
+	// there before, in any group — it need not be the active one.
+	let fresh = null;
+	for (let attempt = 0; attempt < 100 && !fresh; attempt++) {
+		await new Promise((r) => setTimeout(r, 150));
+		fresh = codexTabs().find((t) => !before.has(t.tab)) || null;
 	}
+	if (!fresh || fresh.groupIndex === target.groupIndex) return;
+
+	// Activate it where it is, then move it by group distance.
+	await vscode.commands.executeCommand('openEditorsTools.focusChat', fresh.groupIndex, fresh.tabIndex);
+	const distance = Math.abs(fresh.groupIndex - target.groupIndex);
+	await vscode.commands.executeCommand('moveActiveEditor', {
+		to: fresh.groupIndex > target.groupIndex ? 'left' : 'right',
+		by: 'group',
+		value: distance,
+	});
 }
 
 // The spawn record lives in a JSON blob rather than a column:
@@ -901,7 +907,7 @@ class ChatsProvider {
 			rows.push({ ...t, kind: 'codex', data: this.codex.lookup(t.conversationId), subs });
 		}
 
-		this.hasRunningSubagents = this.hasRunningSubagents || rows.some((r) => r.kind === 'codex' && r.subs && r.subs.length);
+		this.hasRunningSubagents = this.hasRunningSubagents || rows.some((r) => (r.kind === 'codex' || r.kind === 'codex-live') && r.subs && r.subs.length);
 
 		// Chats whose tab was closed. The list above mirrors open tabs, so
 		// closing a tab used to silently drop the chat from the panel even
@@ -933,9 +939,15 @@ class ChatsProvider {
 				rows.push({ kind: 'claude-closed', data: entry });
 			}
 			const openCodexIds = new Set(rows.filter((r) => r.kind === 'codex').map((r) => r.conversationId));
+			const liveSince = Date.now() - CODEX_LIVE_MS;
 			for (const [id, thread] of this.codex.byId) {
 				if (thread.archived || !thread.title || thread.lastActivity < cutoff) continue;
 				if (openCodexIds.has(id)) continue;
+				if (thread.lastActivity >= liveSince) {
+					const subs = this.codex.subagentsFor(id, Date.now() - SUBAGENT_ACTIVE_MS);
+					rows.push({ kind: 'codex-live', conversationId: id, data: thread, subs });
+					continue;
+				}
 				rows.push({ kind: 'codex-closed', conversationId: id, data: thread });
 			}
 		}
@@ -957,6 +969,7 @@ class ChatsProvider {
 		// Usage lives in its own webview above this tree — see usageView.js.
 		const items = rows.map((row) => {
 			const item = row.kind === 'codex' ? this._codexItem(row)
+				: row.kind === 'codex-live' ? this._codexLiveItem(row)
 				: row.kind === 'claude-closed' ? this._closedClaudeItem(row.data)
 				: row.kind === 'codex-closed' ? this._closedCodexItem(row)
 				: this._item(row);
@@ -983,6 +996,43 @@ class ChatsProvider {
 			title: 'Reopen session',
 			arguments: [data.sessionId],
 		};
+		return item;
+	}
+
+	// Running in Codex's sidebar: no tab to focus, so a click opens the thread
+	// as a tab beside the Claude chat instead.
+	_codexLiveItem(row) {
+		const { data, conversationId, subs } = row;
+		const item = new vscode.TreeItem(data.title, subs && subs.length
+			? vscode.TreeItemCollapsibleState.Expanded
+			: vscode.TreeItemCollapsibleState.None);
+		item.id = `codex-live:${conversationId}`;
+		item.iconPath = this.codexIcon;
+		item.contextValue = 'codexChat';
+		item.command = {
+			command: 'openEditorsTools.openCodexHere',
+			title: 'Open thread',
+			arguments: [conversationId],
+		};
+		if (subs && subs.length) {
+			item.subagentItems = subs.map((sub) => {
+				const child = new vscode.TreeItem(sub.name, vscode.TreeItemCollapsibleState.None);
+				child.id = `${item.id}:agent:${sub.id}`;
+				child.parentItem = item;
+				child.iconPath = new vscode.ThemeIcon('sync~spin');
+				child.contextValue = 'subagent';
+				child.description = [sub.model, sub.tokens ? `${formatTokens(sub.tokens)} tok` : null, formatAge(sub.lastActivity)].filter(Boolean).join(' · ');
+				return child;
+			});
+		}
+		item.description = [
+			subs && subs.length ? `${subs.length} agent${subs.length > 1 ? 's' : ''}` : null,
+			formatAge(data.lastActivity),
+			data.tokens ? `${formatTokens(data.tokens)} tok` : null,
+			data.model,
+			'sidebar',
+		].filter(Boolean).join(' · ');
+		item.tooltip = `${data.title} — running in the Codex sidebar. Click to open it as a tab beside the Claude chat.`;
 		return item;
 	}
 
