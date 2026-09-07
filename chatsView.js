@@ -445,11 +445,13 @@ class TranscriptIndex {
 // metadata in ~/.codex/state_5.sqlite. Unlike Claude, the tab carries a real
 // URI, so rows key off the conversation id rather than the title.
 const CODEX_VIEW_TYPE = 'chatgpt.conversationEditor';
-// A Codex chat can also run inside Codex's own sidebar view, which is not an
-// editor tab and so invisible to the tab scan. A thread written to this
-// recently with no tab of its own is that case: shown as a live row, not as
-// a closed one.
-const CODEX_LIVE_MS = 5 * 60 * 1000;
+// A Codex chat can also run inside Codex's own sidebar view (no editor tab),
+// and a CLOUD task writes nothing locally at all while it works — thread row,
+// recency and rollout file all sit still (measured 146 minutes stale on an
+// actively working chat). Liveness is therefore unprovable from disk; a
+// recently touched thread gets the benefit of the doubt and renders as a live
+// row. Local work keeps the row honest through the rollout file's mtime.
+const CODEX_LIVE_MS = 3 * 60 * 60 * 1000;
 const CODEX_SCHEME = 'openai-codex';
 const CODEX_AUTHORITY = 'route';
 
@@ -500,7 +502,7 @@ class CodexIndex {
 			db = new DatabaseSync(file, { readOnly: true });
 			const rows = db.prepare(
 				'SELECT id, name, title, tokens_used, model, reasoning_effort, updated_at_ms, archived,'
-				+ ' thread_source, source, agent_nickname, agent_path FROM threads'
+				+ ' thread_source, source, agent_nickname, agent_path, rollout_path, recency_at_ms FROM threads'
 			).all();
 			const next = new Map();
 			const children = new Map();
@@ -513,6 +515,16 @@ class CodexIndex {
 					lastActivity: Number(row.updated_at_ms) || 0,
 					archived: !!row.archived,
 				};
+				// updated_at_ms stalls the moment work goes to the cloud; the
+				// rollout file keeps moving for local work. Take the newest of
+				// the three signals.
+				try {
+					if (row.rollout_path) {
+						const mtime = fs.statSync(row.rollout_path).mtimeMs;
+						if (mtime > entry.lastActivity) entry.lastActivity = mtime;
+					}
+				} catch (_) { /* rollout gone or unreadable */ }
+				if (Number(row.recency_at_ms) > entry.lastActivity) entry.lastActivity = Number(row.recency_at_ms);
 				if (row.thread_source === 'subagent') {
 					const parent = parentThreadId(row.source);
 					// A subagent with no traceable parent is dropped rather than
@@ -1046,7 +1058,9 @@ class ChatsProvider {
 	_closedCodexItem(row) {
 		const item = new vscode.TreeItem(row.data.title, vscode.TreeItemCollapsibleState.None);
 		item.id = `codex-closed:${row.conversationId}`;
-		item.iconPath = new vscode.ThemeIcon('history');
+		// The Codex logo, not the history codicon — a row should say which
+		// agent it is before it says how old it is.
+		item.iconPath = this.codexIcon;
 		item.contextValue = 'closedCodexChat';
 		item.description = [formatAge(row.data.lastActivity), 'closed', row.data.model].filter(Boolean).join(' · ');
 		item.tooltip = `${row.data.title} — closed Codex thread. Click to open it in a tab.`;
