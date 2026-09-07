@@ -694,9 +694,16 @@ function formatTokens(n) {
 
 // How long the agent has been working on the current turn (live), or how long
 // the last one took: your last message to the reply that answered it.
-function turnDuration(data, running) {
+// A turn is not over when the orchestrator ends its message while subagents
+// it spawned are still writing — the work is theirs until they stop. So the
+// turn runs while any subagent is active, and once settled it ends at the
+// later of the reply and the last subagent write.
+function turnDuration(data, running, subagents) {
 	if (!data || !data.lastUserAt) return null;
-	const end = running ? Date.now() : data.lastReplyAt;
+	const subs = subagents || { all: [], running: [] };
+	const live = running || (subs.running && subs.running.length > 0);
+	const lastSubWrite = (subs.all || []).reduce((m, a) => Math.max(m, a.mtimeMs || 0), 0);
+	const end = live ? Date.now() : Math.max(data.lastReplyAt || 0, lastSubWrite);
 	if (!end || end <= data.lastUserAt) return null;
 	const secs = Math.round((end - data.lastUserAt) / 1000);
 	if (secs < 60) return `${secs}s`;
@@ -1181,10 +1188,11 @@ class ChatsProvider {
 		const pct = data.contextLimit ? Math.round((data.contextTokens / data.contextLimit) * 100) : 0;
 		const subagents = row.subagents || { all: [], cost: 0, messages: 0 };
 		const totalCost = data.cost + subagents.cost;
-		const worked = turnDuration(data, state === 'running');
+		const worked = turnDuration(data, state === 'running', subagents);
+		const live = state === 'running' || (subs && subs.length > 0);
 		item.description = [
 			subs && subs.length ? `${subs.length} agent${subs.length > 1 ? 's' : ''}` : null,
-			worked ? (state === 'running' ? `⏱ ${worked}` : `${worked} turn`) : formatAge(data.lastActivity),
+			worked ? (live ? `⏱ ${worked}` : `${worked} turn`) : formatAge(data.lastActivity),
 			`${formatTokens(data.contextTokens)}/${formatTokens(data.contextLimit)}`,
 			formatCost(totalCost),
 		].filter(Boolean).join(' · ');
