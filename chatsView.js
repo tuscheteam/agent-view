@@ -973,14 +973,15 @@ class ChatsProvider {
 
 		// Most recent activity first. Tabs we cannot match (a brand new chat with
 		// no transcript yet) sort last rather than jumping to the top.
-		// Open tabs first, always — an open tab is in use by definition, even
-		// when its on-disk record is stale. Codex cloud sessions are the concrete
-		// case: their activity lives server-side, so the local thread record
-		// (updated_at, recency_at, rollout mtime, all checked) stops moving the
-		// moment work goes remote, and pure lastActivity sorting dropped a live
-		// tab below three weeks of closed history. Within each block, most
-		// recent activity first.
-		const openRank = (row) => (row.kind === 'claude-closed' || row.kind === 'codex-closed' ? 1 : 0);
+		// Only a Claude chat with no tab is provably closed, and those sink to a
+		// bottom block. A Codex chat cannot be classified: it can run in Codex's
+		// sidebar with no editor tab and idle for hours between local writes, so
+		// "no tab, 13h old" says nothing about whether it is closed. Sorting it
+		// with the open rows by recency put a same-morning Codex chat above 18
+		// older Claude tabs instead of dead last. Codex rows therefore never take
+		// the closed penalty; they sort purely on the newest of their three
+		// activity signals.
+		const openRank = (row) => (row.kind === 'claude-closed' ? 1 : 0);
 		rows.sort((a, b) =>
 			openRank(a) - openRank(b)
 			|| (b.data ? b.data.lastActivity : 0) - (a.data ? a.data.lastActivity : 0));
