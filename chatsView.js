@@ -461,7 +461,34 @@ let DatabaseSync = null;
 try { ({ DatabaseSync } = require('node:sqlite')); } catch (_) { /* fallback path */ }
 
 function codexDir() {
+	// CODEX_HOME is Codex's own override for ~/.codex; honouring it also lets
+	// tests point the index at a fixture directory.
 	return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+}
+
+// Codex bumps its schema by renaming the database (state_5.sqlite →
+// state_6.sqlite) and leaves the old file behind, so a pinned filename goes
+// stale on the next bump. Pick the highest N present.
+function codexStateDb() {
+	let best = null;
+	let bestN = -1;
+	try {
+		for (const name of fs.readdirSync(codexDir())) {
+			const m = /^state_(\d+)\.sqlite$/.exec(name);
+			if (m && Number(m[1]) > bestN) { bestN = Number(m[1]); best = path.join(codexDir(), name); }
+		}
+	} catch (_) { /* no ~/.codex at all */ }
+	return best;
+}
+
+// The guardian prompt preamble. Codex's guardian review threads open to an
+// empty chat; on builds that store them with thread_source NULL and no
+// parseable source blob, this first line of their title is the only marker
+// left to drop them by.
+const CODEX_GUARDIAN_PREAMBLE = 'The following is the Codex agent history';
+
+function isGuardianTitle(text) {
+	return typeof text === 'string' && text.startsWith(CODEX_GUARDIAN_PREAMBLE);
 }
 
 function codexConversationId(uri) {
@@ -481,6 +508,7 @@ class CodexIndex {
 		this.byId = new Map();
 		this.subagentsByParent = new Map();
 		this.source = 'none';
+		this.sourceFile = null; // basename of the sqlite db actually read
 	}
 
 	subagentsFor(threadId, activeSince) {
@@ -494,19 +522,32 @@ class CodexIndex {
 	}
 
 	_fromDatabase() {
-		const file = path.join(codexDir(), 'state_5.sqlite');
-		if (!fs.existsSync(file)) return false;
+		const file = codexStateDb();
+		if (!file) return false;
 		let db;
 		try {
 			// Read-only, always: Codex owns this database and may be writing it.
 			db = new DatabaseSync(file, { readOnly: true });
-			const rows = db.prepare(
-				'SELECT id, name, title, tokens_used, model, reasoning_effort, updated_at_ms, archived,'
-				+ ' thread_source, source, agent_nickname, agent_path, rollout_path, recency_at_ms FROM threads'
-			).all();
+			// Older Codex builds ship fewer columns; selecting a column that is
+			// not there throws, which used to dump the whole install on the
+			// JSONL fallback. Ask the schema first; a missing column simply
+			// reads as null on every row.
+			const have = new Set(db.prepare('PRAGMA table_info(threads)').all().map((c) => c.name));
+			const wanted = ['id', 'name', 'title', 'tokens_used', 'model', 'reasoning_effort',
+				'updated_at_ms', 'archived', 'thread_source', 'source', 'agent_nickname',
+				'agent_path', 'rollout_path', 'recency_at_ms', 'first_user_message'];
+			const cols = wanted.filter((c) => have.has(c));
+			if (!cols.includes('id')) return false;
+			const rows = db.prepare(`SELECT ${cols.join(', ')} FROM threads`).all();
 			const next = new Map();
 			const children = new Map();
 			for (const row of rows) {
+				// `codex exec` batch runs share the table but are not chats
+				// anyone opened — one host showed 200+ of them as closed rows.
+				if (row.source === 'exec') continue;
+				// Last-resort guard for guardian rows a build stored with
+				// neither thread_source='subagent' nor a parseable source blob.
+				if (isGuardianTitle(row.name) || isGuardianTitle(row.title) || isGuardianTitle(row.first_user_message)) continue;
 				const entry = {
 					title: row.name || row.title,
 					tokens: Number(row.tokens_used) || 0,
@@ -525,7 +566,9 @@ class CodexIndex {
 					}
 				} catch (_) { /* rollout gone or unreadable */ }
 				if (Number(row.recency_at_ms) > entry.lastActivity) entry.lastActivity = Number(row.recency_at_ms);
-				if (row.thread_source === 'subagent') {
+				// Some builds leave thread_source NULL on subagent rows, so the
+				// source blob is an equal authority on what spawned the thread.
+				if (row.thread_source === 'subagent' || subagentSource(row.source)) {
 					const parent = parentThreadId(row.source);
 					// A subagent with no traceable parent is dropped rather than
 					// listed: it is still not a chat anyone opened.
@@ -545,6 +588,7 @@ class CodexIndex {
 			this.byId = next;
 			this.subagentsByParent = children;
 			this.source = 'sqlite';
+			this.sourceFile = path.basename(file);
 			return true;
 		} catch (_) {
 			return false; // locked, WAL unreadable, or an older schema
@@ -565,6 +609,9 @@ class CodexIndex {
 			try {
 				const rec = JSON.parse(line);
 				if (!rec.id) continue;
+				// Same guardian guard as the sqlite path — the JSONL index has
+				// no thread_source field to filter on.
+				if (isGuardianTitle(rec.thread_name) || isGuardianTitle(rec.first_user_message)) continue;
 				next.set(rec.id, {
 					title: rec.thread_name,
 					tokens: 0,
@@ -646,12 +693,18 @@ async function newCodexInTab() {
 //   {"subagent":{"thread_spawn":{"parent_thread_id":"…","agent_nickname":"…"}}}
 // with a second shape, {"subagent":{"other":"guardian"}}, for Codex's own
 // review passes — those name no parent and are simply not listed.
-function parentThreadId(source) {
+function subagentSource(source) {
 	if (typeof source !== 'string' || source[0] !== '{') return null;
 	try {
-		const spawn = JSON.parse(source).subagent;
-		return (spawn && spawn.thread_spawn && spawn.thread_spawn.parent_thread_id) || null;
+		const parsed = JSON.parse(source);
+		if (!parsed || typeof parsed !== 'object' || !('subagent' in parsed)) return null;
+		return parsed.subagent || {};
 	} catch (_) { return null; }
+}
+
+function parentThreadId(source) {
+	const spawn = subagentSource(source);
+	return (spawn && spawn.thread_spawn && spawn.thread_spawn.parent_thread_id) || null;
 }
 
 function codexTabs() {
@@ -1138,7 +1191,7 @@ class ChatsProvider {
 		md.appendMarkdown(`| Last activity | ${formatAge(data.lastActivity)} |\n`);
 		if (data.tokens) md.appendMarkdown(`| Tokens used | ${data.tokens.toLocaleString()} |\n`);
 		md.appendMarkdown(`| Thread | \`${conversationId}\` |\n\n`);
-		md.appendMarkdown(`_Read from \`${this.codex.source === 'sqlite' ? '~/.codex/state_5.sqlite' : '~/.codex/session_index.jsonl'}\`. No cost shown — no verified price list for these models._`);
+		md.appendMarkdown(`_Read from \`${this.codex.source === 'sqlite' ? `~/.codex/${this.codex.sourceFile || 'state_N.sqlite'}` : '~/.codex/session_index.jsonl'}\`. No cost shown — no verified price list for these models._`);
 		item.tooltip = md;
 		return item;
 	}
