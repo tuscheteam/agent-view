@@ -191,11 +191,24 @@ const SUBAGENT_ACTIVE_MS = 120000;
 
 // Frames of the cli-spinners "dots" set. Child rows draw one as label text
 // so a running agent reads as work in progress; one shared frame index keeps
-// every row in step. The frame advances once per root render, no timer: an
-// 80 ms repaint interval used to drive it, and that event storm starved VS
-// Code's tree refresh — the panel sat frozen for 10+ minutes while agents
-// finished underneath it.
+// every row in step. A 200 ms timer advances it, with two guards learned the
+// hard way. The 0.13.9 timer fired a refresh for EVERY parent row per 80 ms
+// tick, and that starved VS Code's tree: AsyncDataTree.refreshNode makes a
+// root refresh wait for every in-flight child refresh that intersects it,
+// re-checking after each one resolves — with child refreshes arriving faster
+// than they completed, the root refresh (file watchers, the 45 s sweep)
+// never got a gap, and the panel sat frozen for 10+ minutes while agents
+// finished underneath it. 0.13.10 dropped the timer and advanced the frame
+// once per root render, which starved nothing but crawled — the glyph moved
+// only when a watcher or the sweep happened to fire. So now: each tick
+// repaints ONE parent row, round-robin, and while a root refresh is pending
+// or running the tick fires nothing at all (see spinnerTick).
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_INTERVAL_MS = 200;
+// A requested root refresh that never lands (a throw inside getChildren, a
+// disposed view) would otherwise mute the spinner forever; past this age the
+// pending flag is treated as stale and dropped.
+const ROOT_PENDING_MAX_MS = 10000;
 const subagentCache = new Map();
 
 // Claude Code writes agent-<id>.meta.json next to each subagent transcript at
@@ -1087,8 +1100,18 @@ class ChatsProvider {
 		// selection is driven from these — see syncSelection() in register().
 		this.items = [];
 		this.itemByTab = new Map();
-		// Shared spinner frame; getChildren advances it once per root render.
+		// Shared spinner frame, advanced by the 200 ms tick (spinnerTick).
 		this._spinnerFrame = 0;
+		this._spinnerTimer = null;
+		// Which parent row the next tick repaints — one per tick, round-robin,
+		// so at most five refresh promises per second are ever in flight.
+		this._spinnerParentIdx = 0;
+		// True from "a root refresh was requested" until the root getChildren
+		// returned. Ticks stay silent while it is set: a tick's own refresh is
+		// exactly the kind of in-flight work AsyncDataTree makes the root wait
+		// for, and enough of them back to back starve it out entirely.
+		this._rootPending = false;
+		this._rootPendingSince = 0;
 		// Labels of tabs the scan could not classify, as last logged — the
 		// "unrecognised tabs" diagnostic line fires only when this set changes.
 		this._lastUnrecognised = '';
@@ -1097,7 +1120,56 @@ class ChatsProvider {
 		this.onDidRender = this._onDidRender.event;
 	}
 
-	refresh() { this._onDidChangeTreeData.fire(); }
+	refresh() {
+		// The one place a root refresh is requested. Marking it before the
+		// fire() lets spinnerTick yield until the render lands.
+		this._rootPending = true;
+		this._rootPendingSince = Date.now();
+		this._onDidChangeTreeData.fire();
+	}
+
+	// Advance the shared frame and rewrite every child label in place, then
+	// repaint ONE parent row. A bare fire() would re-read every transcript
+	// five times a second, and firing all parents at once rebuilt the refresh
+	// pile-up that froze the tree in 0.13.9 — so the repaint rotates through
+	// the parents, and yields entirely while a root refresh is in flight.
+	spinnerTick() {
+		this._spinnerFrame = (this._spinnerFrame + 1) % SPINNER_FRAMES.length;
+		const frame = SPINNER_FRAMES[this._spinnerFrame];
+		const parents = [];
+		for (const item of this.items) {
+			if (!item.subagentItems || !item.subagentItems.length) continue;
+			parents.push(item);
+			for (const child of item.subagentItems) child.label = `${frame} ${child.baseLabel}`;
+		}
+		if (this._rootPending && Date.now() - this._rootPendingSince > ROOT_PENDING_MAX_MS) {
+			this._rootPending = false;
+			if (this.log) this.log('spinner: root refresh watchdog cleared');
+		}
+		if (this._rootPending || !parents.length) return;
+		this._spinnerParentIdx %= parents.length;
+		this._onDidChangeTreeData.fire(parents[this._spinnerParentIdx]);
+		this._spinnerParentIdx = (this._spinnerParentIdx + 1) % parents.length;
+	}
+
+	// Called after every root render: the interval runs only while a child
+	// row is on screen, so an idle tree costs nothing.
+	updateSpinner() {
+		const rows = this.items.filter((it) => it.subagentItems && it.subagentItems.length).length;
+		if (rows && !this._spinnerTimer) {
+			this._spinnerTimer = setInterval(() => this.spinnerTick(), SPINNER_INTERVAL_MS);
+			if (this.log) this.log(`spinner on: ${rows} row(s)`);
+		} else if (!rows) {
+			this.stopSpinner();
+		}
+	}
+
+	stopSpinner() {
+		if (!this._spinnerTimer) return;
+		clearInterval(this._spinnerTimer);
+		this._spinnerTimer = null;
+		if (this.log) this.log('spinner off');
+	}
 
 	getTreeItem(element) { return element; }
 
@@ -1108,10 +1180,13 @@ class ChatsProvider {
 		// Child level: the running subagents attached to a chat row.
 		if (element) return element.subagentItems || [];
 
-		// Root render: advance the shared spinner frame here, before the child
-		// rows are built, so the glyph moves whenever the tree naturally
-		// re-renders — file watchers, the 45 s sweep, tab switches.
-		this._spinnerFrame = (this._spinnerFrame + 1) % SPINNER_FRAMES.length;
+		// Root render underway: a spinner tick that fired now would hand
+		// AsyncDataTree another child refresh to wait on, so ticks go silent
+		// until this pass returns. Set here as well as in refresh(), because
+		// VS Code also calls the root getChildren on its own — view reveal,
+		// collapse-state changes — with no fire() beforehand.
+		this._rootPending = true;
+		this._rootPendingSince = Date.now();
 
 		const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
 		await this.index.refresh(folder ? folder.uri.fsPath : null);
@@ -1236,6 +1311,8 @@ class ChatsProvider {
 		this.itemByTab = new Map(items.filter((x) => x.tab).map((x) => [x.tab, x.item]));
 		this._logUnrecognisedTabs();
 		this._onDidRender.fire();
+		this._rootPending = false;
+		this.updateSpinner();
 		return this.items;
 	}
 
@@ -1296,6 +1373,8 @@ class ChatsProvider {
 		if (subs && subs.length) {
 			item.subagentItems = subs.map((sub) => {
 				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${sub.name}`, vscode.TreeItemCollapsibleState.None);
+				// spinnerTick rebuilds the label from this between renders.
+				child.baseLabel = sub.name;
 				child.id = `${item.id}:agent:${sub.id}`;
 				child.parentItem = item;
 				child.contextValue = 'subagent';
@@ -1362,6 +1441,7 @@ class ChatsProvider {
 		if (subs && subs.length) {
 			item.subagentItems = subs.map((sub) => {
 				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${sub.name}`, vscode.TreeItemCollapsibleState.None);
+				child.baseLabel = sub.name;
 				child.id = `${item.id}:agent:${sub.id}`;
 				child.parentItem = item;
 				child.contextValue = 'subagent';
@@ -1417,6 +1497,7 @@ class ChatsProvider {
 			item.subagentItems = subs.map((sub) => {
 				const name = sub.name || `agent ${sub.id.slice(0, 8)}`;
 				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${name}`, vscode.TreeItemCollapsibleState.None);
+				child.baseLabel = name;
 				child.contextValue = 'subagent';
 				// Same shape as a Codex child row — model · total tokens · age —
 				// plus cost, which stays because Claude models have a price list.
@@ -1843,7 +1924,7 @@ function register(context) {
 		// instant — the 1.5s transcript debounce is for file writes, not clicks.
 		vscode.window.tabGroups.onDidChangeTabs(() => provider.refresh()),
 		vscode.window.onDidChangeWindowState(() => provider.refresh()),
-		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); clearInterval(usageTick); watchers.forEach((w) => w.close()); } }
+		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); clearInterval(usageTick); provider.stopSpinner(); watchers.forEach((w) => w.close()); } }
 	);
 }
 
