@@ -188,6 +188,12 @@ async function readTranscript(file) {
 // completion record to read, and none is needed: mtime within the window says
 // "running", and the first line's prompt text names the agent.
 const SUBAGENT_ACTIVE_MS = 120000;
+
+// Frames of the cli-spinners "dots" set. Child rows draw one as label text
+// so a running agent ticks like a terminal spinner; one shared frame index
+// keeps every row in step.
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_INTERVAL_MS = 80;
 const subagentCache = new Map();
 
 // Claude Code writes agent-<id>.meta.json next to each subagent transcript at
@@ -971,11 +977,46 @@ class ChatsProvider {
 		// selection is driven from these — see syncSelection() in register().
 		this.items = [];
 		this.itemByTab = new Map();
+		// Spinner state. register() feeds viewVisible from the tree view's
+		// visibility events; a host without that API counts as visible.
+		this._spinnerFrame = 0;
+		this._spinnerTimer = null;
+		this.viewVisible = true;
 		this._onDidRender = new vscode.EventEmitter();
 		this.onDidRender = this._onDidRender.event;
 	}
 
 	refresh() { this._onDidChangeTreeData.fire(); }
+
+	// Advance the shared frame and repaint each rendered child row in place.
+	// Fires per child: a bare fire() would re-read every transcript at 12 Hz.
+	spinnerTick() {
+		this._spinnerFrame = (this._spinnerFrame + 1) % SPINNER_FRAMES.length;
+		const frame = SPINNER_FRAMES[this._spinnerFrame];
+		for (const item of this.items) {
+			for (const child of item.subagentItems || []) {
+				child.label = `${frame} ${child.baseLabel}`;
+				this._onDidChangeTreeData.fire(child);
+			}
+		}
+	}
+
+	// The interval runs only while a child row is on screen; a hidden view or
+	// a tree with no children stops it.
+	updateSpinner() {
+		const wanted = this.viewVisible && this.items.some((it) => it.subagentItems && it.subagentItems.length);
+		if (wanted && !this._spinnerTimer) {
+			this._spinnerTimer = setInterval(() => this.spinnerTick(), SPINNER_INTERVAL_MS);
+		} else if (!wanted) {
+			this.stopSpinner();
+		}
+	}
+
+	stopSpinner() {
+		if (!this._spinnerTimer) return;
+		clearInterval(this._spinnerTimer);
+		this._spinnerTimer = null;
+	}
 
 	getTreeItem(element) { return element; }
 
@@ -1107,6 +1148,7 @@ class ChatsProvider {
 		});
 		this.items = items.map((x) => x.item);
 		this.itemByTab = new Map(items.filter((x) => x.tab).map((x) => [x.tab, x.item]));
+		this.updateSpinner();
 		this._onDidRender.fire();
 		return this.items;
 	}
@@ -1145,10 +1187,10 @@ class ChatsProvider {
 		};
 		if (subs && subs.length) {
 			item.subagentItems = subs.map((sub) => {
-				const child = new vscode.TreeItem(sub.name, vscode.TreeItemCollapsibleState.None);
+				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${sub.name}`, vscode.TreeItemCollapsibleState.None);
+				child.baseLabel = sub.name;
 				child.id = `${item.id}:agent:${sub.id}`;
 				child.parentItem = item;
-				child.iconPath = new vscode.ThemeIcon('sync~spin');
 				child.contextValue = 'subagent';
 				child.description = [sub.model, sub.tokens ? `${formatTokens(sub.tokens)} tok` : null, formatAge(sub.lastActivity)].filter(Boolean).join(' · ');
 				return child;
@@ -1212,10 +1254,10 @@ class ChatsProvider {
 
 		if (subs && subs.length) {
 			item.subagentItems = subs.map((sub) => {
-				const child = new vscode.TreeItem(sub.name, vscode.TreeItemCollapsibleState.None);
+				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${sub.name}`, vscode.TreeItemCollapsibleState.None);
+				child.baseLabel = sub.name;
 				child.id = `${item.id}:agent:${sub.id}`;
 				child.parentItem = item;
-				child.iconPath = new vscode.ThemeIcon('sync~spin');
 				child.contextValue = 'subagent';
 				child.description = [
 					sub.model,
@@ -1267,8 +1309,9 @@ class ChatsProvider {
 		item.id = `chat:${data ? data.sessionId : `${groupIndex}:${tabIndex}`}`;
 		if (subs && subs.length) {
 			item.subagentItems = subs.map((sub) => {
-				const child = new vscode.TreeItem(sub.name || `agent ${sub.id.slice(0, 8)}`, vscode.TreeItemCollapsibleState.None);
-				child.iconPath = new vscode.ThemeIcon('sync~spin');
+				const name = sub.name || `agent ${sub.id.slice(0, 8)}`;
+				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${name}`, vscode.TreeItemCollapsibleState.None);
+				child.baseLabel = name;
 				child.contextValue = 'subagent';
 				// Same shape as a Codex child row — model · total tokens · age —
 				// plus cost, which stays because Claude models have a price list.
@@ -1401,6 +1444,17 @@ function register(context) {
 		treeDataProvider: provider,
 		showCollapseAll: false,
 	});
+
+	// The spinner has nothing to paint while the panel is hidden. The scratch
+	// tests' vscode stub returns a view without this event; a missing
+	// visibility API counts as visible.
+	provider.viewVisible = view.visible !== false;
+	if (typeof view.onDidChangeVisibility === 'function') {
+		context.subscriptions.push(view.onDidChangeVisibility((e) => {
+			provider.viewVisible = e.visible;
+			provider.updateSpinner();
+		}));
+	}
 
 	// Point the selection at the chat that is actually open. Selection is not
 	// moved for a non-chat tab: the last chat stays marked, which is still the
@@ -1624,7 +1678,7 @@ function register(context) {
 		// instant — the 1.5s transcript debounce is for file writes, not clicks.
 		vscode.window.tabGroups.onDidChangeTabs(() => provider.refresh()),
 		vscode.window.onDidChangeWindowState(() => provider.refresh()),
-		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); clearInterval(usageTick); watchers.forEach((w) => w.close()); } }
+		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); provider.stopSpinner(); clearInterval(usageTick); watchers.forEach((w) => w.close()); } }
 	);
 }
 
