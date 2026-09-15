@@ -190,23 +190,79 @@ async function readTranscript(file) {
 const SUBAGENT_ACTIVE_MS = 120000;
 const subagentCache = new Map();
 
+// Claude Code writes agent-<id>.meta.json next to each subagent transcript at
+// spawn time: {"agentType","description","workflowPhase","model",...}. The
+// description is the one-line name the spawner gave the agent — a far better
+// row label than a heading fished out of the prompt. The file never changes
+// after spawn, so a successful parse is cached for the life of the process; a
+// missing file (older Claude Code builds) or a malformed one reads as null and
+// stays silent.
+const subagentMetaCache = new Map();
+
+function readSubagentMeta(transcriptFile) {
+	const metaFile = transcriptFile.replace(/\.jsonl$/, '.meta.json');
+	if (subagentMetaCache.has(metaFile)) return subagentMetaCache.get(metaFile);
+	let meta = null;
+	try {
+		const parsed = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+		if (parsed && typeof parsed === 'object') meta = parsed;
+	} catch (_) { /* absent or malformed — the prompt-derived name covers it */ }
+	// Only a parsed meta is cached: the transcript can appear a beat before the
+	// meta file during spawn, and a cached null would hide it forever.
+	if (meta) subagentMetaCache.set(metaFile, meta);
+	return meta;
+}
+
 // Subagents bill against the same account as the chat that spawned them, and
 // their transcripts carry the same per-message `usage` and `model` fields — but
 // they are separate files, so a parent chat's own transcript understates what
 // the work cost.
 function readSubagentSummary(file, stat) {
 	const cached = subagentCache.get(file);
-	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached;
+	// A summary built before meta.json landed must not stick for a transcript
+	// that never changes again: on such a hit, re-check for the meta file once
+	// per refresh and rebuild only when it has appeared.
+	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size
+		&& (cached._metaApplied || !readSubagentMeta(file))) return cached;
 
 	const summary = {
 		mtimeMs: stat.mtimeMs,
 		size: stat.size,
 		model: null,
 		name: null,
+		// From the spawn meta file: what kind of agent this is (general-purpose,
+		// Explore, workflow-subagent), which workflow phase spawned it, and the
+		// model it was requested with — the transcript only knows the model once
+		// the first assistant message lands.
+		kind: null,
+		phase: null,
+		metaModel: null,
 		messages: 0,
 		cost: 0,
 		totals: { input: 0, output: 0, cacheRead: 0, write5m: 0, write1h: 0 },
 	};
+
+	const meta = readSubagentMeta(file);
+	summary._metaApplied = !!meta;
+	if (meta) {
+		if (typeof meta.description === 'string' && meta.description.trim()) {
+			const desc = meta.description.trim();
+			// Same cap style as threadLabel, tighter: a child row shares its line
+			// with model/tokens/age/cost.
+			if (desc.length > 40) {
+				let cut = desc.slice(0, 39);
+				// The cut can land inside a surrogate pair; a lone high surrogate
+				// renders as U+FFFD in the tree, so drop it before the ellipsis.
+				if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+				summary.name = `${cut.trimEnd()}…`;
+			} else {
+				summary.name = desc;
+			}
+		}
+		if (typeof meta.agentType === 'string') summary.kind = meta.agentType;
+		if (typeof meta.workflowPhase === 'string') summary.phase = meta.workflowPhase;
+		if (typeof meta.model === 'string') summary.metaModel = meta.model;
+	}
 
 	let text;
 	try { text = fs.readFileSync(file, 'utf8'); } catch (_) { return summary; }
@@ -1214,16 +1270,24 @@ class ChatsProvider {
 				const child = new vscode.TreeItem(sub.name || `agent ${sub.id.slice(0, 8)}`, vscode.TreeItemCollapsibleState.None);
 				child.iconPath = new vscode.ThemeIcon('sync~spin');
 				child.contextValue = 'subagent';
+				// Same shape as a Codex child row — model · total tokens · age —
+				// plus cost, which stays because Claude models have a price list.
+				// The in/out/cache split moved to the tooltip.
+				const rowModel = sub.model || sub.metaModel;
+				const rowTokens = sub.totals.input + sub.totals.cacheRead
+					+ sub.totals.write5m + sub.totals.write1h + sub.totals.output;
 				child.description = [
-					sub.model ? sub.model.replace(/^claude-/, '') : null,
-					`${formatTokens(sub.totals.input + sub.totals.cacheRead + sub.totals.write5m + sub.totals.write1h)} in`,
-					`${formatTokens(sub.totals.output)} out`,
-					formatCost(sub.cost),
+					rowModel ? rowModel.replace(/^claude-/, '') : null,
+					rowTokens ? `${formatTokens(rowTokens)} tok` : null,
+					formatAge(sub.mtimeMs),
+					sub.cost ? formatCost(sub.cost) : null,
 				].filter(Boolean).join(' · ');
 				const md = new vscode.MarkdownString();
 				md.appendMarkdown(`**${sub.name || 'subagent'}**\n\n`);
 				md.appendMarkdown(`| | |\n|---|---|\n`);
-				md.appendMarkdown(`| Model | \`${sub.model || 'unknown'}\` |\n`);
+				if (sub.kind) md.appendMarkdown(`| Kind | ${sub.kind} |\n`);
+				if (sub.phase) md.appendMarkdown(`| Phase | ${sub.phase} |\n`);
+				md.appendMarkdown(`| Model | \`${sub.model || sub.metaModel || 'unknown'}\` |\n`);
 				md.appendMarkdown(`| Turns | ${sub.messages} |\n`);
 				md.appendMarkdown(`| Input | ${sub.totals.input.toLocaleString()} |\n`);
 				md.appendMarkdown(`| Output | ${sub.totals.output.toLocaleString()} |\n`);

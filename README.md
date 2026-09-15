@@ -15,7 +15,7 @@ your account's rate-limit windows drawn as bars above them.
 | blue `●` badge | The agent is working right now |
 | orange `?` badge | The agent asked a question and is blocked on your answer |
 | green `●` badge | The agent replied and you have not read it yet. Clears when you look at the tab, or when you reply |
-| `⟳` child rows | Subagents working in the last 2 minutes, with per-agent model, tokens and cost. Codex subagents appear the same way, named by the nickname Codex gave them |
+| `⟳` child rows | Subagents working in the last 2 minutes, named by their spawn description, with model, total tokens, age and cost. Codex subagents appear the same way, named by the nickname Codex gave them |
 | `🕘` rows | Chats whose tab was closed; click to reopen the session |
 
 Hover any row for the full breakdown (model, turns, cache reads/writes, reset times).
