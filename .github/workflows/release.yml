@@ -14,6 +14,10 @@ jobs:
           node-version: 20
       - name: Package
         run: npx --yes @vscode/vsce package --no-dependencies
+      # A second copy under a fixed name, so /releases/latest/download/agent-view-latest.vsix
+      # resolves without knowing the version — the README's one-line update relies on it.
+      - name: Stable asset name
+        run: cp agent-view-*.vsix agent-view-latest.vsix
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}

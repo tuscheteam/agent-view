@@ -77,12 +77,20 @@ Or in VS Code: Extensions view → `···` menu → *Install from VSIX…*
 
 ## Updating
 
-Same command, any time — it replaces the installed version in place:
+One line, any time — it replaces the installed version in place. macOS / Linux / Git Bash:
 
 ```sh
-gh release download -R tuscheteam/agent-view -p "*.vsix" --clobber
-code --install-extension agent-view-*.vsix
+curl -sL -o agent-view.vsix https://github.com/tuscheteam/agent-view/releases/latest/download/agent-view-latest.vsix && code --install-extension agent-view.vsix
 ```
+
+Windows PowerShell:
+
+```powershell
+iwr https://github.com/tuscheteam/agent-view/releases/latest/download/agent-view-latest.vsix -OutFile agent-view.vsix; code --install-extension agent-view.vsix
+```
+
+Then reload the window. No terminal: download that same file and use the
+Extensions view → `···` → *Install from VSIX…*.
 
 Sideloaded extensions do not auto-update. To hear about new versions, click
 *Watch → Custom → Releases* on the repo.
