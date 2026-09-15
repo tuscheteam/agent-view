@@ -10,27 +10,7 @@ const chatsView = require('./chatsView');
 // The pin/unpin pair is two commands rather than one toggle because VS Code
 // ships no toggle command; the buttons swap via the built-in
 // `activeEditorIsPinned` context key in package.json.
-// Every command here drives another extension. If that extension is missing the
-// command simply does not exist, and executeCommand rejects with a message no
-// one can act on — so say which extension is needed and offer to open it.
-const COMPANIONS = {
-	'claude-vscode.editor.open': { id: 'Anthropic.claude-code', name: 'Claude Code' },
-	'chatgpt.newCodexPanel': { id: 'openai.chatgpt', name: 'Codex (ChatGPT)' },
-};
-
 async function forwardCommand(id) {
-	const companion = COMPANIONS[id];
-	if (companion && !vscode.extensions.getExtension(companion.id)) {
-		const open = 'Show extension';
-		const pick = await vscode.window.showWarningMessage(
-			`This needs the ${companion.name} extension, which is not installed.`,
-			open
-		);
-		if (pick === open) {
-			await vscode.commands.executeCommand('workbench.extensions.search', `@id:${companion.id}`);
-		}
-		return;
-	}
 	try {
 		await vscode.commands.executeCommand(id);
 	} catch (err) {
@@ -42,12 +22,10 @@ function activate(context) {
 	const forward = (id) => () => forwardCommand(id);
 
 	context.subscriptions.push(
-		// "Open in New Tab" — starts a fresh conversation as its own editor tab,
-		// so it shows up in this list immediately.
-		vscode.commands.registerCommand('openEditorsTools.newClaudeChat', forward('claude-vscode.editor.open')),
-		// openEditorsTools.newCodexChat is registered in chatsView.js — the
-		// extension's own chatgpt.newCodexPanel opens a route the webview has no
-		// component for, so we take the long way round instead.
+		// openEditorsTools.newClaudeChat and .newCodexChat are registered in
+		// chatsView.js — both must place the new tab in its agent's column,
+		// which needs the column helpers there. A bare forward opened the chat
+		// in whatever group happened to be active.
 		// Called without arguments on purpose: the built-ins resolve the active
 		// editor themselves, and forwarding the view's menu args misresolves them.
 		vscode.commands.registerCommand('openEditorsTools.pin', forward('workbench.action.pinEditor')),

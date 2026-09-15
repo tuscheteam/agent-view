@@ -725,11 +725,17 @@ async function newCodexInTab() {
 	if (!requireCodex()) return;
 	// createNewPanel picks its own column — the active text editor's, else
 	// ViewColumn.Active — so a new agent lands wherever the last file was open
-	// rather than beside the chats. Note where the Claude chats live first.
-	const target = claudeTabs()[0];
+	// rather than beside the chats. Note where it belongs first: the Codex
+	// column, else the group right of the Claude column, else wherever the
+	// panel opened.
+	const codexCol = codexColumn();
+	const claudeCol = claudeColumn();
+	const targetIndex = codexCol !== null ? codexCol
+		: claudeCol !== null ? claudeCol + 1
+		: null;
 	const before = new Set(codexTabs().map((t) => t.tab));
 	await vscode.commands.executeCommand('chatgpt.newCodexPanel');
-	if (!target) return;
+	if (targetIndex === null) return;
 
 	// The panel is created asynchronously and, since the 26.59 build, can take
 	// several seconds to register as a tab. Wait for a Codex tab that was not
@@ -739,13 +745,13 @@ async function newCodexInTab() {
 		await new Promise((r) => setTimeout(r, 150));
 		fresh = codexTabs().find((t) => !before.has(t.tab)) || null;
 	}
-	if (!fresh || fresh.groupIndex === target.groupIndex) return;
+	if (!fresh || fresh.groupIndex === targetIndex) return;
 
 	// Activate it where it is, then move it by group distance.
 	await vscode.commands.executeCommand('openEditorsTools.focusChat', fresh.groupIndex, fresh.tabIndex);
-	const distance = Math.abs(fresh.groupIndex - target.groupIndex);
+	const distance = Math.abs(fresh.groupIndex - targetIndex);
 	await vscode.commands.executeCommand('moveActiveEditor', {
-		to: fresh.groupIndex > target.groupIndex ? 'left' : 'right',
+		to: fresh.groupIndex > targetIndex ? 'left' : 'right',
 		by: 'group',
 		value: distance,
 	});
@@ -799,6 +805,55 @@ function claudeTabs() {
 		});
 	});
 	return out;
+}
+
+// ── Columns ────────────────────────────────────────────────────────────────
+// The layout this extension is built for keeps every Claude chat in one editor
+// group and every Codex conversation in the group to its right. "The Claude
+// column" is wherever most Claude tabs already sit — moving the majority
+// toward a single stray would churn the whole layout instead of correcting
+// the one tab that drifted.
+function columnOf(tabs) {
+	if (!tabs.length) return null;
+	const counts = new Map();
+	for (const t of tabs) counts.set(t.groupIndex, (counts.get(t.groupIndex) || 0) + 1);
+	const max = Math.max(...counts.values());
+	const tied = [...counts.keys()].filter((g) => counts.get(g) === max).sort((a, b) => a - b);
+	if (tied.length === 1) return tied[0];
+	// Tie: the group actively showing one of these tabs is the one in use,
+	// then the leftmost.
+	const groups = vscode.window.tabGroups.all;
+	const active = tied.find((g) => tabs.some(
+		(t) => t.groupIndex === g && groups[g] && groups[g].activeTab === t.tab));
+	return active !== undefined ? active : tied[0];
+}
+
+function claudeColumn() { return columnOf(claudeTabs()); }
+
+// Conversation tabs only: the "New Codex Agent" home page has no conversation
+// id and says nothing about where conversations live.
+function codexColumn() { return columnOf(codexTabs().filter((t) => t.conversationId)); }
+
+// VS Code ships focus-Nth-group commands only up to the fifth; a higher index
+// stays unfocused rather than focusing the wrong group.
+const FOCUS_GROUP_COMMANDS = [
+	'workbench.action.focusFirstEditorGroup',
+	'workbench.action.focusSecondEditorGroup',
+	'workbench.action.focusThirdEditorGroup',
+	'workbench.action.focusFourthEditorGroup',
+	'workbench.action.focusFifthEditorGroup',
+];
+
+async function focusGroup(index) {
+	const cmd = FOCUS_GROUP_COMMANDS[index];
+	if (cmd) await vscode.commands.executeCommand(cmd);
+}
+
+// There is no API to activate an arbitrary tab, and a webview tab has no URI
+// to re-open — so focus the owning group, then jump by index.
+async function activateTab(groupIndex, tabIndex) {
+	await focusGroup(groupIndex);
+	await vscode.commands.executeCommand('workbench.action.openEditorAtIndex', tabIndex);
 }
 
 function formatAge(ms) {
@@ -982,31 +1037,37 @@ class ChatsProvider {
 		this._spinnerFrame = 0;
 		this._spinnerTimer = null;
 		this.viewVisible = true;
+		this.log = null; // register() hands over the Output-channel logger
 		this._onDidRender = new vscode.EventEmitter();
 		this.onDidRender = this._onDidRender.event;
 	}
 
 	refresh() { this._onDidChangeTreeData.fire(); }
 
-	// Advance the shared frame and repaint each rendered child row in place.
-	// Fires per child: a bare fire() would re-read every transcript at 12 Hz.
+	// Advance the shared frame and repaint the child rows. The event names
+	// the parent row, not each child: VS Code re-reads a refreshed element's
+	// children and repaints them, whereas a refresh aimed at a child left the
+	// label unpainted on a real window. A bare fire() would re-read every
+	// transcript at 12 Hz, so only rows that have children are named.
 	spinnerTick() {
 		this._spinnerFrame = (this._spinnerFrame + 1) % SPINNER_FRAMES.length;
 		const frame = SPINNER_FRAMES[this._spinnerFrame];
 		for (const item of this.items) {
-			for (const child of item.subagentItems || []) {
-				child.label = `${frame} ${child.baseLabel}`;
-				this._onDidChangeTreeData.fire(child);
-			}
+			const kids = item.subagentItems || [];
+			if (!kids.length) continue;
+			for (const child of kids) child.label = `${frame} ${child.baseLabel}`;
+			this._onDidChangeTreeData.fire(item);
 		}
 	}
 
 	// The interval runs only while a child row is on screen; a hidden view or
 	// a tree with no children stops it.
 	updateSpinner() {
-		const wanted = this.viewVisible && this.items.some((it) => it.subagentItems && it.subagentItems.length);
+		const rows = this.items.filter((it) => it.subagentItems && it.subagentItems.length).length;
+		const wanted = this.viewVisible && rows > 0;
 		if (wanted && !this._spinnerTimer) {
 			this._spinnerTimer = setInterval(() => this.spinnerTick(), SPINNER_INTERVAL_MS);
+			if (this.log) this.log(`spinner on: ${rows} row(s) with agents`);
 		} else if (!wanted) {
 			this.stopSpinner();
 		}
@@ -1016,6 +1077,7 @@ class ChatsProvider {
 		if (!this._spinnerTimer) return;
 		clearInterval(this._spinnerTimer);
 		this._spinnerTimer = null;
+		if (this.log) this.log(`spinner off (${this.viewVisible ? 'no agents' : 'view hidden'})`);
 	}
 
 	getTreeItem(element) { return element; }
@@ -1431,6 +1493,7 @@ function register(context) {
 	const decorations = new ChatDecorations();
 	const seen = new SeenStore(context.globalState);
 	const provider = new ChatsProvider(index, context.extensionUri, decorations, seen);
+	provider.log = log;
 	// One cache feeds the bars; it repaints them itself whenever a lookup lands.
 	const usage = new UsageCache(() => usageView.render(), log);
 	const usageView = new UsageViewProvider(usage, log);
@@ -1549,15 +1612,37 @@ function register(context) {
 		// webview's router reports location "/" with no component — an empty
 		// page. A conversation URI carries its own route, so opening one
 		// directly is the test of whether the editor host works at all.
-		// Codex tabs land beside the Claude chat, in its group, so both agents
-		// live in one column instead of claiming one each.
+		// A thread opens in the Codex column; with no Codex column yet it goes
+		// one group right of the Claude column, which VS Code creates on
+		// demand, so Claude and Codex each keep a column of their own.
 		vscode.commands.registerCommand('openEditorsTools.openCodexHere', async (conversationId) => {
-			const target = claudeTabs()[0];
-			const group = target !== undefined
-				? vscode.window.tabGroups.all[target.groupIndex]
+			const codexCol = codexColumn();
+			const claudeCol = claudeColumn();
+			// ViewColumn is 1-based, so the group RIGHT of Claude group index
+			// N is view column N + 2.
+			const viewColumn = codexCol !== null
+				? vscode.window.tabGroups.all[codexCol].viewColumn
+				: claudeCol !== null ? claudeCol + 2
 				: undefined;
-			await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE,
-				group ? group.viewColumn : undefined);
+			await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE, viewColumn);
+		}),
+		// Registered here rather than in extension.js as a plain forward:
+		// claude-vscode.editor.open opens in the ACTIVE group, which is how new
+		// chats drifted into the file or Codex group. Focus the Claude column
+		// first, then open. No arguments on purpose — an argument would be
+		// taken as a session id.
+		vscode.commands.registerCommand('openEditorsTools.newClaudeChat', async () => {
+			if (!vscode.extensions.getExtension('Anthropic.claude-code')) {
+				vscode.window.showWarningMessage('This needs the Claude Code extension, which is not installed.');
+				return;
+			}
+			const column = claudeColumn();
+			if (column !== null) await focusGroup(column);
+			try {
+				await vscode.commands.executeCommand('claude-vscode.editor.open');
+			} catch (err) {
+				vscode.window.showErrorMessage(`Could not open a new Claude chat — ${err.message}`);
+			}
 		}),
 		vscode.commands.registerCommand('openEditorsTools.openCodexThread', async () => {
 			if (!requireCodex()) return;
@@ -1654,24 +1739,51 @@ function register(context) {
 		// the left of the editor. Undo is one palette entry away
 		// (View: Move Panel to Bottom).
 		vscode.commands.registerCommand('openEditorsTools.arrangeLeft', arrangeLeft),
+		// One click back to the full four-column layout after it drifts:
+		// Explorer | Agent View | Claude chats | Codex chats. Every step is
+		// best-effort on its own — a failing workbench command must not stop
+		// the tab herding behind it.
+		vscode.commands.registerCommand('openEditorsTools.arrangeLayout', async () => {
+			const step = async (name, fn) => {
+				try { await fn(); } catch (err) { log(`arrangeLayout: ${name} failed — ${err.message}`); }
+			};
+			// Panel to the left with Agent View showing, Explorer sidebar up.
+			await step('arrangeLeft', () => arrangeLeft());
+			await step('explorer', () => vscode.commands.executeCommand('workbench.view.explorer'));
+			// Exactly two side-by-side editor groups. setEditorLayout folds
+			// surplus groups' editors into the survivors; nothing is closed.
+			await step('setEditorLayout', () => vscode.commands.executeCommand('vscode.setEditorLayout', {
+				orientation: 0,
+				groups: [{}, {}],
+			}));
+			// Claude tabs into group 0, Codex conversation tabs into group 1.
+			// One stray at a time, re-reading tabGroups after every move —
+			// each move renumbers the indices the next one needs. The guard
+			// caps a host that refuses to move a tab.
+			await step('moveTabs', async () => {
+				for (let guard = 0; guard < 100; guard++) {
+					const strayClaude = claudeTabs().find((t) => t.groupIndex !== 0);
+					const strayCodex = codexTabs().filter((t) => t.conversationId).find((t) => t.groupIndex !== 1);
+					const stray = strayClaude || strayCodex;
+					if (!stray) break;
+					const target = strayClaude ? 0 : 1;
+					await activateTab(stray.groupIndex, stray.tabIndex);
+					await vscode.commands.executeCommand('moveActiveEditor', {
+						to: stray.groupIndex > target ? 'left' : 'right',
+						by: 'group',
+						value: Math.abs(stray.groupIndex - target),
+					});
+				}
+			});
+			// Land in the Claude column.
+			await step('focus', () => focusGroup(0));
+		}),
 		vscode.commands.registerCommand('openEditorsTools.refreshChats', () => {
 			usage.refreshAll();
 			usageView.render();
 			provider.refresh();
 		}),
-		vscode.commands.registerCommand('openEditorsTools.focusChat', async (groupIndex, tabIndex) => {
-			// There is no API to activate an arbitrary tab, and a webview tab has
-			// no URI to re-open — so focus the owning group, then jump by index.
-			const focusGroup = [
-				'workbench.action.focusFirstEditorGroup',
-				'workbench.action.focusSecondEditorGroup',
-				'workbench.action.focusThirdEditorGroup',
-				'workbench.action.focusFourthEditorGroup',
-				'workbench.action.focusFifthEditorGroup',
-			][groupIndex];
-			if (focusGroup) await vscode.commands.executeCommand(focusGroup);
-			await vscode.commands.executeCommand('workbench.action.openEditorAtIndex', tabIndex);
-		}),
+		vscode.commands.registerCommand('openEditorsTools.focusChat', activateTab),
 		vscode.window.tabGroups.onDidChangeTabs(scheduleRefresh),
 		vscode.window.tabGroups.onDidChangeTabGroups(scheduleRefresh),
 		// Switching tabs is what clears an unread mark, and it has to feel
@@ -1690,5 +1802,6 @@ module.exports = {
 		readTranscript, projectDirFor, ratesFor, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel,
+		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,
 	},
 };

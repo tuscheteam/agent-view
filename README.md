@@ -27,7 +27,9 @@ itself there — files, then chats, then the chat you are working in. That is a
 one-time move; drag things wherever you like afterwards. Two palette commands
 cover the rest: **Agent View: Show Chats Panel** brings the view back if it
 gets closed, and **Agent View: Arrange as Left Column** restores the layout.
-*View: Move Panel to Bottom* undoes it.
+*View: Move Panel to Bottom* undoes it. **Arrange Layout: Explorer | Agent View
+| Claude | Codex** restores the full four-column layout in one click — Explorer
+sidebar, then this panel, then a Claude group, then a Codex group.
 
 ## Buttons
 
