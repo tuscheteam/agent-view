@@ -57,6 +57,9 @@ the output style, CLAUDE.md rule and optional length hook that pair with this.
 activation, when the usage view was drawn, and every usage lookup with its
 result and timing.
 
+**Agent View: Log Open Tabs** writes one line per open tab — label, input kind
+and whether the scan recognised it as Claude or Codex — into that same log.
+
 `Claude token expired` in the usage rows is normal after an idle stretch: the
 stored token lasts 8 hours and only Claude Code renews it. The bars come back
 by themselves within a second of your next Claude message.

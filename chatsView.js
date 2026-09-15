@@ -190,10 +190,12 @@ async function readTranscript(file) {
 const SUBAGENT_ACTIVE_MS = 120000;
 
 // Frames of the cli-spinners "dots" set. Child rows draw one as label text
-// so a running agent ticks like a terminal spinner; one shared frame index
-// keeps every row in step.
+// so a running agent reads as work in progress; one shared frame index keeps
+// every row in step. The frame advances once per root render, no timer: an
+// 80 ms repaint interval used to drive it, and that event storm starved VS
+// Code's tree refresh — the panel sat frozen for 10+ minutes while agents
+// finished underneath it.
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const SPINNER_INTERVAL_MS = 80;
 const subagentCache = new Map();
 
 // Claude Code writes agent-<id>.meta.json next to each subagent transcript at
@@ -775,20 +777,70 @@ function parentThreadId(source) {
 	return (spawn && spawn.thread_spawn && spawn.thread_spawn.parent_thread_id) || null;
 }
 
+// The Codex extension also ships two webview VIEWS (chatgpt.sidebarView and
+// chatgpt.sidebarSecondaryView, both titled "Codex"; the title becomes the
+// thread name once a chat is open). VS Code lets a view be dragged into the
+// editor area, where its tab carries NO recognised input — tab.input is
+// undefined — and only the view title survives as the label. Matching that
+// label against the thread index is the one way left to recognise such a tab;
+// without it an open "POLARITY" view was listed as a closed thread and
+// codexColumn() overlooked its group, so openCodexHere's claudeColumn()+2
+// fallback kept creating new groups. Set by the ChatsProvider constructor.
+let codexIndexForTabs = null;
+
+// A thread id for a view-tab label, null for the "Codex" home view, undefined
+// when the label names no Codex thread. Only the Codex index is consulted, so
+// a Claude chat sharing the title cannot collide — Claude tabs always carry a
+// webview input and never reach this lookup.
+function codexViewThreadId(label) {
+	const key = String(label || '').trim().toLowerCase();
+	if (!key) return undefined;
+	if (key === 'codex') return null;
+	if (!codexIndexForTabs) return undefined;
+	for (const [id, thread] of codexIndexForTabs.byId) {
+		if (thread.title && String(thread.title).trim().toLowerCase() === key) return id;
+	}
+	return undefined;
+}
+
 function codexTabs() {
 	const out = [];
+	const viewTabs = [];
 	vscode.window.tabGroups.all.forEach((group, groupIndex) => {
 		group.tabs.forEach((tab, tabIndex) => {
 			const input = tab.input;
-			if (!input || input.viewType !== CODEX_VIEW_TYPE) return;
-			// A fresh "New Codex Agent" tab has route /extension/panel/new — no
-			// conversation id yet (it gets one server-side once the chat starts,
-			// but the tab URI never changes). conversationId stays null for it;
-			// the row still belongs in the list, or new agents would be invisible
-			// exactly like closed tabs used to be.
-			out.push({ tab, groupIndex, tabIndex, conversationId: codexConversationId(input.uri) });
+			if (input && input.viewType === CODEX_VIEW_TYPE) {
+				// A fresh "New Codex Agent" tab has route /extension/panel/new — no
+				// conversation id yet (it gets one server-side once the chat starts,
+				// but the tab URI never changes). conversationId stays null for it;
+				// the row still belongs in the list, or new agents would be invisible
+				// exactly like closed tabs used to be.
+				out.push({ tab, groupIndex, tabIndex, conversationId: codexConversationId(input.uri) });
+				return;
+			}
+			// A Codex view dragged into the editor area: no usable input, so the
+			// label is the evidence. These are ordinary editor tabs — herding and
+			// focus commands treat them like any Codex conversation tab. The
+			// guard mirrors _logUnrecognisedTabs: a tab with a viewType OR a uri
+			// is an ordinary editor, so a file named after a thread ("notes.md")
+			// cannot be claimed as a Codex view.
+			if (input && (input.viewType !== undefined || input.uri !== undefined)) return;
+			const matched = codexViewThreadId(tab.label);
+			if (matched === undefined) return;
+			viewTabs.push({ tab, groupIndex, tabIndex, conversationId: matched, view: true });
 		});
 	});
+	// A thread can be on screen twice — its conversation tab plus a dragged-out
+	// view, or both sidebar views sharing one title. Each duplicate would get
+	// item.id codex:<threadId>, and the tree throws on a repeated id, so only
+	// the first appearance of a thread survives. Conversation tabs win: their
+	// URI names the thread outright, a view tab only label-matches it.
+	const seen = new Set(out.map((t) => t.conversationId).filter(Boolean));
+	for (const v of viewTabs) {
+		if (v.conversationId && seen.has(v.conversationId)) continue;
+		if (v.conversationId) seen.add(v.conversationId);
+		out.push(v);
+	}
 	return out;
 }
 
@@ -1026,59 +1078,26 @@ class ChatsProvider {
 		this.icon = vscode.Uri.joinPath(extensionUri, 'resources', 'claude.svg');
 		this.codexIcon = vscode.Uri.joinPath(extensionUri, 'resources', 'codex.svg');
 		this.codex = new CodexIndex();
+		// codexTabs() is a free function shared by commands that run outside
+		// any provider, so it reaches the thread index through this ref.
+		codexIndexForTabs = this.codex;
 		this._onDidChangeTreeData = new vscode.EventEmitter();
 		this.onDidChangeTreeData = this._onDidChangeTreeData.event;
 		// Rendered top-level items, and the tab each one stands for. The tree
 		// selection is driven from these — see syncSelection() in register().
 		this.items = [];
 		this.itemByTab = new Map();
-		// Spinner state. register() feeds viewVisible from the tree view's
-		// visibility events; a host without that API counts as visible.
+		// Shared spinner frame; getChildren advances it once per root render.
 		this._spinnerFrame = 0;
-		this._spinnerTimer = null;
-		this.viewVisible = true;
+		// Labels of tabs the scan could not classify, as last logged — the
+		// "unrecognised tabs" diagnostic line fires only when this set changes.
+		this._lastUnrecognised = '';
 		this.log = null; // register() hands over the Output-channel logger
 		this._onDidRender = new vscode.EventEmitter();
 		this.onDidRender = this._onDidRender.event;
 	}
 
 	refresh() { this._onDidChangeTreeData.fire(); }
-
-	// Advance the shared frame and repaint the child rows. The event names
-	// the parent row, not each child: VS Code re-reads a refreshed element's
-	// children and repaints them, whereas a refresh aimed at a child left the
-	// label unpainted on a real window. A bare fire() would re-read every
-	// transcript at 12 Hz, so only rows that have children are named.
-	spinnerTick() {
-		this._spinnerFrame = (this._spinnerFrame + 1) % SPINNER_FRAMES.length;
-		const frame = SPINNER_FRAMES[this._spinnerFrame];
-		for (const item of this.items) {
-			const kids = item.subagentItems || [];
-			if (!kids.length) continue;
-			for (const child of kids) child.label = `${frame} ${child.baseLabel}`;
-			this._onDidChangeTreeData.fire(item);
-		}
-	}
-
-	// The interval runs only while a child row is on screen; a hidden view or
-	// a tree with no children stops it.
-	updateSpinner() {
-		const rows = this.items.filter((it) => it.subagentItems && it.subagentItems.length).length;
-		const wanted = this.viewVisible && rows > 0;
-		if (wanted && !this._spinnerTimer) {
-			this._spinnerTimer = setInterval(() => this.spinnerTick(), SPINNER_INTERVAL_MS);
-			if (this.log) this.log(`spinner on: ${rows} row(s) with agents`);
-		} else if (!wanted) {
-			this.stopSpinner();
-		}
-	}
-
-	stopSpinner() {
-		if (!this._spinnerTimer) return;
-		clearInterval(this._spinnerTimer);
-		this._spinnerTimer = null;
-		if (this.log) this.log(`spinner off (${this.viewVisible ? 'no agents' : 'view hidden'})`);
-	}
 
 	getTreeItem(element) { return element; }
 
@@ -1088,6 +1107,11 @@ class ChatsProvider {
 	async getChildren(element) {
 		// Child level: the running subagents attached to a chat row.
 		if (element) return element.subagentItems || [];
+
+		// Root render: advance the shared spinner frame here, before the child
+		// rows are built, so the glyph moves whenever the tree naturally
+		// re-renders — file watchers, the 45 s sweep, tab switches.
+		this._spinnerFrame = (this._spinnerFrame + 1) % SPINNER_FRAMES.length;
 
 		const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
 		await this.index.refresh(folder ? folder.uri.fsPath : null);
@@ -1210,9 +1234,31 @@ class ChatsProvider {
 		});
 		this.items = items.map((x) => x.item);
 		this.itemByTab = new Map(items.filter((x) => x.tab).map((x) => [x.tab, x.item]));
-		this.updateSpinner();
+		this._logUnrecognisedTabs();
 		this._onDidRender.fire();
 		return this.items;
+	}
+
+	// Diagnostic trail for tabs the scan cannot classify — a webview view
+	// dragged into the editor area arrives with tab.input undefined, and one
+	// such tab hid an open Codex thread behind a "closed" row. Logged only
+	// when the set changes, so the channel stays readable.
+	_logUnrecognisedTabs() {
+		const labels = [];
+		vscode.window.tabGroups.all.forEach((group) => {
+			group.tabs.forEach((tab) => {
+				const input = tab.input;
+				// An input with a viewType or a uri is an ordinary editor the
+				// scan already understands or skips on purpose.
+				if (input && (input.viewType !== undefined || input.uri !== undefined)) return;
+				if (codexViewThreadId(tab.label) !== undefined) return;
+				labels.push(tab.label);
+			});
+		});
+		const key = labels.join(' | ');
+		if (key === this._lastUnrecognised) return;
+		this._lastUnrecognised = key;
+		if (key && this.log) this.log(`unrecognised tabs: ${key}`);
 	}
 
 	_closedClaudeItem(data) {
@@ -1250,7 +1296,6 @@ class ChatsProvider {
 		if (subs && subs.length) {
 			item.subagentItems = subs.map((sub) => {
 				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${sub.name}`, vscode.TreeItemCollapsibleState.None);
-				child.baseLabel = sub.name;
 				child.id = `${item.id}:agent:${sub.id}`;
 				child.parentItem = item;
 				child.contextValue = 'subagent';
@@ -1317,7 +1362,6 @@ class ChatsProvider {
 		if (subs && subs.length) {
 			item.subagentItems = subs.map((sub) => {
 				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${sub.name}`, vscode.TreeItemCollapsibleState.None);
-				child.baseLabel = sub.name;
 				child.id = `${item.id}:agent:${sub.id}`;
 				child.parentItem = item;
 				child.contextValue = 'subagent';
@@ -1373,7 +1417,6 @@ class ChatsProvider {
 			item.subagentItems = subs.map((sub) => {
 				const name = sub.name || `agent ${sub.id.slice(0, 8)}`;
 				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${name}`, vscode.TreeItemCollapsibleState.None);
-				child.baseLabel = name;
 				child.contextValue = 'subagent';
 				// Same shape as a Codex child row — model · total tokens · age —
 				// plus cost, which stays because Claude models have a price list.
@@ -1507,17 +1550,6 @@ function register(context) {
 		treeDataProvider: provider,
 		showCollapseAll: false,
 	});
-
-	// The spinner has nothing to paint while the panel is hidden. The scratch
-	// tests' vscode stub returns a view without this event; a missing
-	// visibility API counts as visible.
-	provider.viewVisible = view.visible !== false;
-	if (typeof view.onDidChangeVisibility === 'function') {
-		context.subscriptions.push(view.onDidChangeVisibility((e) => {
-			provider.viewVisible = e.visible;
-			provider.updateSpinner();
-		}));
-	}
 
 	// Point the selection at the chat that is actually open. Selection is not
 	// moved for a non-chat tab: the last chat stays marked, which is still the
@@ -1717,6 +1749,27 @@ function register(context) {
 		// dragged the container: VS Code registers workbench.view.extension.<id>
 		// for every contributed container, and it opens the container in place.
 		vscode.commands.registerCommand('openEditorsTools.showLog', () => output.show(true)),
+		// One line per open tab, into the same channel: what the input object
+		// is, and whether the scan recognised it. This is the tool for "a chat
+		// is open but the panel lists it as closed" — a dragged-out webview
+		// view shows up here as input=none with recognised=codex-view or '-'.
+		vscode.commands.registerCommand('openEditorsTools.dumpTabs', () => {
+			vscode.window.tabGroups.all.forEach((group, i) => {
+				group.tabs.forEach((tab, j) => {
+					const input = tab.input;
+					const recognised = input && typeof input.viewType === 'string' && input.viewType.includes('claudeVSCodePanel') ? 'claude'
+						: input && input.viewType === CODEX_VIEW_TYPE ? 'codex'
+						: (!input || input.viewType === undefined) && codexViewThreadId(tab.label) !== undefined ? 'codex-view'
+						: '-';
+					log(`group ${i} tab ${j} label=${tab.label}`
+						+ ` input=${input ? (input.constructor && input.constructor.name) || 'object' : 'none'}`
+						+ ` viewType=${(input && input.viewType) || '-'}`
+						+ ` uri=${input && input.uri ? input.uri.toString() : '-'}`
+						+ ` recognised=${recognised} active=${tab.isActive === true}`);
+				});
+			});
+			output.show(true);
+		}),
 		// Opt-in, sticky: once turned on it survives Claude Code updates, which
 		// install a fresh directory and silently shed the override.
 		vscode.commands.registerCommand('openEditorsTools.restyleOn', async () => {
@@ -1790,7 +1843,7 @@ function register(context) {
 		// instant — the 1.5s transcript debounce is for file writes, not clicks.
 		vscode.window.tabGroups.onDidChangeTabs(() => provider.refresh()),
 		vscode.window.onDidChangeWindowState(() => provider.refresh()),
-		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); provider.stopSpinner(); clearInterval(usageTick); watchers.forEach((w) => w.close()); } }
+		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); clearInterval(usageTick); watchers.forEach((w) => w.close()); } }
 	);
 }
 
