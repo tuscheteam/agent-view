@@ -6,6 +6,8 @@ const readline = require('readline');
 const { UsageCache, watchCredentials } = require('./usage');
 const restyle = require('./restyle');
 const { UsageViewProvider } = require('./usageView');
+const { LeaderboardCache } = require('./leaderboard');
+const { LeaderboardViewProvider } = require('./leaderboardView');
 
 // A CHATS tree of our own, because the built-in OPEN EDITORS rows cannot carry
 // extra information: Claude chats are createWebviewPanel("claudeVSCodePanel")
@@ -1692,6 +1694,9 @@ function register(context) {
 	// One cache feeds the bars; it repaints them itself whenever a lookup lands.
 	const usage = new UsageCache(() => usageView.render(), log);
 	const usageView = new UsageViewProvider(usage, log);
+	const leaderboard = new LeaderboardCache(context, () => leaderboardView.render(), log);
+	const leaderboardView = new LeaderboardViewProvider(leaderboard, log);
+	leaderboard.start();
 
 	// A real TreeView rather than registerTreeDataProvider, because the panel has
 	// to drive its own selection: the grey highlight is the tree's selection, and
@@ -1789,6 +1794,9 @@ function register(context) {
 		vscode.window.registerWebviewViewProvider('openEditorsTools.usage', usageView, {
 			// Cheap to keep alive, and it avoids a blank flash every time the
 			// container is revealed.
+			webviewOptions: { retainContextWhenHidden: true },
+		}),
+		vscode.window.registerWebviewViewProvider('openEditorsTools.leaderboard', leaderboardView, {
 			webviewOptions: { retainContextWhenHidden: true },
 		}),
 		vscode.window.registerFileDecorationProvider(decorations),
@@ -1945,6 +1953,25 @@ function register(context) {
 		}),
 		vscode.commands.registerCommand('openEditorsTools.showChats', () =>
 			vscode.commands.executeCommand('workbench.view.extension.openEditorsToolsChats')),
+		vscode.commands.registerCommand('openEditorsTools.setAslApiKey', async () => {
+			const key = await vscode.window.showInputBox({
+				title: 'AI Stupid Level API key',
+				prompt: 'Stored in VS Code SecretStorage. It is never written to settings or git.',
+				password: true,
+				ignoreFocusOut: true,
+			});
+			if (!key) return;
+			await leaderboard.setApiKey(key);
+			vscode.window.showInformationMessage('AI Stupid Level API key saved. Leaderboard refresh queued.');
+		}),
+		vscode.commands.registerCommand('openEditorsTools.clearAslApiKey', async () => {
+			await leaderboard.clearApiKey();
+			vscode.window.showInformationMessage('AI Stupid Level API key removed.');
+		}),
+		vscode.commands.registerCommand('openEditorsTools.refreshLeaderboard', async () => {
+			await leaderboard.refreshNow({ reason: 'manual' });
+			leaderboardView.render();
+		}),
 		// The layout this panel is built for: file tree, then chats, then the
 		// chat itself. The panel is the one location VS Code lets us stand up as
 		// a column, so the container defaults there and this moves the panel to
@@ -1993,6 +2020,8 @@ function register(context) {
 		vscode.commands.registerCommand('openEditorsTools.refreshChats', () => {
 			usage.refreshAll();
 			usageView.render();
+			leaderboard.maybeRefresh('refresh-command');
+			leaderboardView.render();
 			provider.refresh();
 		}),
 		vscode.commands.registerCommand('openEditorsTools.focusChat', activateTab),
@@ -2002,7 +2031,7 @@ function register(context) {
 		// instant — the 1.5s transcript debounce is for file writes, not clicks.
 		vscode.window.tabGroups.onDidChangeTabs(() => provider.refresh()),
 		vscode.window.onDidChangeWindowState(() => provider.refresh()),
-		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); clearInterval(usageTick); provider.stopSpinner(); watchers.forEach((w) => w.close()); } }
+		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); clearInterval(usageTick); leaderboard.dispose(); provider.stopSpinner(); watchers.forEach((w) => w.close()); } }
 	);
 }
 

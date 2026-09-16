@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.13.12",
+  "version": "0.13.13",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -119,6 +119,23 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "openEditorsTools.refreshLeaderboard",
+        "title": "Refresh AI Stupid Level Leaderboard",
+        "category": "Agent View",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "openEditorsTools.setAslApiKey",
+        "title": "Set AI Stupid Level API Key",
+        "category": "Agent View",
+        "icon": "$(key)"
+      },
+      {
+        "command": "openEditorsTools.clearAslApiKey",
+        "title": "Clear AI Stupid Level API Key",
+        "category": "Agent View"
+      },
+      {
         "command": "openEditorsTools.focusChat",
         "title": "Focus Chat",
         "category": "Agent View"
@@ -164,6 +181,12 @@
           "initialSize": 1
         },
         {
+          "id": "openEditorsTools.leaderboard",
+          "name": "Leaderboard",
+          "type": "webview",
+          "initialSize": 2
+        },
+        {
           "id": "openEditorsTools.chats",
           "name": "Chats",
           "initialSize": 6
@@ -183,6 +206,15 @@
         {
           "command": "openEditorsTools.openCodexInEditor",
           "when": "false"
+        },
+        {
+          "command": "openEditorsTools.refreshLeaderboard"
+        },
+        {
+          "command": "openEditorsTools.setAslApiKey"
+        },
+        {
+          "command": "openEditorsTools.clearAslApiKey"
         },
         {
           "command": "openEditorsTools.arrangeLayout"
@@ -233,6 +265,16 @@
           "command": "openEditorsTools.refreshChats",
           "when": "view == openEditorsTools.chats",
           "group": "navigation@5"
+        },
+        {
+          "command": "openEditorsTools.refreshLeaderboard",
+          "when": "view == openEditorsTools.leaderboard",
+          "group": "navigation@1"
+        },
+        {
+          "command": "openEditorsTools.setAslApiKey",
+          "when": "view == openEditorsTools.leaderboard",
+          "group": "navigation@2"
         },
         {
           "command": "openEditorsTools.newClaudeChat",

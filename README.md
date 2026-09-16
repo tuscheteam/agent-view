@@ -45,6 +45,15 @@ Claude logo — new Claude chat as an editor tab. History icon beside it — reo
 session. Codex logo — new Codex agent, placed next to your chats. Second history icon — open any
 past Codex conversation in a tab. Refresh — re-read everything and refetch usage.
 
+## Leaderboard
+
+The Leaderboard panel shows AI Stupid Level's current OpenAI and Anthropic
+models in two compact columns: reasoning and coding. It uses the free API tier
+conservatively: five local-time refresh slots per day (`08:00`, `11:00`,
+`14:00`, `17:00`, `20:00`), two calls per slot, with the calls spaced apart for
+the 1/minute limit. Run **Agent View: Set AI Stupid Level API Key** once; the
+key is stored in VS Code SecretStorage, not in settings.
+
 ## Quiet timeline (optional)
 
 **Agent View: Restyle Claude Panel** collapses Claude Code's chat timeline the
@@ -139,6 +148,8 @@ Everything runs locally. Concretely, the extension:
 - reads Claude session transcripts under `~/.claude/projects/` (local files);
 - opens Codex's local thread database `~/.codex/state_5.sqlite` read-only, and spawns
   `codex app-server` locally to read rate limits — Codex handles its own credentials;
+- sends your AI Stupid Level API key only to `https://aistupidlevel.info/api/v1/models`
+  for the reasoning and coding leaderboard calls;
 - caches usage for 5 minutes; sends nothing anywhere else.
 
 ## Trademarks
