@@ -31,6 +31,14 @@ gets closed, and **Agent View: Arrange as Left Column** restores the layout.
 | Claude | Codex** restores the full four-column layout in one click — Explorer
 sidebar, then this panel, then a Claude group, then a Codex group.
 
+`openEditorsTools.codexOpenTarget` decides where a Codex row opens: `sidebar`
+loads the thread into the Codex sidebar panel, `editor` opens it as a tab in
+the Codex column, and `auto` (the default) uses the sidebar panel when one is
+open — including a Codex view dragged into the editor area — or when no Codex
+editor tab exists yet, and opens an editor tab otherwise. Right-click any Codex
+row for **Open in Codex Sidebar** and **Open in Editor Tab** to pick the other
+surface without changing the setting.
+
 ## Buttons
 
 Claude logo — new Claude chat as an editor tab. History icon beside it — reopen any past Claude
@@ -119,6 +127,7 @@ running there.
 | --- | --- | --- |
 | `openEditorsTools.closedChatHours` | `48` | How long closed chats stay listed. `0` hides them |
 | `openEditorsTools.recentFirst` | `false` | Move the editor you just activated to the top of its group |
+| `openEditorsTools.codexOpenTarget` | `auto` | Where a Codex row opens: `sidebar` panel, `editor` tab, or `auto` |
 
 ## Privacy
 

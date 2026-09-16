@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.13.11",
+  "version": "0.13.12",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -28,6 +28,21 @@
           "type": "number",
           "default": 48,
           "description": "Also list chats whose tab was closed, if their session was active within this many hours. Click a row to reopen it. 0 hides closed chats."
+        },
+        "openEditorsTools.codexOpenTarget": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "sidebar",
+            "editor"
+          ],
+          "default": "auto",
+          "enumDescriptions": [
+            "Use the Codex sidebar panel when one is open (also when it sits in the editor area) or when no Codex editor tab exists; otherwise open an editor tab in the Codex column",
+            "Always load threads into the Codex sidebar panel",
+            "Always open threads as editor tabs in the Codex column"
+          ],
+          "description": "Where clicking a Codex row, or New Codex Agent, opens the thread. Right-click a row for the other surface at any time."
         }
       }
     },
@@ -119,6 +134,16 @@
         "title": "Open Claude Session in Tab",
         "category": "Agent View",
         "icon": "$(history)"
+      },
+      {
+        "command": "openEditorsTools.openCodexInSidebar",
+        "title": "Open in Codex Sidebar",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.openCodexInEditor",
+        "title": "Open in Editor Tab",
+        "category": "Agent View"
       }
     ],
     "viewsContainers": {
@@ -152,10 +177,30 @@
           "when": "false"
         },
         {
+          "command": "openEditorsTools.openCodexInSidebar",
+          "when": "false"
+        },
+        {
+          "command": "openEditorsTools.openCodexInEditor",
+          "when": "false"
+        },
+        {
           "command": "openEditorsTools.arrangeLayout"
         },
         {
           "command": "openEditorsTools.dumpTabs"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "openEditorsTools.openCodexInSidebar",
+          "when": "view == openEditorsTools.chats && (viewItem == codexChat || viewItem == closedCodexChat)",
+          "group": "codex@1"
+        },
+        {
+          "command": "openEditorsTools.openCodexInEditor",
+          "when": "view == openEditorsTools.chats && (viewItem == codexChat || viewItem == closedCodexChat)",
+          "group": "codex@2"
         }
       ],
       "view/title": [

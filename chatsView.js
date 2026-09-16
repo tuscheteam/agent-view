@@ -727,6 +727,10 @@ function codexUri(conversationId) {
 // soon as the conversation exists.
 const CODEX_EXTENSION_ID = 'openai.chatgpt';
 
+// register() hands over its Output-channel logger so the free-function Codex
+// commands can trace the sidebar route they navigate to.
+let codexLog = null;
+
 // Codex features are dead weight without the extension that owns the data, so
 // name it rather than failing quietly on a missing command or an absent
 // ~/.codex.
@@ -770,6 +774,64 @@ async function newCodexInTab() {
 		by: 'group',
 		value: distance,
 	});
+}
+
+// Which surface a Codex thread opens on: navigate the existing Codex sidebar
+// panel, or open a fresh editor tab. Some users keep the Codex chat as the
+// sidebar view (placed in the editor area), others run a single conversation
+// panel — so the choice is a setting with an auto default. In "auto" the
+// sidebar wins whenever a Codex sidebar view is already on screen (codexTabs()
+// flags a dragged-out view view:true) OR no Codex conversation editor tab
+// exists at all, so a single-panel layout never grows a third surface. With a
+// conversation editor tab open and no sidebar view, "auto" keeps opening tabs.
+function resolveCodexTarget() {
+	const setting = vscode.workspace.getConfiguration('openEditorsTools').get('codexOpenTarget', 'auto');
+	if (setting === 'sidebar' || setting === 'editor') return setting;
+	const tabs = codexTabs();
+	const hasSidebarView = tabs.some((t) => t.view === true);
+	const hasConversationEditor = tabs.some((t) => t.view !== true && t.conversationId);
+	return (hasSidebarView || !hasConversationEditor) ? 'sidebar' : 'editor';
+}
+
+// Load a thread into the existing Codex sidebar panel. The extension registers
+// a UriHandler whose handleUri posts navigate-to-route to the sidebar webview,
+// so opening vscode://openai.chatgpt/local/<id> routes that panel to the
+// thread rather than spawning a tab. chatgpt.openSidebar first reveals the view
+// wherever it lives (side bar or editor area); both steps are best-effort, so a
+// one-time "Allow … to open this URI" prompt or a missing command cannot
+// strand the caller.
+async function openCodexInSidebar(conversationId) {
+	try { await vscode.commands.executeCommand('chatgpt.openSidebar'); } catch (_) { /* reveal is best-effort */ }
+	const route = `vscode://${CODEX_EXTENSION_ID}/local/${conversationId}`;
+	if (codexLog) codexLog(`codex sidebar route: ${route}`);
+	await vscode.env.openExternal(vscode.Uri.parse(route));
+}
+
+// Open a thread as a Codex custom-editor tab in the Codex column — the group
+// most Codex conversation tabs already sit in, else one group right of the
+// Claude column (ViewColumn is 1-based, so Claude group index N is column
+// N + 2), else wherever the host puts it.
+async function openCodexInEditor(conversationId) {
+	const codexCol = codexColumn();
+	const claudeCol = claudeColumn();
+	const viewColumn = codexCol !== null
+		? vscode.window.tabGroups.all[codexCol].viewColumn
+		: claudeCol !== null ? claudeCol + 2
+		: undefined;
+	await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE, viewColumn);
+}
+
+// "New Codex Agent" honouring the same target choice: in the sidebar a fresh
+// chat is chatgpt.newChat once the view is revealed; in an editor tab it is the
+// panel path newCodexInTab already drives.
+async function newCodexChat() {
+	if (!requireCodex()) return;
+	if (resolveCodexTarget() === 'sidebar') {
+		try { await vscode.commands.executeCommand('chatgpt.openSidebar'); } catch (_) { /* reveal is best-effort */ }
+		await vscode.commands.executeCommand('chatgpt.newChat');
+		return;
+	}
+	await newCodexInTab();
 }
 
 // The spawn record lives in a JSON blob rather than a column:
@@ -1363,6 +1425,9 @@ class ChatsProvider {
 			? vscode.TreeItemCollapsibleState.Expanded
 			: vscode.TreeItemCollapsibleState.None);
 		item.id = `codex-live:${conversationId}`;
+		// The context-menu commands reach the thread through this, whichever
+		// command the row's default click carries.
+		item.conversationId = conversationId;
 		item.iconPath = this.codexIcon;
 		item.contextValue = 'codexChat';
 		item.command = {
@@ -1389,19 +1454,20 @@ class ChatsProvider {
 			data.model,
 			'sidebar',
 		].filter(Boolean).join(' · ');
-		item.tooltip = `${data.title} — running in the Codex sidebar. Click to open it as a tab beside the Claude chat.`;
+		item.tooltip = `${data.title} — running in the Codex sidebar. Click to open it.`;
 		return item;
 	}
 
 	_closedCodexItem(row) {
 		const item = new vscode.TreeItem(row.data.title, vscode.TreeItemCollapsibleState.None);
 		item.id = `codex-closed:${row.conversationId}`;
+		item.conversationId = row.conversationId;
 		// The Codex logo, not the history codicon — a row should say which
 		// agent it is before it says how old it is.
 		item.iconPath = this.codexIcon;
 		item.contextValue = 'closedCodexChat';
 		item.description = [formatAge(row.data.lastActivity), 'closed', row.data.model].filter(Boolean).join(' · ');
-		item.tooltip = `${row.data.title} — closed Codex thread. Click to open it in a tab.`;
+		item.tooltip = `${row.data.title} — closed Codex thread. Click to open it.`;
 		item.command = {
 			command: 'openEditorsTools.openCodexHere',
 			title: 'Open thread',
@@ -1418,6 +1484,9 @@ class ChatsProvider {
 		// Identity is the thread, or the tab's position for an agent that has no
 		// thread yet — never the label, which two chats can share.
 		item.id = `codex:${conversationId || `new:${groupIndex}:${tabIndex}`}`;
+		// null for a brand-new agent with no thread yet; the sidebar/editor
+		// context commands no-op on that until the conversation exists.
+		item.conversationId = conversationId;
 		item.iconPath = this.codexIcon;
 		item.contextValue = 'codexChat';
 		item.command = {
@@ -1608,6 +1677,8 @@ function register(context) {
 	// "Agent View: Show Log".
 	const output = vscode.window.createOutputChannel('Agent View');
 	const log = (message) => output.appendLine(`${new Date().toISOString().slice(11, 19)}  ${message}`);
+	// Let the free-function Codex commands trace the sidebar route they open.
+	codexLog = log;
 	log(`activated on ${process.platform}, remote=${vscode.env.remoteName || 'local'}`);
 
 	if (context.globalState.get('openEditorsTools.restyle')) {
@@ -1725,19 +1796,26 @@ function register(context) {
 		// webview's router reports location "/" with no component — an empty
 		// page. A conversation URI carries its own route, so opening one
 		// directly is the test of whether the editor host works at all.
-		// A thread opens in the Codex column; with no Codex column yet it goes
-		// one group right of the Claude column, which VS Code creates on
-		// demand, so Claude and Codex each keep a column of their own.
+		// The row's default click. Where the thread lands follows the
+		// codexOpenTarget setting: the sidebar path navigates the existing Codex
+		// panel, the editor path opens a tab in the Codex column (created on
+		// demand right of Claude, so Claude and Codex keep separate columns).
 		vscode.commands.registerCommand('openEditorsTools.openCodexHere', async (conversationId) => {
-			const codexCol = codexColumn();
-			const claudeCol = claudeColumn();
-			// ViewColumn is 1-based, so the group RIGHT of Claude group index
-			// N is view column N + 2.
-			const viewColumn = codexCol !== null
-				? vscode.window.tabGroups.all[codexCol].viewColumn
-				: claudeCol !== null ? claudeCol + 2
-				: undefined;
-			await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE, viewColumn);
+			if (resolveCodexTarget() === 'sidebar') { await openCodexInSidebar(conversationId); return; }
+			await openCodexInEditor(conversationId);
+		}),
+		// Two explicit row commands so either surface is one right-click away
+		// regardless of the setting. Both take the tree item and read its
+		// conversationId; a new-agent row carries null and is skipped.
+		vscode.commands.registerCommand('openEditorsTools.openCodexInSidebar', async (item) => {
+			if (!requireCodex()) return;
+			const id = item && item.conversationId;
+			if (id) await openCodexInSidebar(id);
+		}),
+		vscode.commands.registerCommand('openEditorsTools.openCodexInEditor', async (item) => {
+			if (!requireCodex()) return;
+			const id = item && item.conversationId;
+			if (id) await openCodexInEditor(id);
 		}),
 		// Registered here rather than in extension.js as a plain forward:
 		// claude-vscode.editor.open opens in the ACTIVE group, which is how new
@@ -1790,7 +1868,7 @@ function register(context) {
 				vscode.window.showErrorMessage(`Could not open ${uri.toString()} — ${err.message}`);
 			}
 		}),
-		vscode.commands.registerCommand('openEditorsTools.newCodexChat', newCodexInTab),
+		vscode.commands.registerCommand('openEditorsTools.newCodexChat', newCodexChat),
 		// The counterpart to the Codex thread picker: Claude sessions are only
 		// reachable from the tree while they are inside the closed-chat window,
 		// so this reaches the whole transcript history.
@@ -1937,5 +2015,6 @@ module.exports = {
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel,
 		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,
+		resolveCodexTarget, openCodexInSidebar, openCodexInEditor, newCodexChat,
 	},
 };
