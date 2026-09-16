@@ -1953,6 +1953,10 @@ function register(context) {
 		}),
 		vscode.commands.registerCommand('openEditorsTools.showChats', () =>
 			vscode.commands.executeCommand('workbench.view.extension.openEditorsToolsChats')),
+		vscode.commands.registerCommand('openEditorsTools.showLeaderboard', async () => {
+			await vscode.commands.executeCommand('workbench.view.extension.openEditorsToolsChats');
+			await vscode.commands.executeCommand('openEditorsTools.leaderboard.focus');
+		}),
 		vscode.commands.registerCommand('openEditorsTools.setAslApiKey', async () => {
 			const key = await vscode.window.showInputBox({
 				title: 'AI Stupid Level API key',

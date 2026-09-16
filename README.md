@@ -52,7 +52,8 @@ models in two compact columns: reasoning and coding. It uses the free API tier
 conservatively: five local-time refresh slots per day (`08:00`, `11:00`,
 `14:00`, `17:00`, `20:00`), two calls per slot, with the calls spaced apart for
 the 1/minute limit. Run **Agent View: Set AI Stupid Level API Key** once; the
-key is stored in VS Code SecretStorage, not in settings.
+key is stored in VS Code SecretStorage, not in settings. If VS Code keeps the
+new view hidden after an update, run **Agent View: Show Leaderboard Panel**.
 
 ## Quiet timeline (optional)
 

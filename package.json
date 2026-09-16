@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.13.13",
+  "version": "0.13.14",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -50,6 +50,11 @@
       {
         "command": "openEditorsTools.showChats",
         "title": "Show Chats Panel",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.showLeaderboard",
+        "title": "Show Leaderboard Panel",
         "category": "Agent View"
       },
       {
@@ -184,7 +189,8 @@
           "id": "openEditorsTools.leaderboard",
           "name": "Leaderboard",
           "type": "webview",
-          "initialSize": 2
+          "initialSize": 2,
+          "visibility": "visible"
         },
         {
           "id": "openEditorsTools.chats",
@@ -215,6 +221,9 @@
         },
         {
           "command": "openEditorsTools.clearAslApiKey"
+        },
+        {
+          "command": "openEditorsTools.showLeaderboard"
         },
         {
           "command": "openEditorsTools.arrangeLayout"
