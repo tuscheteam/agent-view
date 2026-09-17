@@ -7,7 +7,7 @@ const { UsageCache, watchCredentials } = require('./usage');
 const restyle = require('./restyle');
 const { UsageViewProvider } = require('./usageView');
 const { LeaderboardCache } = require('./leaderboard');
-const { LeaderboardViewProvider } = require('./leaderboardView');
+const { LeaderboardViewProvider, infoLines } = require('./leaderboardView');
 
 // A CHATS tree of our own, because the built-in OPEN EDITORS rows cannot carry
 // extra information: Claude chats are createWebviewPanel("claudeVSCodePanel")
@@ -1994,6 +1994,13 @@ function register(context) {
 		vscode.commands.registerCommand('openEditorsTools.clearAslApiKey', async () => {
 			await leaderboard.clearApiKey();
 			vscode.window.showInformationMessage('AI Stupid Level API key removed.');
+		}),
+		vscode.commands.registerCommand('openEditorsTools.leaderboardInfo', async () => {
+			const snapshot = leaderboard.getSnapshot();
+			snapshot.hasKey = await leaderboard.hasKey();
+			const lines = infoLines(snapshot);
+			if (!snapshot.hasKey) lines.push('No API key set. Run "Agent View: Set AI Stupid Level API Key".');
+			vscode.window.showInformationMessage('Leaderboard', { modal: true, detail: lines.join('\n') });
 		}),
 		vscode.commands.registerCommand('openEditorsTools.refreshLeaderboard', async () => {
 			await leaderboard.refreshNow({ reason: 'manual' });

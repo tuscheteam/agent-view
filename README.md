@@ -60,6 +60,11 @@ the 1/minute limit. Run **Agent View: Set AI Stupid Level API Key** once; the
 key is stored in VS Code SecretStorage, not in settings. If VS Code keeps the
 new view hidden after an update, run **Agent View: Show Leaderboard Panel**.
 
+The rank colour names the provider: white for OpenAI, orange for Anthropic,
+whose `claude-` prefix is dropped in the cell (hover a row for the full name).
+Source, schedule, freshness and remaining quota sit behind the view's info
+button.
+
 ## Quiet timeline (optional)
 
 **Agent View: Restyle Claude Panel** collapses Claude Code's chat timeline the

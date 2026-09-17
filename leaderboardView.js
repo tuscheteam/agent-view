@@ -38,7 +38,6 @@ class LeaderboardViewProvider {
 			this._column('Reasoning', snapshot.reasoning),
 			this._column('Coding', snapshot.coding),
 		].join('\n');
-		const state = stateLine(snapshot);
 		const notice = noticeLine(snapshot);
 
 		return `<!DOCTYPE html>
@@ -48,32 +47,13 @@ class LeaderboardViewProvider {
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <style nonce="${nonce}">
 	body {
-		padding: 10px 12px 12px;
+		padding: 6px 8px 8px;
 		margin: 0;
 		font-family: var(--vscode-font-family);
 		font-size: var(--vscode-font-size);
 		color: var(--vscode-foreground);
 	}
-	.top {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 8px;
-		margin-bottom: 8px;
-	}
-	.title {
-		font-weight: 650;
-		letter-spacing: 0;
-	}
-	.pill {
-		border: 1px solid var(--vscode-widget-border);
-		border-radius: 999px;
-		padding: 1px 6px;
-		color: var(--vscode-descriptionForeground);
-		font-size: 0.86em;
-		white-space: nowrap;
-	}
-	.meta, .notice {
+	.notice {
 		color: var(--vscode-descriptionForeground);
 		font-size: 0.9em;
 		line-height: 1.35;
@@ -83,7 +63,7 @@ class LeaderboardViewProvider {
 	.grid {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-		gap: 10px;
+		gap: 6px;
 	}
 	.col {
 		min-width: 0;
@@ -97,7 +77,7 @@ class LeaderboardViewProvider {
 		justify-content: space-between;
 		align-items: baseline;
 		gap: 6px;
-		padding: 7px 8px;
+		padding: 5px 6px;
 		border-bottom: 1px solid var(--vscode-widget-border);
 	}
 	.col-title { font-weight: 650; }
@@ -108,18 +88,24 @@ class LeaderboardViewProvider {
 	}
 	.row {
 		display: grid;
-		grid-template-columns: 2.2em minmax(0, 1fr) 2.5em;
+		grid-template-columns: 1.9em minmax(0, 1fr) max-content;
 		align-items: center;
-		gap: 6px;
-		min-height: 34px;
-		padding: 5px 8px;
+		gap: 4px;
+		min-height: 20px;
+		padding: 3px 6px;
 		border-bottom: 1px solid color-mix(in srgb, var(--vscode-widget-border) 65%, transparent);
 	}
 	.row:last-child { border-bottom: 0; }
+	/* The rank colour names the provider, the same pair the Usage bars use:
+	   foreground white for OpenAI, the Claude orange for Anthropic. It replaced
+	   a provider line under every model, which cost a text row per entry. */
 	.rank {
 		color: var(--vscode-descriptionForeground);
 		font-variant-numeric: tabular-nums;
+		font-weight: 600;
 	}
+	.rank.openai { color: var(--vscode-foreground); }
+	.rank.anthropic { color: #D97757; }
 	.model { min-width: 0; }
 	.name {
 		overflow: hidden;
@@ -127,23 +113,6 @@ class LeaderboardViewProvider {
 		white-space: nowrap;
 		font-weight: 600;
 	}
-	.provider {
-		display: flex;
-		align-items: center;
-		gap: 5px;
-		color: var(--vscode-descriptionForeground);
-		font-size: 0.86em;
-		margin-top: 1px;
-	}
-	.dot {
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		background: var(--vscode-descriptionForeground);
-		flex: 0 0 auto;
-	}
-	.dot.openai { background: var(--vscode-foreground); }
-	.dot.anthropic { background: #D97757; }
 	.score {
 		text-align: right;
 		font-weight: 650;
@@ -161,11 +130,6 @@ class LeaderboardViewProvider {
 </style>
 </head>
 <body>
-<div class="top">
-	<div class="title">AI Stupid Level</div>
-	<div class="pill">2 calls / refresh</div>
-</div>
-<div class="meta">${state}</div>
 ${notice}
 <div class="grid">
 ${columns}
@@ -190,13 +154,20 @@ ${rows}
 
 function rowHtml(row) {
 	return `<div class="row" title="${escapeHtml(`${row.name} · ${providerLabel(row.provider)}`)}">
-	<div class="rank">#${escapeHtml(row.rank)}</div>
+	<div class="rank ${escapeHtml(row.provider)}">#${escapeHtml(row.rank)}</div>
 	<div class="model">
-		<div class="name">${escapeHtml(row.name)}</div>
-		<div class="provider"><span class="dot ${escapeHtml(row.provider)}"></span>${escapeHtml(providerLabel(row.provider))}</div>
+		<div class="name">${escapeHtml(shortName(row))}</div>
 	</div>
 	<div class="score">${row.score === null ? '-' : escapeHtml(formatScore(row.score))}</div>
 </div>`;
+}
+
+// The orange rank already says Anthropic, so the "claude-" prefix only costs
+// the width that decides whether "fable-5-1" fits or ends in an ellipsis. The
+// row tooltip keeps the full name.
+function shortName(row) {
+	const name = String(row.name || '');
+	return row.provider === 'anthropic' ? name.replace(/^claude-/i, '') : name;
 }
 
 function stateLine(snapshot) {
@@ -209,10 +180,22 @@ function stateLine(snapshot) {
 function noticeLine(snapshot) {
 	if (!snapshot.hasKey) return '<div class="notice error">No API key set. Run “Agent View: Set AI Stupid Level API Key”.</div>';
 	if (snapshot.lastError) return `<div class="notice error">${escapeHtml(snapshot.lastError)}</div>`;
-	const quota = snapshot.reasoning && snapshot.reasoning.quota && snapshot.reasoning.quota.remaining
-		? `API remaining after reasoning: ${snapshot.reasoning.quota.remaining}`
-		: 'Source: aistupidlevel.info';
-	return `<div class="notice">${escapeHtml(quota)}</div>`;
+	return '';
+}
+
+// Everything that used to sit above the table — source, schedule, freshness,
+// quota — now answers the view's info button, so the panel itself is the two
+// columns and nothing else.
+function infoLines(snapshot) {
+	const quota = snapshot.reasoning && snapshot.reasoning.quota && snapshot.reasoning.quota.remaining;
+	return [
+		'Source: AI Stupid Level (aistupidlevel.info), OpenAI and Anthropic models only.',
+		'Rank colour: white = OpenAI, orange = Anthropic. Hover a row for the full model name.',
+		stateLine(snapshot),
+		'Each refresh costs 2 API calls, spaced for the free 1/min limit.',
+		quota ? `API calls remaining after the last reasoning fetch: ${quota}` : null,
+		snapshot.lastError ? `Last error: ${snapshot.lastError}` : null,
+	].filter(Boolean);
 }
 
 function formatScore(score) {
@@ -258,4 +241,4 @@ function escapeHtml(text) {
 	return String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
-module.exports = { LeaderboardViewProvider, _internal: { stateLine, noticeLine, rowHtml } };
+module.exports = { LeaderboardViewProvider, infoLines, _internal: { stateLine, noticeLine, rowHtml, infoLines } };

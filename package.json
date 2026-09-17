@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.13.15",
+  "version": "0.13.16",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -129,6 +129,12 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "openEditorsTools.leaderboardInfo",
+        "title": "Leaderboard Info: Source, Schedule and Quota",
+        "category": "Agent View",
+        "icon": "$(info)"
+      },
+      {
         "command": "openEditorsTools.refreshLeaderboard",
         "title": "Refresh AI Stupid Level Leaderboard",
         "category": "Agent View",
@@ -219,6 +225,9 @@
           "when": "false"
         },
         {
+          "command": "openEditorsTools.leaderboardInfo"
+        },
+        {
           "command": "openEditorsTools.refreshLeaderboard"
         },
         {
@@ -279,6 +288,11 @@
           "command": "openEditorsTools.refreshChats",
           "when": "view == openEditorsTools.chats",
           "group": "navigation@5"
+        },
+        {
+          "command": "openEditorsTools.leaderboardInfo",
+          "when": "view == openEditorsTools.leaderboard",
+          "group": "navigation@0"
         },
         {
           "command": "openEditorsTools.refreshLeaderboard",
