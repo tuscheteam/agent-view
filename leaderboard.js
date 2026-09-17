@@ -2,6 +2,11 @@ const API_BASE = 'https://aistupidlevel.info/api/v1';
 const SECRET_KEY = 'openEditorsTools.aslApiKey';
 const CACHE_KEY = 'openEditorsTools.aslLeaderboardCache';
 const REFRESH_HOURS = [8, 11, 14, 17, 20];
+// The site's CODING tab is its "speed" key, which its own frontend rewrites to
+// sortBy=7axis before every request. sortBy=coding is accepted by the API too
+// but returns the COMBINED numbers — the column showed gpt-5.5 at 86 while the
+// site's CODING tab said 91.
+const CODING_SORT = '7axis';
 const REQUEST_SPACING_MS = 65000;
 const TIMER_MAX_MS = 24 * 60 * 60 * 1000;
 const ALLOWED_PROVIDERS = new Set(['openai', 'anthropic']);
@@ -16,6 +21,11 @@ class LeaderboardCache {
 		this.sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
 		this.spacingMs = options.spacingMs === undefined ? REQUEST_SPACING_MS : options.spacingMs;
 		this.cache = context.globalState.get(CACHE_KEY) || emptyCache();
+		// A coding column cached under another mode is wrong data with a right
+		// label; an empty column until the next fetch is the honest state.
+		if (this.cache.coding && this.cache.coding.sortBy !== CODING_SORT) {
+			this.cache = { ...this.cache, coding: null };
+		}
 		this.inFlight = false;
 		this.timer = null;
 	}
@@ -55,10 +65,13 @@ class LeaderboardCache {
 			this._notify();
 			return false;
 		}
-		return this.refreshNow({ reason, slotKey });
+		// Only the coding column missing for this slot (it was just dropped as
+		// stale): one call instead of two, the free tier has ten a day.
+		const codingOnly = this.cache.lastSlotKey === slotKey && Boolean(this.cache.reasoning) && !this.cache.coding;
+		return this.refreshNow({ reason, slotKey, codingOnly });
 	}
 
-	async refreshNow({ reason = 'manual', slotKey = slotKeyFor(this.now()) || manualSlotKey(this.now()) } = {}) {
+	async refreshNow({ reason = 'manual', slotKey = slotKeyFor(this.now()) || manualSlotKey(this.now()), codingOnly = false } = {}) {
 		if (this.inFlight) return false;
 		const key = await this.context.secrets.get(SECRET_KEY);
 		if (!key) {
@@ -96,13 +109,15 @@ class LeaderboardCache {
 		this.log(`ASL leaderboard refresh started (${reason}, slot=${slotKey})`);
 
 		try {
-			const reasoning = await fetchModels(this.fetchImpl, key, 'reasoning');
-			this.cache = { ...this.cache, reasoning, lastError: null };
-			await this._save();
-			this._notify();
-			if (this.spacingMs > 0) await this.sleep(this.spacingMs);
+			if (!codingOnly) {
+				const reasoning = await fetchModels(this.fetchImpl, key, 'reasoning');
+				this.cache = { ...this.cache, reasoning, lastError: null };
+				await this._save();
+				this._notify();
+				if (this.spacingMs > 0) await this.sleep(this.spacingMs);
+			}
 
-			const coding = await fetchModels(this.fetchImpl, key, 'coding');
+			const coding = await fetchModels(this.fetchImpl, key, CODING_SORT);
 			this.cache = {
 				...this.cache,
 				coding,
@@ -299,6 +314,7 @@ module.exports = {
 	nextRefreshAt,
 	_internal: {
 		API_BASE,
+		CODING_SORT,
 		SECRET_KEY,
 		CACHE_KEY,
 		REFRESH_HOURS,
