@@ -21,6 +21,9 @@ class UsageViewProvider {
 		// from a panel that never got asked to draw, which is a bad place to
 		// debug from — every step now says what it did.
 		this.log = log || (() => {});
+		// Set by register(): the Leaderboard view takes the bars over while this
+		// one is not showing, so it needs to hear about every change.
+		this.onVisibilityChange = null;
 	}
 
 	resolveWebviewView(webviewView) {
@@ -32,6 +35,11 @@ class UsageViewProvider {
 		webviewView.onDidChangeVisibility(() => {
 			this.log(`usage view visibility: ${webviewView.visible}`);
 			if (webviewView.visible) this.render();
+			if (this.onVisibilityChange) this.onVisibilityChange();
+		});
+		webviewView.onDidDispose(() => {
+			this.view = null;
+			if (this.onVisibilityChange) this.onVisibilityChange();
 		});
 		this.render();
 	}
@@ -57,6 +65,22 @@ class UsageViewProvider {
 		}
 	}
 
+	// True only while the pane is expanded and on screen: a collapsed or hidden
+	// view reports visible = false, and a view hidden from the context menu is
+	// never resolved at all.
+	isVisible() { return !!(this.view && this.view.visible); }
+
+	// The bars as an embeddable piece — a stylesheet fragment and the markup —
+	// for the Leaderboard webview, which shows them while this view is
+	// collapsed or hidden. Every selector is scoped under .usage and the two
+	// class names both sheets used (.row, .name) are .urow/.uname here.
+	block() {
+		const page = this._html(this.usage.get('claude'), this.usage.get('codex'));
+		const css = /<style[^>]*>([\s\S]*?)<\/style>/.exec(page)[1].replace(/\tbody \{[\s\S]*?\n\t\}\n/, '');
+		const html = /<body>\n([\s\S]*?)\n<\/body>/.exec(page)[1];
+		return { css, html };
+	}
+
 	_html(claude, codex) {
 		const nonce = crypto.randomBytes(16).toString('base64');
 		const csp = `default-src 'none'; style-src 'nonce-${nonce}';`;
@@ -70,7 +94,7 @@ class UsageViewProvider {
 			this._row('Claude', 'claude', claude, widths),
 			this._row('Codex', 'codex', codex, widths),
 		].join('\n');
-		const widthRules = [...widths].map((w) => `.w${w} { width: ${w}%; }`).join('\n\t');
+		const widthRules = [...widths].map((w) => `.usage .w${w} { width: ${w}%; }`).join('\n\t');
 
 		return `<!DOCTYPE html>
 <html lang="en">
@@ -87,64 +111,66 @@ class UsageViewProvider {
 		font-size: var(--vscode-font-size);
 		color: var(--vscode-foreground);
 	}
-	.row + .row { margin-top: 10px; }
-	.head {
+	.usage .urow + .urow { margin-top: 10px; }
+	.usage .head {
 		display: flex;
 		align-items: baseline;
 		justify-content: space-between;
 		gap: 8px;
 		margin-bottom: 3px;
 	}
-	.name { font-weight: 600; }
+	.usage .uname { font-weight: 600; }
 	/* One line per window: which window, how full, how much, when it resets.
 	   Stacked bars with a single shared caption underneath read as one number
 	   and left you guessing which bar was the 5-hour one. */
-	.win {
+	.usage .win {
 		display: grid;
 		grid-template-columns: 3.6em 1fr 2.6em 2.4em;
 		align-items: center;
 		column-gap: 6px;
 		line-height: 1.7;
 	}
-	.win .label { color: var(--vscode-descriptionForeground); }
-	.win .pct { text-align: right; font-variant-numeric: tabular-nums; }
-	.win .reset {
+	.usage .win .label { color: var(--vscode-descriptionForeground); }
+	.usage .win .pct { text-align: right; font-variant-numeric: tabular-nums; }
+	.usage .win .reset {
 		text-align: right;
 		color: var(--vscode-descriptionForeground);
 		font-size: 0.9em;
 	}
-	.sub {
+	.usage .sub {
 		color: var(--vscode-descriptionForeground);
 		font-size: 0.9em;
 	}
 	/* Spans, not divs, so they sit in the grid row — which means they need an
 	   explicit display or they collapse to inline height. */
-	.track {
+	.usage .track {
 		display: block;
 		height: 6px;
 		border-radius: 3px;
 		background: var(--vscode-input-background);
 		overflow: hidden;
 	}
-	.fill { display: block; height: 100%; border-radius: 3px; }
-	.claude .fill { background: ${CLAUDE_FILL}; }
-	.codex .fill { background: ${CODEX_FILL_DARK}; }
+	.usage .fill { display: block; height: 100%; border-radius: 3px; }
+	.usage .claude .fill { background: ${CLAUDE_FILL}; }
+	.usage .codex .fill { background: ${CODEX_FILL_DARK}; }
 	/* White disappears on a light theme; fall back to the logo's own grey. */
-	body.vscode-light .codex .fill { background: ${CODEX_FILL_LIGHT}; }
-	.muted { color: var(--vscode-descriptionForeground); }
+	body.vscode-light .usage .codex .fill { background: ${CODEX_FILL_LIGHT}; }
+	.usage .muted { color: var(--vscode-descriptionForeground); }
 	${widthRules}
 </style>
 </head>
 <body>
+<div class="usage">
 ${rows}
+</div>
 </body>
 </html>`;
 	}
 
 	_row(name, cls, usage, widths) {
-		if (!usage) return `<div class="row ${cls}"><div class="head"><span class="name">${name}</span><span class="muted">checking…</span></div></div>`;
-		if (usage.error) return `<div class="row ${cls}"><div class="head"><span class="name">${name}</span></div><div class="sub">${escapeHtml(usage.error)}</div></div>`;
-		if (!usage.windows.length) return `<div class="row ${cls}"><div class="head"><span class="name">${name}</span><span class="muted">no limits reported</span></div></div>`;
+		if (!usage) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span><span class="muted">checking…</span></div></div>`;
+		if (usage.error) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span></div><div class="sub">${escapeHtml(usage.error)}</div></div>`;
+		if (!usage.windows.length) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span><span class="muted">no limits reported</span></div></div>`;
 
 		const lines = usage.windows
 			.map(([label, w]) => {
@@ -162,8 +188,8 @@ ${rows}
 			})
 			.join('\n');
 
-		return `<div class="row ${cls}">
-	<div class="head"><span class="name">${name}</span><span class="sub">${escapeHtml(usage.plan || '')}</span></div>
+		return `<div class="urow ${cls}">
+	<div class="head"><span class="uname">${name}</span><span class="sub">${escapeHtml(usage.plan || '')}</span></div>
 ${lines}
 </div>`;
 	}

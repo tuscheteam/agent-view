@@ -1715,10 +1715,14 @@ function register(context) {
 	const provider = new ChatsProvider(index, context.extensionUri, decorations, seen);
 	provider.log = log;
 	// One cache feeds the bars; it repaints them itself whenever a lookup lands.
-	const usage = new UsageCache(() => usageView.render(), log);
+	const usage = new UsageCache(() => { usageView.render(); if (!usageView.isVisible()) leaderboardView.render(); }, log);
 	const usageView = new UsageViewProvider(usage, log);
 	const leaderboard = new LeaderboardCache(context, () => leaderboardView.render(), log);
 	const leaderboardView = new LeaderboardViewProvider(leaderboard, log);
+	// While the Usage pane is collapsed or hidden its bars ride on top of the
+	// Leaderboard pane — see LeaderboardViewProvider.usageBlock.
+	leaderboardView.usageBlock = () => (usageView.isVisible() ? null : usageView.block());
+	usageView.onVisibilityChange = () => leaderboardView.render();
 	leaderboard.start();
 
 	// A real TreeView rather than registerTreeDataProvider, because the panel has
@@ -1794,7 +1798,7 @@ function register(context) {
 	// nothing ever asked again and the bars sat unchanged for days. Ticking
 	// well under the 5-minute TTL keeps them honest; get() is a Map lookup
 	// unless the entry has actually expired.
-	const usageTick = setInterval(() => usageView.render(), 60000);
+	const usageTick = setInterval(() => { usageView.render(); if (!usageView.isVisible()) leaderboardView.render(); }, 60000);
 
 	// A refreshed token is the one thing that fixes an expired-token panel, and
 	// it arrives as a file write rather than anything we could poll cheaply.

@@ -5,6 +5,11 @@ class LeaderboardViewProvider {
 		this.cache = cache;
 		this.log = log || (() => {});
 		this.view = null;
+		// Set by register(): returns { css, html } for the Usage bars while the
+		// Usage view is collapsed or hidden, else null. VS Code gives every pane
+		// a 120 px minimum body, which left dead space under the five bars; in
+		// here they take exactly the height they need.
+		this.usageBlock = null;
 	}
 
 	resolveWebviewView(webviewView) {
@@ -39,6 +44,8 @@ class LeaderboardViewProvider {
 			this._column('Coding', snapshot.coding),
 		].join('\n');
 		const notice = noticeLine(snapshot);
+		let usage = null;
+		try { usage = this.usageBlock ? this.usageBlock() : null; } catch (_) { usage = null; }
 
 		return `<!DOCTYPE html>
 <html lang="en">
@@ -127,9 +134,12 @@ class LeaderboardViewProvider {
 	@media (max-width: 280px) {
 		.grid { grid-template-columns: minmax(0, 1fr); }
 	}
+	.usage { margin: 2px 4px 10px; }
+${usage ? usage.css : ''}
 </style>
 </head>
 <body>
+${usage ? usage.html : ''}
 ${notice}
 <div class="grid">
 ${columns}

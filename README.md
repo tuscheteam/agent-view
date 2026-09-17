@@ -65,6 +65,11 @@ whose `claude-` prefix is dropped in the cell (hover a row for the full name).
 Source, schedule, freshness and remaining quota sit behind the view's info
 button.
 
+VS Code gives every pane a 120 px minimum body, which leaves dead space under
+the five Usage bars. Collapse the Usage pane (or hide it from its context
+menu) and the bars move to the top of the Leaderboard pane, where they take
+exactly the height they need; expand Usage again and they move back.
+
 ## Quiet timeline (optional)
 
 **Agent View: Restyle Claude Panel** collapses Claude Code's chat timeline the
