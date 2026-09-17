@@ -1671,8 +1671,31 @@ async function firstRun(context) {
 	try { await arrangeLeft(); } catch (_) { /* layout commands are best effort */ }
 }
 
+// VS Code remembers where a user dragged each view. Someone who once moved
+// Chats and Usage into another container (the Terminal panel, in the case that
+// prompted this) keeps them there, while a view added by a later release is
+// born in the home container — so the three never share a panel again without
+// manual dragging. vscode.moveViews puts them back together; a view already
+// home is left alone.
+const HOME_CONTAINER = 'workbench.view.extension.openEditorsToolsChats';
+const OWN_VIEWS = ['openEditorsTools.chats', 'openEditorsTools.usage', 'openEditorsTools.leaderboard'];
+async function gatherViews() {
+	await vscode.commands.executeCommand('vscode.moveViews', { viewIds: OWN_VIEWS, destinationId: HOME_CONTAINER });
+	await arrangeLeft();
+}
+
+// Once per install, on the release that introduced the third view: without it
+// the Leaderboard sat alone in a hidden container for anyone with moved views.
+const GATHERED_KEY = 'openEditorsTools.viewsGathered.v1';
+async function gatherOnce(context) {
+	if (context.globalState.get(GATHERED_KEY)) return;
+	await context.globalState.update(GATHERED_KEY, true);
+	try { await gatherViews(); } catch (_) { /* layout commands are best effort */ }
+}
+
 function register(context) {
 	firstRun(context);
+	gatherOnce(context);
 	const index = new TranscriptIndex();
 	// One channel for everything this extension does that can fail quietly:
 	// usage fetches, webview resolution, layout moves. Opened from
@@ -1982,6 +2005,7 @@ function register(context) {
 		// the left of the editor. Undo is one palette entry away
 		// (View: Move Panel to Bottom).
 		vscode.commands.registerCommand('openEditorsTools.arrangeLeft', arrangeLeft),
+		vscode.commands.registerCommand('openEditorsTools.gatherViews', gatherViews),
 		// One click back to the full four-column layout after it drifts:
 		// Explorer | Agent View | Claude chats | Codex chats. Every step is
 		// best-effort on its own — a failing workbench command must not stop

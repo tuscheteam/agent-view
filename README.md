@@ -31,6 +31,11 @@ gets closed, and **Agent View: Arrange as Left Column** restores the layout.
 | Claude | Codex** restores the full four-column layout in one click — Explorer
 sidebar, then this panel, then a Claude group, then a Codex group.
 
+VS Code remembers where each view was dragged, so a view added by an update can
+land in a different panel than the ones you moved. **Agent View: Reset Views**
+puts Chats, Usage and Leaderboard back into one panel; the extension runs it
+once by itself after the update that added the Leaderboard.
+
 `openEditorsTools.codexOpenTarget` decides where a Codex row opens: `sidebar`
 loads the thread into the Codex sidebar panel, `editor` opens it as a tab in
 the Codex column, and `auto` (the default) uses the sidebar panel when one is

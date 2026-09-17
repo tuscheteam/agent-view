@@ -5,3 +5,4 @@ docs/**
 .gitignore
 publish.ps1
 PUBLISHING.md
+tests/**
