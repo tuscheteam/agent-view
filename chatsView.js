@@ -5,6 +5,7 @@ const path = require('path');
 const readline = require('readline');
 const { UsageCache, watchCredentials } = require('./usage');
 const restyle = require('./restyle');
+const claudeFix = require('./claudeFix');
 const { UsageViewProvider } = require('./usageView');
 const { LeaderboardCache, DEFAULT_SUBAGENT_EXCLUDE } = require('./leaderboard');
 const { LeaderboardViewProvider, infoLines } = require('./leaderboardView');
@@ -1710,6 +1711,22 @@ function register(context) {
 		try { restyle.apply().forEach((r) => log(`restyle: ${r.status} — ${r.cssFile}`)); } catch (err) { log(`restyle failed: ${err.message}`); }
 	}
 
+	// Guard against Claude Code builds that ship a broken renameSession call
+	// (2.1.272/2.1.273 and any future build with the same minified shape).
+	// Runs on every activation so a fresh auto-update is re-patched silently.
+	Promise.resolve().then(() => claudeFix.apply()).then((results) => {
+		const acted = results.filter((r) => r.action !== 'already' && r.action !== 'clean');
+		acted.forEach((r) => log(`claudeFix: ${r.action} — ${r.file}${r.error ? ` (${r.error})` : ''}`));
+		if (results.some((r) => r.action === 'patched')) {
+			vscode.window.showInformationMessage(
+				'Agent View repaired the Claude Code rename bug — reload to apply.',
+				'Reload Window'
+			).then((choice) => {
+				if (choice === 'Reload Window') vscode.commands.executeCommand('workbench.action.reloadWindow');
+			});
+		}
+	}).catch((err) => log(`claudeFix failed: ${err.message}`));
+
 	const decorations = new ChatDecorations();
 	const seen = new SeenStore(context.globalState);
 	const provider = new ChatsProvider(index, context.extensionUri, decorations, seen);
@@ -1981,6 +1998,24 @@ function register(context) {
 			await context.globalState.update('openEditorsTools.restyle', false);
 			results.forEach((r) => log(`restyle: ${r.status} — ${r.cssFile}`));
 			vscode.window.showInformationMessage('Claude panel restored to stock. Reload the window.');
+		}),
+		vscode.commands.registerCommand('openEditorsTools.repairClaude', () => {
+			const results = claudeFix.apply();
+			results.forEach((r) => log(`claudeFix: ${r.action} — ${r.file}${r.error ? ` (${r.error})` : ''}`));
+			const patched = results.filter((r) => r.action === 'patched').length;
+			const already = results.filter((r) => r.action === 'already').length;
+			const clean = results.filter((r) => r.action === 'clean').length;
+			vscode.window.showInformationMessage(
+				`Claude Code patches: ${patched} applied, ${already} already patched, ${clean} clean.`
+			);
+		}),
+		vscode.commands.registerCommand('openEditorsTools.unrepairClaude', () => {
+			const results = claudeFix.revert();
+			results.forEach((r) => log(`claudeFix: ${r.action} — ${r.file}${r.error ? ` (${r.error})` : ''}`));
+			const reverted = results.filter((r) => r.action === 'reverted').length;
+			vscode.window.showInformationMessage(
+				`Claude Code patches reverted: ${reverted} file(s) restored.`
+			);
 		}),
 		vscode.commands.registerCommand('openEditorsTools.showChats', () =>
 			vscode.commands.executeCommand('workbench.view.extension.openEditorsToolsChats')),

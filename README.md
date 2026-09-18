@@ -112,6 +112,11 @@ result and timing.
 **Agent View: Log Open Tabs** writes one line per open tab — label, input kind
 and whether the scan recognised it as Claude or Codex — into that same log.
 
+If renames stop working after a Claude Code update, the extension re-patches
+the broken call sites automatically at the next reload. To run the patch
+manually, use **Agent View: Repair Claude Code Patches**; to undo it, use
+**Agent View: Undo Claude Code Patches**.
+
 `Claude token expired` in the usage rows is normal after an idle stretch: the
 stored token lasts 8 hours and only Claude Code renews it. The bars come back
 by themselves within a second of your next Claude message.

@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.13.19",
+  "version": "0.13.20",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -86,6 +86,16 @@
       {
         "command": "openEditorsTools.restyleOff",
         "title": "Restore Claude Panel (stock look)",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.repairClaude",
+        "title": "Repair Claude Code Patches",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.unrepairClaude",
+        "title": "Undo Claude Code Patches",
         "category": "Agent View"
       },
       {
@@ -249,6 +259,12 @@
         },
         {
           "command": "openEditorsTools.showLeaderboard"
+        },
+        {
+          "command": "openEditorsTools.repairClaude"
+        },
+        {
+          "command": "openEditorsTools.unrepairClaude"
         },
         {
           "command": "openEditorsTools.arrangeLayout"
