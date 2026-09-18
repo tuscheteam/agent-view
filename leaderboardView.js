@@ -135,14 +135,6 @@ class LeaderboardViewProvider {
 		.grid { grid-template-columns: minmax(0, 1fr); }
 	}
 	.usage { margin: 2px 4px 10px; }
-	/* The API terms require a visible source link wherever the data shows. */
-	.source {
-		margin-top: 6px;
-		text-align: right;
-		color: var(--vscode-descriptionForeground);
-		font-size: 0.86em;
-	}
-	.source a { color: inherit; }
 ${usage ? usage.css : ''}
 </style>
 </head>
@@ -152,7 +144,6 @@ ${notice}
 <div class="grid">
 ${columns}
 </div>
-<div class="source">Source: <a href="https://aistupidlevel.info">aistupidlevel.info</a></div>
 </body>
 </html>`;
 	}
