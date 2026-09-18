@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.13.18",
+  "version": "0.13.19",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -43,6 +43,17 @@
             "Always open threads as editor tabs in the Codex column"
           ],
           "description": "Where clicking a Codex row, or New Codex Agent, opens the thread. Right-click a row for the other surface at any time."
+        },
+        "openEditorsTools.subagentExcludeModels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "claude-fable-5-1",
+            "gpt-6-astra"
+          ],
+          "description": "Leaderboard names never recommended as subagent models (flagships priced for orchestration, not fan-out)."
         }
       }
     },

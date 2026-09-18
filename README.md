@@ -70,6 +70,25 @@ the five Usage bars. Collapse the Usage pane (or hide it from its context
 menu) and the bars move to the top of the Leaderboard pane, where they take
 exactly the height they need; expand Usage again and they move back.
 
+## Subagent recommendation
+
+After every leaderboard refresh — and once at startup when a coding column is
+already cached — the extension writes `~/.agent-view/subagent-recommendation.json`.
+It names the best-scoring coding model per provider, one for Claude and one for
+Codex, so an orchestrator picks its subagent model from the board instead of a
+line in your memory that goes stale the next time the ranking moves.
+
+`openEditorsTools.subagentExcludeModels` (default `["claude-fable-5-1",
+"gpt-6-astra"]`) lists names the file never recommends — flagship models priced
+for the orchestrator seat, not for fan-out. A change applies on the next
+refresh, no reload.
+
+Point your orchestrator at the file. One line in `CLAUDE.md` or `AGENTS.md`:
+
+> For subagents, read `~/.agent-view/subagent-recommendation.json` and use
+> `claude.model` (Claude orchestrator) or `codex.model` (Codex orchestrator) as
+> the subagent model.
+
 ## Quiet timeline (optional)
 
 **Agent View: Restyle Claude Panel** collapses Claude Code's chat timeline the

@@ -1,3 +1,7 @@
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
 const API_BASE = 'https://aistupidlevel.info/api/v1';
 const SECRET_KEY = 'openEditorsTools.aslApiKey';
 const CACHE_KEY = 'openEditorsTools.aslLeaderboardCache';
@@ -10,6 +14,11 @@ const CODING_SORT = '7axis';
 const REQUEST_SPACING_MS = 65000;
 const TIMER_MAX_MS = 24 * 60 * 60 * 1000;
 const ALLOWED_PROVIDERS = new Set(['openai', 'anthropic']);
+// Flagship models are priced for the orchestrator seat, not for fan-out, so
+// they never win the subagent recommendation even when they top the board.
+const DEFAULT_SUBAGENT_EXCLUDE = ['claude-fable-5-1', 'gpt-6-astra'];
+const RECOMMENDATION_DIR = '.agent-view';
+const RECOMMENDATION_FILE = 'subagent-recommendation.json';
 
 class LeaderboardCache {
 	constructor(context, onChange, log, options = {}) {
@@ -20,6 +29,14 @@ class LeaderboardCache {
 		this.fetchImpl = options.fetchImpl || globalThis.fetch;
 		this.sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
 		this.spacingMs = options.spacingMs === undefined ? REQUEST_SPACING_MS : options.spacingMs;
+		// Where the subagent recommendation file lands; tests point this at a
+		// temp dir instead of the real home so a run leaves the home alone.
+		this.homeDir = options.homeDir || os.homedir();
+		// The exclude list arrives as a plain array (excludedModels) or as a
+		// getter (getExcluded) the caller re-reads each write, so a settings
+		// change lands on the next refresh without reloading the extension.
+		this.excludedModels = options.excludedModels;
+		this.getExcluded = typeof options.getExcluded === 'function' ? options.getExcluded : null;
 		this.cache = context.globalState.get(CACHE_KEY) || emptyCache();
 		// A coding column cached under another mode is wrong data with a right
 		// label; an empty column until the next fetch is the honest state.
@@ -36,6 +53,9 @@ class LeaderboardCache {
 
 	start() {
 		this._scheduleTimer();
+		// A cached coding column from a previous session is enough to hand the
+		// orchestrators a recommendation immediately, before the first refresh.
+		if (this.cache && this.cache.coding) this.writeRecommendation(this.cache);
 		this.maybeRefresh('startup');
 	}
 
@@ -127,6 +147,7 @@ class LeaderboardCache {
 			};
 			await this._save();
 			this.log(`ASL leaderboard refresh complete (${reason}, slot=${slotKey})`);
+			this.writeRecommendation(this.cache);
 			return true;
 		} catch (err) {
 			this.cache = {
@@ -172,6 +193,46 @@ class LeaderboardCache {
 
 	_notify() {
 		this.onChange();
+	}
+
+	// Re-read the exclude list at write time: a getter wins over the fixed
+	// array, and the built-in default fills in when neither was supplied.
+	_resolveExcluded(options = {}) {
+		if (typeof options.getExcluded === 'function') return options.getExcluded();
+		if (this.getExcluded) return this.getExcluded();
+		if (Array.isArray(options.excludedModels)) return options.excludedModels;
+		if (Array.isArray(this.excludedModels)) return this.excludedModels;
+		return DEFAULT_SUBAGENT_EXCLUDE;
+	}
+
+	// Drop the best coding pick per provider into ~/.agent-view so a Claude Code
+	// or Codex orchestrator can read one file and choose its subagent model. A
+	// write failure is logged and swallowed; a missing file just means no pick
+	// yet, never a broken refresh.
+	writeRecommendation(cache, options = {}) {
+		const coding = cache && cache.coding;
+		if (!coding || !Array.isArray(coding.rows)) return false;
+		const excluded = this._resolveExcluded(options);
+		const { claude, codex } = recommendSubagents(coding, excluded);
+		const payload = {
+			generatedAt: coding.generatedAt || null,
+			writtenAt: this.now().toISOString(),
+			source: 'aistupidlevel.info (sortBy=7axis coding board)',
+			excluded,
+			claude,
+			codex,
+			note: 'Best-scoring coding model per provider, flagships excluded. Orchestrators: pass claude.model / codex.model as the subagent model.',
+		};
+		const homeDir = options.homeDir || this.homeDir;
+		const dir = path.join(homeDir, RECOMMENDATION_DIR);
+		try {
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, RECOMMENDATION_FILE), `${JSON.stringify(payload, null, 2)}\n`);
+			return true;
+		} catch (err) {
+			this.log(`subagent recommendation write failed: ${err && err.message ? err.message : String(err)}`);
+			return false;
+		}
 	}
 
 	_scheduleTimer() {
@@ -295,6 +356,50 @@ function nextRefreshAt(date) {
 	return tomorrow;
 }
 
+// Pick the best coding model per provider that no one excluded. Highest score
+// wins; a tie breaks to the better (lower) rank. Returns raw model names, which
+// are already real ids the orchestrators pass straight through.
+function recommendSubagents(codingColumn, excluded) {
+	const rows = codingColumn && Array.isArray(codingColumn.rows) ? codingColumn.rows : [];
+	const blocked = buildExcludeSet(excluded);
+	const best = { anthropic: null, openai: null };
+	for (const row of rows) {
+		if (!row || !row.name) continue;
+		if (row.provider !== 'anthropic' && row.provider !== 'openai') continue;
+		if (blocked.has(normalizeModelName(row.name))) continue;
+		const score = Number(row.score);
+		if (!Number.isFinite(score)) continue;
+		const rank = Number(row.rank);
+		const current = best[row.provider];
+		if (!current || score > current._score || (score === current._score && rank < current._rank)) {
+			best[row.provider] = { model: row.name, score: row.score, rank: row.rank, _score: score, _rank: rank };
+		}
+	}
+	return { claude: pickRecommendation(best.anthropic), codex: pickRecommendation(best.openai) };
+}
+
+function pickRecommendation(entry) {
+	if (!entry) return null;
+	return { model: entry.model, score: entry.score, rank: entry.rank };
+}
+
+// A name matches an exclude entry with or without its "claude-" prefix, so a
+// user can write "fable-5-1" and still block "claude-fable-5-1".
+function normalizeModelName(name) {
+	let value = String(name || '').trim().toLowerCase();
+	if (value.startsWith('claude-')) value = value.slice('claude-'.length);
+	return value;
+}
+
+function buildExcludeSet(excluded) {
+	const set = new Set();
+	for (const entry of Array.isArray(excluded) ? excluded : []) {
+		const name = normalizeModelName(entry);
+		if (name) set.add(name);
+	}
+	return set;
+}
+
 function emptyCache() {
 	return {
 		reasoning: null,
@@ -312,6 +417,8 @@ module.exports = {
 	shapeRows,
 	slotKeyFor,
 	nextRefreshAt,
+	recommendSubagents,
+	DEFAULT_SUBAGENT_EXCLUDE,
 	_internal: {
 		API_BASE,
 		CODING_SORT,

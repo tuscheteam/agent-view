@@ -6,7 +6,7 @@ const readline = require('readline');
 const { UsageCache, watchCredentials } = require('./usage');
 const restyle = require('./restyle');
 const { UsageViewProvider } = require('./usageView');
-const { LeaderboardCache } = require('./leaderboard');
+const { LeaderboardCache, DEFAULT_SUBAGENT_EXCLUDE } = require('./leaderboard');
 const { LeaderboardViewProvider, infoLines } = require('./leaderboardView');
 
 // A CHATS tree of our own, because the built-in OPEN EDITORS rows cannot carry
@@ -1717,7 +1717,11 @@ function register(context) {
 	// One cache feeds the bars; it repaints them itself whenever a lookup lands.
 	const usage = new UsageCache(() => { usageView.render(); if (!usageView.isVisible()) leaderboardView.render(); }, log);
 	const usageView = new UsageViewProvider(usage, log);
-	const leaderboard = new LeaderboardCache(context, () => leaderboardView.render(), log);
+	// Re-read the exclude list on every write so a settings change lands on the
+	// next refresh; leaderboard.js stays vscode-free, so the getter lives here.
+	const leaderboard = new LeaderboardCache(context, () => leaderboardView.render(), log, {
+		getExcluded: () => vscode.workspace.getConfiguration('openEditorsTools').get('subagentExcludeModels', DEFAULT_SUBAGENT_EXCLUDE),
+	});
 	const leaderboardView = new LeaderboardViewProvider(leaderboard, log);
 	// While the Usage pane is collapsed or hidden its bars ride on top of the
 	// Leaderboard pane — see LeaderboardViewProvider.usageBlock.
