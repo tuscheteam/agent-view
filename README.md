@@ -117,6 +117,10 @@ the broken call sites automatically at the next reload. To run the patch
 manually, use **Agent View: Repair Claude Code Patches**; to undo it, use
 **Agent View: Undo Claude Code Patches**.
 
+Codex chat names come from `~/.codex/session_index.jsonl`, the log Codex's own window
+reads, and fall back to the database only for threads the log does not name.
+A chat you renamed in Codex keeps that name here even after you resume it.
+
 `Claude token expired` in the usage rows is normal after an idle stretch: the
 stored token lasts 8 hours and only Claude Code renews it. The bars come back
 by themselves within a second of your next Claude message.

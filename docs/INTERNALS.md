@@ -61,6 +61,15 @@ Thread metadata comes from the `threads` table in `~/.codex/state_5.sqlite`, ope
 extension host may be older, so there is a fallback to `~/.codex/session_index.jsonl`, which
 carries names and timestamps but no token counts. The row tooltip names which source it read.
 
+**Thread names have two stores.** `threads.name` in sqlite is a mirror. `session_index.jsonl` is an
+append-only log with one `{id, thread_name, updated_at}` record per naming event, and the newest
+record per id is the name Codex's own window shows. Since 2026-09-19 a rename reaches only the log,
+and a thread that had a mirrored name loses it when Codex resumes the chat and re-derives the row
+from its rollout (name NULL, title back to the first message). The panel therefore reads the log
+first (`readNameLog`, cached on mtime+size, tail-read past 8 MiB) and falls back to `threads.name`,
+then `threads.title`. Each entry records its `titleSource` (`log`, `name`, `title`) for debugging.
+`tests/codextitles.js` pins this, including a check against the real install.
+
 #### The black Codex panel
 
 The ChatGPT extension's own **New Codex Agent** opens the editor at route

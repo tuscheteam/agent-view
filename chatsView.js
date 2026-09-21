@@ -583,6 +583,63 @@ function codexConversationId(uri) {
 // `source` JSON naming the parent. One conversation that fans out to nine
 // helpers therefore stores ten threads, and listing the table as-is showed
 // nine phantom chats, each titled with the parent's first message.
+// Codex keeps a thread's name in two places. threads.name in state_5.sqlite is
+// a mirror; ~/.codex/session_index.jsonl is an append-only log with one record
+// per naming event ({id, thread_name, updated_at}) and is what Codex's own
+// window reads, so the newest record per id is the name. Since 2026-09-19 a
+// rename reaches only the log, and a thread that had a mirrored name loses it
+// the moment Codex resumes and re-derives the row from its rollout (name NULL,
+// title back to the first message). Trusting sqlite alone made a renamed chat
+// fall back to "# Handover — 2026-09-19 …" in the panel while Codex showed
+// "ORDER-FLOW".
+const NAME_LOG_MAX_BYTES = 8 * 1024 * 1024;
+const nameLogCache = { file: null, mtimeMs: -1, size: -1, names: new Map() };
+
+// Newest non-empty name per thread id. Cached on mtime+size, so the 45 s sweep
+// and every tab event cost one stat, not a parse. A log past 8 MiB is read
+// from its tail: older threads then fall back to the sqlite name, which beats
+// loading a multi-megabyte file on every refresh.
+function readNameLog() {
+	const file = path.join(codexDir(), 'session_index.jsonl');
+	let stat;
+	try { stat = fs.statSync(file); } catch (_) { return new Map(); }
+	if (nameLogCache.file === file && nameLogCache.mtimeMs === stat.mtimeMs && nameLogCache.size === stat.size) {
+		return nameLogCache.names;
+	}
+	let text = '';
+	try {
+		if (stat.size <= NAME_LOG_MAX_BYTES) {
+			text = fs.readFileSync(file, 'utf8');
+		} else {
+			const fd = fs.openSync(file, 'r');
+			try {
+				const buf = Buffer.alloc(NAME_LOG_MAX_BYTES);
+				fs.readSync(fd, buf, 0, NAME_LOG_MAX_BYTES, stat.size - NAME_LOG_MAX_BYTES);
+				text = buf.toString('utf8');
+			} finally { fs.closeSync(fd); }
+			text = text.slice(text.indexOf('\n') + 1); // first line is cut mid-record
+		}
+	} catch (_) { return nameLogCache.file === file ? nameLogCache.names : new Map(); }
+	const names = new Map();
+	for (const raw of text.replace(/^\uFEFF/, '').split('\n')) {
+		const line = raw.trim();
+		if (!line) continue;
+		try {
+			const rec = JSON.parse(line);
+			const name = typeof rec.thread_name === 'string' ? rec.thread_name.trim() : '';
+			// A record without a name says nothing; it must not blank a name an
+			// earlier record set.
+			if (!rec.id || !name) continue;
+			names.set(rec.id, { name, updatedAt: rec.updated_at ? Date.parse(rec.updated_at) || 0 : 0 });
+		} catch (_) { /* partial or corrupt line */ }
+	}
+	nameLogCache.file = file;
+	nameLogCache.mtimeMs = stat.mtimeMs;
+	nameLogCache.size = stat.size;
+	nameLogCache.names = names;
+	return names;
+}
+
 class CodexIndex {
 	constructor() {
 		this.byId = new Map();
@@ -619,6 +676,7 @@ class CodexIndex {
 			const cols = wanted.filter((c) => have.has(c));
 			if (!cols.includes('id')) return false;
 			const rows = db.prepare(`SELECT ${cols.join(', ')} FROM threads`).all();
+			const names = readNameLog();
 			const next = new Map();
 			const children = new Map();
 			for (const row of rows) {
@@ -628,8 +686,13 @@ class CodexIndex {
 				// Last-resort guard for guardian rows a build stored with
 				// neither thread_source='subagent' nor a parseable source blob.
 				if (isGuardianTitle(row.name) || isGuardianTitle(row.title) || isGuardianTitle(row.first_user_message)) continue;
+				const logged = names.get(row.id);
 				const entry = {
-					title: row.name || row.title,
+					title: (logged && logged.name) || row.name || row.title,
+					// Where the label came from, for the diagnostics and the tests: a
+					// panel that shows a first-message title should be traceable to a
+					// missing log record, not to a guess.
+					titleSource: logged ? 'log' : row.name ? 'name' : 'title',
 					tokens: Number(row.tokens_used) || 0,
 					model: row.model,
 					effort: row.reasoning_effort,
@@ -680,24 +743,12 @@ class CodexIndex {
 	// Names and timestamps only — enough to render a row when sqlite is out of
 	// reach, just without token counts.
 	_fromSessionIndex() {
-		const file = path.join(codexDir(), 'session_index.jsonl');
-		let text;
-		try { text = fs.readFileSync(file, 'utf8'); } catch (_) { return; }
 		const next = new Map();
-		for (const line of text.split('\n')) {
-			if (!line) continue;
-			try {
-				const rec = JSON.parse(line);
-				if (!rec.id) continue;
-				// Same guardian guard as the sqlite path — the JSONL index has
-				// no thread_source field to filter on.
-				if (isGuardianTitle(rec.thread_name) || isGuardianTitle(rec.first_user_message)) continue;
-				next.set(rec.id, {
-					title: rec.thread_name,
-					tokens: 0,
-					lastActivity: rec.updated_at ? Date.parse(rec.updated_at) : 0,
-				});
-			} catch (_) { /* partial line */ }
+		for (const [id, { name, updatedAt }] of readNameLog()) {
+			// Same guardian guard as the sqlite path — the JSONL index has
+			// no thread_source field to filter on.
+			if (isGuardianTitle(name)) continue;
+			next.set(id, { title: name, titleSource: 'log', tokens: 0, lastActivity: updatedAt });
 		}
 		this.byId = next;
 		this.source = 'index';
