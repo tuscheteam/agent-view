@@ -1359,24 +1359,27 @@ class ChatsProvider {
 				: { all: [], running: [], cost: 0, messages: 0 };
 			return { ...t, kind: 'claude', data, state, subagents, subs: subagents.running };
 		});
-		// Cross-provider: match Codex exec rows to Claude sessions.
-		// An exec thread whose activity overlaps a running or recently
-		// active Claude session is shown as its child.
-		const XPROV_WINDOW_MS = 5 * 60 * 1000;
-		const matchedExec = new Set();
-		for (const row of rows) {
-			if (row.kind !== 'claude' || !row.data) continue;
-			const cEnd = row.data.lastActivity;
-			const cStart = cEnd - Math.max((row.data.messages || 1) * 60000, XPROV_WINDOW_MS);
-			const xprovSubs = [];
-			for (const [execId, exec] of this.codex.execById) {
-				if (matchedExec.has(execId)) continue;
-				if (exec.lastActivity >= cStart && exec.lastActivity <= cEnd + XPROV_WINDOW_MS) {
-					xprovSubs.push(exec);
-					matchedExec.add(execId);
-				}
+		// Cross-provider: a Codex exec thread that wrote within the last
+		// SUBAGENT_ACTIVE_MS is shown under the Claude session closest to
+		// it in time. Settled exec threads drop out two minutes after
+		// their last write, exactly like native subagent rows — a
+		// message-count-scaled window here once attached every judge
+		// thread of the day to a long idle session and made it look busy.
+		const XPROV_PARENT_WINDOW_MS = 30 * 60 * 1000;
+		const xprovActiveCutoff = Date.now() - SUBAGENT_ACTIVE_MS;
+		for (const exec of this.codex.execById.values()) {
+			if (exec.lastActivity < xprovActiveCutoff) continue;
+			let best = null;
+			let bestGap = XPROV_PARENT_WINDOW_MS;
+			for (const row of rows) {
+				if (row.kind !== 'claude' || !row.data) continue;
+				const gap = Math.abs(exec.lastActivity - row.data.lastActivity);
+				if (gap < bestGap) { best = row; bestGap = gap; }
 			}
-			if (xprovSubs.length) row.xprovSubs = xprovSubs;
+			if (best) {
+				if (!best.xprovSubs) best.xprovSubs = [];
+				best.xprovSubs.push(exec);
+			}
 		}
 
 		const openSessionIds = new Set(rows.filter((r) => r.kind === 'claude' && r.data).map((r) => r.data.sessionId));
@@ -1395,36 +1398,35 @@ class ChatsProvider {
 			rows.push({ ...t, kind: 'codex', data: this.codex.lookup(t.conversationId), subs });
 		}
 
-		// Cross-provider reverse: attach orphan Claude sessions as
-		// children of Codex threads they overlap in time with. A Claude
-		// session with no tab created during a Codex thread's active
-		// window is likely a claude -p subagent.
+		// Cross-provider reverse: an orphan Claude session (no tab) that
+		// wrote within the last SUBAGENT_ACTIVE_MS is likely a claude -p
+		// subagent — shown under the Codex thread closest to it in time,
+		// and dropped two minutes after its last write like every other
+		// subagent row.
 		const matchedClaudeSessions = new Set();
 		const codexRows = rows.filter((r) => r.kind === 'codex' || r.kind === 'codex-live');
-		for (const cxRow of codexRows) {
-			if (!cxRow.data) continue;
-			const cxEnd = cxRow.data.lastActivity;
-			const cxStart = cxEnd - XPROV_WINDOW_MS;
-			const claudeSubs = [];
-			for (const entry of this.index.byFile.values()) {
-				if (openSessionIds.has(entry.sessionId)) continue;
-				if (matchedClaudeSessions.has(entry.sessionId)) continue;
-				if (entry.lastActivity >= cxStart && entry.lastActivity <= cxEnd + XPROV_WINDOW_MS) {
-					claudeSubs.push({
-						id: entry.sessionId,
-						name: entry.title || 'claude -p',
-						model: entry.model,
-						cost: entry.cost || 0,
-						messages: entry.messages || 0,
-						totals: entry.totals || { input: 0, output: 0, cacheRead: 0, write5m: 0, write1h: 0 },
-						lastActivity: entry.lastActivity,
-					});
-					matchedClaudeSessions.add(entry.sessionId);
-				}
+		for (const entry of this.index.byFile.values()) {
+			if (openSessionIds.has(entry.sessionId)) continue;
+			if (entry.lastActivity < xprovActiveCutoff) continue;
+			let best = null;
+			let bestGap = XPROV_PARENT_WINDOW_MS;
+			for (const cxRow of codexRows) {
+				if (!cxRow.data) continue;
+				const gap = Math.abs(entry.lastActivity - cxRow.data.lastActivity);
+				if (gap < bestGap) { best = cxRow; bestGap = gap; }
 			}
-			if (claudeSubs.length) {
-				if (!cxRow.xprovSubs) cxRow.xprovSubs = [];
-				cxRow.xprovSubs.push(...claudeSubs);
+			if (best) {
+				matchedClaudeSessions.add(entry.sessionId);
+				if (!best.xprovSubs) best.xprovSubs = [];
+				best.xprovSubs.push({
+					id: entry.sessionId,
+					name: entry.title || 'claude -p',
+					model: entry.model,
+					cost: entry.cost || 0,
+					messages: entry.messages || 0,
+					totals: entry.totals || { input: 0, output: 0, cacheRead: 0, write5m: 0, write1h: 0 },
+					lastActivity: entry.lastActivity,
+				});
 			}
 		}
 
