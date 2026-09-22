@@ -644,6 +644,11 @@ class CodexIndex {
 	constructor() {
 		this.byId = new Map();
 		this.subagentsByParent = new Map();
+		// codex exec rows: threads spawned via CLI (e.g. by a Claude
+		// orchestrator running codex exec "prompt"). Kept separately so
+		// they never appear as standalone chats but can be matched to a
+		// Claude parent by time overlap.
+		this.execById = new Map();
 		this.source = 'none';
 		this.sourceFile = null; // basename of the sqlite db actually read
 	}
@@ -679,10 +684,24 @@ class CodexIndex {
 			const names = readNameLog();
 			const next = new Map();
 			const children = new Map();
+			const exec = new Map();
 			for (const row of rows) {
-				// `codex exec` batch runs share the table but are not chats
-				// anyone opened — one host showed 200+ of them as closed rows.
-				if (row.source === 'exec') continue;
+				// codex exec rows: kept for cross-provider matching instead
+				// of dropped. A Claude orchestrator spawns OpenAI subagents
+				// via codex exec; those render as children of the Claude chat.
+				if (row.source === 'exec') {
+					if (isGuardianTitle(row.name) || isGuardianTitle(row.title) || isGuardianTitle(row.first_user_message)) continue;
+					const logged = names.get(row.id);
+					exec.set(row.id, {
+						id: row.id,
+						title: (logged && logged.name) || row.name || row.title,
+						tokens: Number(row.tokens_used) || 0,
+						model: row.model,
+						lastActivity: Number(row.updated_at_ms) || 0,
+						name: row.agent_nickname || threadLabel(row.name || row.title) || 'codex exec',
+					});
+					continue;
+				}
 				// Last-resort guard for guardian rows a build stored with
 				// neither thread_source='subagent' nor a parseable source blob.
 				if (isGuardianTitle(row.name) || isGuardianTitle(row.title) || isGuardianTitle(row.first_user_message)) continue;
@@ -730,6 +749,7 @@ class CodexIndex {
 			for (const list of children.values()) list.sort((a, b) => b.lastActivity - a.lastActivity);
 			this.byId = next;
 			this.subagentsByParent = children;
+			this.execById = exec;
 			this.source = 'sqlite';
 			this.sourceFile = path.basename(file);
 			return true;
@@ -1339,6 +1359,28 @@ class ChatsProvider {
 				: { all: [], running: [], cost: 0, messages: 0 };
 			return { ...t, kind: 'claude', data, state, subagents, subs: subagents.running };
 		});
+		// Cross-provider: match Codex exec rows to Claude sessions.
+		// An exec thread whose activity overlaps a running or recently
+		// active Claude session is shown as its child.
+		const XPROV_WINDOW_MS = 5 * 60 * 1000;
+		const matchedExec = new Set();
+		for (const row of rows) {
+			if (row.kind !== 'claude' || !row.data) continue;
+			const cEnd = row.data.lastActivity;
+			const cStart = cEnd - Math.max((row.data.messages || 1) * 60000, XPROV_WINDOW_MS);
+			const xprovSubs = [];
+			for (const [execId, exec] of this.codex.execById) {
+				if (matchedExec.has(execId)) continue;
+				if (exec.lastActivity >= cStart && exec.lastActivity <= cEnd + XPROV_WINDOW_MS) {
+					xprovSubs.push(exec);
+					matchedExec.add(execId);
+				}
+			}
+			if (xprovSubs.length) row.xprovSubs = xprovSubs;
+		}
+
+		const openSessionIds = new Set(rows.filter((r) => r.kind === 'claude' && r.data).map((r) => r.data.sessionId));
+
 		this.hasRunningSubagents = rows.some((r) => r.subs && r.subs.length);
 		// Codex rows are appended below, so re-check after they land.
 		this.decorations.replace(rows.map((r) => [r.data && r.data.sessionId, r.state]));
@@ -1351,6 +1393,39 @@ class ChatsProvider {
 				? this.codex.subagentsFor(t.conversationId, Date.now() - SUBAGENT_ACTIVE_MS)
 				: [];
 			rows.push({ ...t, kind: 'codex', data: this.codex.lookup(t.conversationId), subs });
+		}
+
+		// Cross-provider reverse: attach orphan Claude sessions as
+		// children of Codex threads they overlap in time with. A Claude
+		// session with no tab created during a Codex thread's active
+		// window is likely a claude -p subagent.
+		const matchedClaudeSessions = new Set();
+		const codexRows = rows.filter((r) => r.kind === 'codex' || r.kind === 'codex-live');
+		for (const cxRow of codexRows) {
+			if (!cxRow.data) continue;
+			const cxEnd = cxRow.data.lastActivity;
+			const cxStart = cxEnd - XPROV_WINDOW_MS;
+			const claudeSubs = [];
+			for (const entry of this.index.byFile.values()) {
+				if (openSessionIds.has(entry.sessionId)) continue;
+				if (matchedClaudeSessions.has(entry.sessionId)) continue;
+				if (entry.lastActivity >= cxStart && entry.lastActivity <= cxEnd + XPROV_WINDOW_MS) {
+					claudeSubs.push({
+						id: entry.sessionId,
+						name: entry.title || 'claude -p',
+						model: entry.model,
+						cost: entry.cost || 0,
+						messages: entry.messages || 0,
+						totals: entry.totals || { input: 0, output: 0, cacheRead: 0, write5m: 0, write1h: 0 },
+						lastActivity: entry.lastActivity,
+					});
+					matchedClaudeSessions.add(entry.sessionId);
+				}
+			}
+			if (claudeSubs.length) {
+				if (!cxRow.xprovSubs) cxRow.xprovSubs = [];
+				cxRow.xprovSubs.push(...claudeSubs);
+			}
 		}
 
 		this.hasRunningSubagents = this.hasRunningSubagents || rows.some((r) => (r.kind === 'codex' || r.kind === 'codex-live') && r.subs && r.subs.length);
@@ -1373,6 +1448,7 @@ class ChatsProvider {
 				// when its stored title differs from the tab label — the rename
 				// case produced a phantom closed row of the chat's old name.
 				if (claimed.has(entry.sessionId)) continue;
+				if (matchedClaudeSessions.has(entry.sessionId)) continue;
 				const key = entry.title.trim().toLowerCase();
 				if (openTitles.has(key)) continue;
 				const seen = newestByTitle.get(key);
@@ -1475,12 +1551,12 @@ class ChatsProvider {
 	// as a tab beside the Claude chat instead.
 	_codexLiveItem(row) {
 		const { data, conversationId, subs } = row;
-		const item = new vscode.TreeItem(data.title, subs && subs.length
+		const xprovSubs = row.xprovSubs || [];
+		const allSubs = [...(subs || []), ...xprovSubs.map((xs) => ({ ...xs, isXprov: true }))];
+		const item = new vscode.TreeItem(data.title, allSubs.length
 			? vscode.TreeItemCollapsibleState.Expanded
 			: vscode.TreeItemCollapsibleState.None);
 		item.id = `codex-live:${conversationId}`;
-		// The context-menu commands reach the thread through this, whichever
-		// command the row's default click carries.
 		item.conversationId = conversationId;
 		item.iconPath = this.codexIcon;
 		item.contextValue = 'codexChat';
@@ -1489,20 +1565,32 @@ class ChatsProvider {
 			title: 'Open thread',
 			arguments: [conversationId],
 		};
-		if (subs && subs.length) {
-			item.subagentItems = subs.map((sub) => {
-				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${sub.name}`, vscode.TreeItemCollapsibleState.None);
-				// spinnerTick rebuilds the label from this between renders.
-				child.baseLabel = sub.name;
-				child.id = `${item.id}:agent:${sub.id}`;
+		if (allSubs.length) {
+			item.subagentItems = allSubs.map((sub) => {
+				const label = sub.isXprov ? (sub.name || 'claude -p') : sub.name;
+				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${label}`, vscode.TreeItemCollapsibleState.None);
+				child.baseLabel = label;
+				child.id = sub.isXprov ? `${item.id}:xprov:${sub.id}` : `${item.id}:agent:${sub.id}`;
 				child.parentItem = item;
 				child.contextValue = 'subagent';
-				child.description = [sub.model, sub.tokens ? `${formatTokens(sub.tokens)} tok` : null, formatAge(sub.lastActivity)].filter(Boolean).join(' · ');
+				if (sub.isXprov) {
+					const xModel = sub.model ? sub.model.replace(/^claude-/, '') : null;
+					child.description = [xModel, sub.messages ? `${sub.messages} turns` : null, formatAge(sub.lastActivity), sub.cost ? formatCost(sub.cost) : null].filter(Boolean).join(' · ');
+					const xmd = new vscode.MarkdownString();
+					xmd.appendMarkdown(`**${label}** _(cross-provider)_\n\n| | |\n|---|---|\n| Provider | Claude (Anthropic) |\n`);
+					if (sub.model) xmd.appendMarkdown(`| Model | \`${sub.model}\` |\n`);
+					if (sub.messages) xmd.appendMarkdown(`| Turns | ${sub.messages} |\n`);
+					if (sub.cost) xmd.appendMarkdown(`| Cost | **${formatCost(sub.cost)}** |\n`);
+					xmd.appendMarkdown(`\n_Claude session matched to this Codex thread by time overlap._`);
+					child.tooltip = xmd;
+				} else {
+					child.description = [sub.model, sub.tokens ? `${formatTokens(sub.tokens)} tok` : null, formatAge(sub.lastActivity)].filter(Boolean).join(' · ');
+				}
 				return child;
 			});
 		}
 		item.description = [
-			subs && subs.length ? `${subs.length} agent${subs.length > 1 ? 's' : ''}` : null,
+			allSubs.length ? `${allSubs.length} agent${allSubs.length > 1 ? 's' : ''}` : null,
 			formatAge(data.lastActivity),
 			data.tokens ? `${formatTokens(data.tokens)} tok` : null,
 			data.model,
@@ -1532,14 +1620,12 @@ class ChatsProvider {
 
 	_codexItem(row) {
 		const { tab, groupIndex, tabIndex, data, conversationId, subs } = row;
-		const item = new vscode.TreeItem(tab.label, subs && subs.length
+		const xprovSubs = row.xprovSubs || [];
+		const allSubs = [...(subs || []), ...xprovSubs.map((xs) => ({ ...xs, isXprov: true }))];
+		const item = new vscode.TreeItem(tab.label, allSubs.length
 			? vscode.TreeItemCollapsibleState.Expanded
 			: vscode.TreeItemCollapsibleState.None);
-		// Identity is the thread, or the tab's position for an agent that has no
-		// thread yet — never the label, which two chats can share.
 		item.id = `codex:${conversationId || `new:${groupIndex}:${tabIndex}`}`;
-		// null for a brand-new agent with no thread yet; the sidebar/editor
-		// context commands no-op on that until the conversation exists.
 		item.conversationId = conversationId;
 		item.iconPath = this.codexIcon;
 		item.contextValue = 'codexChat';
@@ -1550,7 +1636,6 @@ class ChatsProvider {
 		};
 
 		if (!conversationId) {
-			// /extension/panel/new — a just-opened agent with no thread yet.
 			item.description = 'new agent';
 			item.tooltip = 'Fresh Codex agent — appears with metadata once the conversation is underway.';
 			return item;
@@ -1561,29 +1646,34 @@ class ChatsProvider {
 			return item;
 		}
 
-		if (subs && subs.length) {
-			item.subagentItems = subs.map((sub) => {
-				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${sub.name}`, vscode.TreeItemCollapsibleState.None);
-				child.baseLabel = sub.name;
-				child.id = `${item.id}:agent:${sub.id}`;
+		if (allSubs.length) {
+			item.subagentItems = allSubs.map((sub) => {
+				const label = sub.isXprov ? (sub.name || 'claude -p') : sub.name;
+				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${label}`, vscode.TreeItemCollapsibleState.None);
+				child.baseLabel = label;
+				child.id = sub.isXprov ? `${item.id}:xprov:${sub.id}` : `${item.id}:agent:${sub.id}`;
 				child.parentItem = item;
 				child.contextValue = 'subagent';
-				child.description = [
-					sub.model,
-					sub.tokens ? `${formatTokens(sub.tokens)} tok` : null,
-					formatAge(sub.lastActivity),
-				].filter(Boolean).join(' · ');
-				child.tooltip = `${sub.name} — Codex subagent of this thread. The row disappears once its thread is idle for 2 minutes.`;
+				if (sub.isXprov) {
+					const xModel = sub.model ? sub.model.replace(/^claude-/, '') : null;
+					child.description = [xModel, sub.messages ? `${sub.messages} turns` : null, formatAge(sub.lastActivity), sub.cost ? formatCost(sub.cost) : null].filter(Boolean).join(' · ');
+					const xmd = new vscode.MarkdownString();
+					xmd.appendMarkdown(`**${label}** _(cross-provider)_\n\n| | |\n|---|---|\n| Provider | Claude (Anthropic) |\n`);
+					if (sub.model) xmd.appendMarkdown(`| Model | \`${sub.model}\` |\n`);
+					if (sub.messages) xmd.appendMarkdown(`| Turns | ${sub.messages} |\n`);
+					if (sub.cost) xmd.appendMarkdown(`| Cost | **${formatCost(sub.cost)}** |\n`);
+					xmd.appendMarkdown(`\n_Claude session matched to this Codex thread by time overlap._`);
+					child.tooltip = xmd;
+				} else {
+					child.description = [sub.model, sub.tokens ? `${formatTokens(sub.tokens)} tok` : null, formatAge(sub.lastActivity)].filter(Boolean).join(' · ');
+					child.tooltip = `${sub.name} — Codex subagent of this thread. The row disappears once its thread is idle for 2 minutes.`;
+				}
 				return child;
 			});
 		}
 
-		// No cost column: these are OpenAI models and this extension has no
-		// verified price list for them. A made-up rate would be worse than none.
-		// And no turn duration either — Codex transcripts expose no
-		// user-message timestamp to measure from.
 		item.description = [
-			subs && subs.length ? `${subs.length} agent${subs.length > 1 ? 's' : ''}` : null,
+			allSubs.length ? `${allSubs.length} agent${allSubs.length > 1 ? 's' : ''}` : null,
 			formatAge(data.lastActivity),
 			data.tokens ? `${formatTokens(data.tokens)} tok` : null,
 			data.model,
@@ -1605,53 +1695,72 @@ class ChatsProvider {
 
 	_item(row) {
 		const { tab, groupIndex, tabIndex, data, state, subs } = row;
-		// Expanded while subagents run; back to a flat row when they finish, so
-		// the list stays compact.
-		const collapse = subs && subs.length
+		const xprovSubs = row.xprovSubs || [];
+		const hasSubs = (subs && subs.length > 0) || xprovSubs.length > 0;
+		const collapse = hasSubs
 			? vscode.TreeItemCollapsibleState.Expanded
 			: vscode.TreeItemCollapsibleState.None;
 		const item = new vscode.TreeItem(tab.label, collapse);
-		// A stable id is what keeps the tree's selection pinned to a chat. Without
-		// one VS Code identifies a row by its position, and this list re-sorts on
-		// every refresh — so the highlight stayed on slot 4 while the chat that
-		// had been there moved, and it ended up marking a chat nobody opened.
 		item.id = `chat:${data ? data.sessionId : `${groupIndex}:${tabIndex}`}`;
-		if (subs && subs.length) {
-			item.subagentItems = subs.map((sub) => {
-				const name = sub.name || `agent ${sub.id.slice(0, 8)}`;
-				const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${name}`, vscode.TreeItemCollapsibleState.None);
-				child.baseLabel = name;
-				child.contextValue = 'subagent';
-				// Same shape as a Codex child row — model · total tokens · age —
-				// plus cost, which stays because Claude models have a price list.
-				// The in/out/cache split moved to the tooltip.
-				const rowModel = sub.model || sub.metaModel;
-				const rowTokens = sub.totals.input + sub.totals.cacheRead
-					+ sub.totals.write5m + sub.totals.write1h + sub.totals.output;
-				child.description = [
-					rowModel ? rowModel.replace(/^claude-/, '') : null,
-					rowTokens ? `${formatTokens(rowTokens)} tok` : null,
-					formatAge(sub.mtimeMs),
-					sub.cost ? formatCost(sub.cost) : null,
+		if (hasSubs) {
+			item.subagentItems = [];
+			if (subs) {
+				for (const sub of subs) {
+					const name = sub.name || `agent ${sub.id.slice(0, 8)}`;
+					const child = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${name}`, vscode.TreeItemCollapsibleState.None);
+					child.baseLabel = name;
+					child.contextValue = 'subagent';
+					const rowModel = sub.model || sub.metaModel;
+					const rowTokens = sub.totals.input + sub.totals.cacheRead
+						+ sub.totals.write5m + sub.totals.write1h + sub.totals.output;
+					child.description = [
+						rowModel ? rowModel.replace(/^claude-/, '') : null,
+						rowTokens ? `${formatTokens(rowTokens)} tok` : null,
+						formatAge(sub.mtimeMs),
+						sub.cost ? formatCost(sub.cost) : null,
+					].filter(Boolean).join(' · ');
+					const md = new vscode.MarkdownString();
+					md.appendMarkdown(`**${sub.name || 'subagent'}**\n\n`);
+					md.appendMarkdown(`| | |\n|---|---|\n`);
+					if (sub.kind) md.appendMarkdown(`| Kind | ${sub.kind} |\n`);
+					if (sub.phase) md.appendMarkdown(`| Phase | ${sub.phase} |\n`);
+					md.appendMarkdown(`| Model | \`${sub.model || sub.metaModel || 'unknown'}\` |\n`);
+					md.appendMarkdown(`| Turns | ${sub.messages} |\n`);
+					md.appendMarkdown(`| Input | ${sub.totals.input.toLocaleString()} |\n`);
+					md.appendMarkdown(`| Output | ${sub.totals.output.toLocaleString()} |\n`);
+					md.appendMarkdown(`| Cache read | ${sub.totals.cacheRead.toLocaleString()} |\n`);
+					md.appendMarkdown(`| Cost | **${formatCost(sub.cost)}** |\n`);
+					md.appendMarkdown(`| Last write | ${formatAge(sub.mtimeMs)} |\n\n`);
+					md.appendMarkdown(`_The row disappears once this transcript is idle for 2 minutes._`);
+					child.tooltip = md;
+					child.id = `${item.id}:agent:${sub.id}`;
+					child.parentItem = item;
+					item.subagentItems.push(child);
+				}
+			}
+			for (const xsub of xprovSubs) {
+				const xname = xsub.name || 'codex exec';
+				const xchild = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${xname}`, vscode.TreeItemCollapsibleState.None);
+				xchild.baseLabel = xname;
+				xchild.contextValue = 'subagent';
+				xchild.description = [
+					xsub.model || null,
+					xsub.tokens ? `${formatTokens(xsub.tokens)} tok` : null,
+					formatAge(xsub.lastActivity),
 				].filter(Boolean).join(' · ');
-				const md = new vscode.MarkdownString();
-				md.appendMarkdown(`**${sub.name || 'subagent'}**\n\n`);
-				md.appendMarkdown(`| | |\n|---|---|\n`);
-				if (sub.kind) md.appendMarkdown(`| Kind | ${sub.kind} |\n`);
-				if (sub.phase) md.appendMarkdown(`| Phase | ${sub.phase} |\n`);
-				md.appendMarkdown(`| Model | \`${sub.model || sub.metaModel || 'unknown'}\` |\n`);
-				md.appendMarkdown(`| Turns | ${sub.messages} |\n`);
-				md.appendMarkdown(`| Input | ${sub.totals.input.toLocaleString()} |\n`);
-				md.appendMarkdown(`| Output | ${sub.totals.output.toLocaleString()} |\n`);
-				md.appendMarkdown(`| Cache read | ${sub.totals.cacheRead.toLocaleString()} |\n`);
-				md.appendMarkdown(`| Cost | **${formatCost(sub.cost)}** |\n`);
-				md.appendMarkdown(`| Last write | ${formatAge(sub.mtimeMs)} |\n\n`);
-				md.appendMarkdown(`_The row disappears once this transcript is idle for 2 minutes._`);
-				child.tooltip = md;
-				child.id = `${item.id}:agent:${sub.id}`;
-				child.parentItem = item;
-				return child;
-			});
+				const xmd = new vscode.MarkdownString();
+				xmd.appendMarkdown(`**${xname}** _(cross-provider)_\n\n`);
+				xmd.appendMarkdown(`| | |\n|---|---|\n`);
+				xmd.appendMarkdown(`| Provider | Codex (OpenAI) |\n`);
+				if (xsub.model) xmd.appendMarkdown(`| Model | \`${xsub.model}\` |\n`);
+				if (xsub.tokens) xmd.appendMarkdown(`| Tokens | ${xsub.tokens.toLocaleString()} |\n`);
+				xmd.appendMarkdown(`| Last activity | ${formatAge(xsub.lastActivity)} |\n\n`);
+				xmd.appendMarkdown(`_Codex exec thread matched to this Claude session by time overlap._`);
+				xchild.tooltip = xmd;
+				xchild.id = `${item.id}:xprov:${xsub.id}`;
+				xchild.parentItem = item;
+				item.subagentItems.push(xchild);
+			}
 		}
 		item.iconPath = this.icon;
 		item.contextValue = 'claudeChat';
@@ -1673,9 +1782,10 @@ class ChatsProvider {
 		const subagents = row.subagents || { all: [], cost: 0, messages: 0 };
 		const totalCost = data.cost + subagents.cost;
 		const worked = turnDuration(data, state === 'running', subagents);
-		const live = state === 'running' || (subs && subs.length > 0);
+		const totalAgentCount = (subs ? subs.length : 0) + xprovSubs.length;
+		const live = state === 'running' || hasSubs;
 		item.description = [
-			subs && subs.length ? `${subs.length} agent${subs.length > 1 ? 's' : ''}` : null,
+			totalAgentCount ? `${totalAgentCount} agent${totalAgentCount > 1 ? 's' : ''}` : null,
 			worked ? (live ? `⏱ ${worked}` : `${worked} turn`) : formatAge(data.lastActivity),
 			`${formatTokens(data.contextTokens)}/${formatTokens(data.contextLimit)}`,
 			formatCost(totalCost),
@@ -2171,7 +2281,7 @@ module.exports = {
 	_internal: {
 		readTranscript, projectDirFor, ratesFor, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
-		subagentsFor, promptLabel, readSubagentSummary, threadLabel,
+		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,
 		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,
 		resolveCodexTarget, openCodexInSidebar, openCodexInEditor, newCodexChat,
 	},
