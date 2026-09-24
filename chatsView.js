@@ -99,6 +99,14 @@ async function readTranscript(file) {
 	// answered, and typing is proof you had read what came before it.
 	let lastReplyAt = 0;
 	let lastUserAt = 0;
+	// Background work the chat launched and has not heard back from, keyed by
+	// task id. See backgroundLaunch() for what counts as a launch.
+	const bgTasks = new Map();
+	const bgFinished = new Set();
+	const bgLabels = new Map();
+	// tool_use id -> { name, description }, kept until the tool_result lands,
+	// so a launch result can be labelled with the call's own description.
+	const toolInputs = new Map();
 
 	const rl = readline.createInterface({
 		input: fs.createReadStream(file, { encoding: 'utf8' }),
@@ -114,11 +122,38 @@ async function readTranscript(file) {
 		else if (record.type === 'ai-title' && record.aiTitle) { aiTitle = record.aiTitle; titles.add(record.aiTitle); }
 
 		const message = record.message;
+		let resultInfo = null;
 		if (message && Array.isArray(message.content)) {
 			for (const block of message.content) {
-				if (block.type === 'tool_use') pending.set(block.id, block.name);
-				else if (block.type === 'tool_result') pending.delete(block.tool_use_id);
+				if (block.type === 'tool_use') {
+					pending.set(block.id, block.name);
+					const input = block.input || {};
+					toolInputs.set(block.id, { name: block.name, description: input.description || null });
+					if (block.name === 'TaskStop' || block.name === 'KillShell') {
+						const stopped = input.task_id || input.shell_id;
+						if (stopped) { bgTasks.delete(stopped); bgFinished.add(stopped); }
+					}
+				} else if (block.type === 'tool_result') {
+					pending.delete(block.tool_use_id);
+					if (!resultInfo) resultInfo = toolInputs.get(block.tool_use_id) || { name: null, description: null };
+					toolInputs.delete(block.tool_use_id);
+				}
 			}
+		}
+		if (resultInfo && record.toolUseResult) {
+			const task = backgroundLaunch(record.toolUseResult, resultInfo, stampOf(record, 0));
+			if (task && (task.resumed || !bgFinished.has(task.id))) {
+				if (task.resumed) {
+					bgFinished.delete(task.id);
+					if (bgLabels.has(task.id)) task.label = bgLabels.get(task.id);
+				}
+				delete task.resumed;
+				bgLabels.set(task.id, task.label);
+				bgTasks.set(task.id, task);
+			}
+		}
+		if (line.includes('task-notification')) {
+			for (const id of finishedTaskIds(record)) { bgTasks.delete(id); bgFinished.add(id); }
 		}
 		if (message && message.role === 'assistant' && message.stop_reason !== undefined) {
 			lastStop = message.stop_reason;
@@ -180,7 +215,92 @@ async function readTranscript(file) {
 		lastReplyAt,
 		lastUserAt,
 		pendingTools: [...pending.values()],
+		backgroundTasks: [...bgTasks.values()],
 	};
+}
+
+// ── Background tasks ───────────────────────────────────────────────────────
+// Shells run with run_in_background (or moved there after their timeout),
+// async agents, workflows and monitors keep working after the chat's turn
+// ends. The chat resumes when a <task-notification> reports them done, so
+// until then it is waiting, even with no subagent row on screen.
+// A launch is recognised by the structured toolUseResult on the tool_result
+// record, never by result text: a transcript that merely prints another
+// chat's launch message must not gain a phantom task.
+function backgroundLaunch(result, info, at) {
+	if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+	const description = info && info.description;
+	if (result.backgroundTaskId) {
+		return { id: String(result.backgroundTaskId), kind: 'shell', label: description || 'background command', startedAt: at };
+	}
+	if (result.status === 'async_launched' && result.agentId) {
+		return { id: String(result.agentId), kind: 'agent', label: result.description || description || 'background agent', startedAt: at };
+	}
+	if (result.status === 'async_launched' && result.taskId) {
+		const workflow = result.taskType === 'local_workflow';
+		return {
+			id: String(result.taskId),
+			kind: workflow ? 'workflow' : 'task',
+			label: result.workflowName || result.summary || description || (workflow ? 'workflow' : 'background task'),
+			summary: result.summary || null,
+			runId: result.runId || null,
+			startedAt: at,
+		};
+	}
+	if (result.resumedAgentId) {
+		return { id: String(result.resumedAgentId), kind: 'agent', label: description || 'resumed agent', startedAt: at, resumed: true };
+	}
+	if (result.taskId && typeof result.timeoutMs === 'number') {
+		return {
+			id: String(result.taskId),
+			kind: 'monitor',
+			label: description || 'monitor',
+			startedAt: at,
+			persistent: Boolean(result.persistent),
+			until: result.persistent ? null : at + result.timeoutMs,
+		};
+	}
+	return null;
+}
+
+// Task ids a record reports as finished. Notifications arrive as queue
+// operations, queued_command attachments and user turns; tool results are
+// skipped because they may quote another chat's notifications. Monitor events
+// carry no status and "running" is a progress report, so neither ends a task.
+const NOTIFICATION_RE = /<task-notification>([\s\S]*?)<\/task-notification>/g;
+function finishedTaskIds(record) {
+	let text = '';
+	if (record.type === 'queue-operation' && typeof record.content === 'string') {
+		text = record.content;
+	} else if (record.type === 'attachment' && record.attachment && record.attachment.type === 'queued_command') {
+		text = JSON.stringify(record.attachment);
+	} else if (record.type === 'user' && record.message) {
+		const content = record.message.content;
+		if (typeof content === 'string') text = content;
+		else if (Array.isArray(content)) text = content.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('\n');
+	}
+	const ids = [];
+	if (!text) return ids;
+	for (const match of text.matchAll(NOTIFICATION_RE)) {
+		const id = /<task-id>([^<\\]+)<\/task-id>/.exec(match[1]);
+		const status = /<status>([a-z_]+)<\/status>/.exec(match[1]);
+		if (id && status && status[1] !== 'running') ids.push(id[1].trim());
+	}
+	return ids;
+}
+
+// Background work dies with the process that launched it, and a UI stop
+// leaves no transcript marker, so a task is shown only while its session's
+// process is alive and was already alive when the task started. The age cap
+// bounds what a silent UI stop can leave behind; a persistent monitor is meant
+// to live as long as its session, so the cap skips it.
+const BG_TASK_MAX_AGE_MS = 24 * 3600000;
+function liveBackgroundTasks(data, processStartedAt, now = Date.now()) {
+	if (!data || !data.backgroundTasks || !data.backgroundTasks.length) return [];
+	if (processStartedAt === undefined || processStartedAt === null) return [];
+	return data.backgroundTasks.filter((t) => t.startedAt >= processStartedAt
+		&& (t.persistent || now - t.startedAt < BG_TASK_MAX_AGE_MS)
+		&& (!t.until || now < t.until));
 }
 
 // ── Subagents ──────────────────────────────────────────────────────────────
@@ -384,7 +504,8 @@ function allSubagentFiles(projectDir, sessionId) {
 		for (const name of names) {
 			if (!name.startsWith('agent-') || !name.endsWith('.jsonl')) continue;
 			const full = path.join(dir, name);
-			try { files.push({ file: full, id: name.replace(/^agent-|\.jsonl$/g, ''), stat: fs.statSync(full) }); } catch (_) { /* vanished */ }
+			// runId ties a workflow's agents to the workflow task that launched them.
+			try { files.push({ file: full, id: name.replace(/^agent-|\.jsonl$/g, ''), runId: dir === base ? null : path.basename(dir), stat: fs.statSync(full) }); } catch (_) { /* vanished */ }
 		}
 	}
 	return files;
@@ -393,7 +514,7 @@ function allSubagentFiles(projectDir, sessionId) {
 function subagentsFor(projectDir, sessionId, now = Date.now()) {
 	const all = allSubagentFiles(projectDir, sessionId).map((entry) => {
 		const summary = readSubagentSummary(entry.file, entry.stat);
-		return { id: entry.id, ...summary, running: now - entry.stat.mtimeMs <= SUBAGENT_ACTIVE_MS };
+		return { id: entry.id, runId: entry.runId, ...summary, running: now - entry.stat.mtimeMs <= SUBAGENT_ACTIVE_MS };
 	});
 	all.sort((a, b) => b.mtimeMs - a.mtimeMs);
 	return {
@@ -406,9 +527,11 @@ function subagentsFor(projectDir, sessionId, now = Date.now()) {
 
 // A session writes ~/.claude/sessions/<pid>.json while its process is alive.
 // Needed because an unanswered tool_use also survives a crashed or closed
-// chat, which would otherwise read as "running" forever.
+// chat, which would otherwise read as "running" forever. Maps session id to
+// the earliest start time among its live processes (0 when a record carries
+// none), which dates the background tasks that process can still own.
 function liveSessionIds() {
-	const ids = new Set();
+	const ids = new Map();
 	const dir = path.join(claudeConfigDir(), 'sessions');
 	let names;
 	try { names = fs.readdirSync(dir); } catch (_) { return ids; }
@@ -416,7 +539,10 @@ function liveSessionIds() {
 		if (!name.endsWith('.json')) continue;
 		try {
 			const rec = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
-			if (rec.sessionId) ids.add(rec.sessionId);
+			if (!rec.sessionId) continue;
+			const started = Number(rec.startedAt) || 0;
+			const known = ids.get(rec.sessionId);
+			ids.set(rec.sessionId, known === undefined ? started : Math.min(known, started));
 		} catch (_) { /* being written right now */ }
 	}
 	return ids;
@@ -1088,7 +1214,11 @@ function turnDuration(data, running, subagents) {
 	const lastSubWrite = (subs.all || []).reduce((m, a) => Math.max(m, a.mtimeMs || 0), 0);
 	const end = live ? Date.now() : Math.max(data.lastReplyAt || 0, lastSubWrite);
 	if (!end || end <= data.lastUserAt) return null;
-	const secs = Math.round((end - data.lastUserAt) / 1000);
+	return formatSpan(end - data.lastUserAt);
+}
+
+function formatSpan(ms) {
+	const secs = Math.max(0, Math.round(ms / 1000));
 	if (secs < 60) return `${secs}s`;
 	const mins = Math.floor(secs / 60);
 	if (mins < 60) return `${mins}m ${String(secs % 60).padStart(2, '0')}s`;
@@ -1357,7 +1487,14 @@ class ChatsProvider {
 			const subagents = (projectDir && data)
 				? subagentsFor(projectDir, data.sessionId)
 				: { all: [], running: [], cost: 0, messages: 0 };
-			return { ...t, kind: 'claude', data, state, subagents, subs: subagents.running };
+			// A background agent, or a workflow's agents, still writing already
+			// have subagent rows; the task row takes over once they go quiet.
+			const tasks = data
+				? liveBackgroundTasks(data, live.get(data.sessionId))
+					.filter((task) => !subagents.running.some((s) => (task.kind === 'agent' && s.id === task.id)
+						|| (task.kind === 'workflow' && task.runId && s.runId === task.runId)))
+				: [];
+			return { ...t, kind: 'claude', data, state, subagents, subs: subagents.running, tasks };
 		});
 		// Cross-provider: a Codex exec thread that wrote within the last
 		// SUBAGENT_ACTIVE_MS is shown under the Claude session closest to
@@ -1384,7 +1521,7 @@ class ChatsProvider {
 
 		const openSessionIds = new Set(rows.filter((r) => r.kind === 'claude' && r.data).map((r) => r.data.sessionId));
 
-		this.hasRunningSubagents = rows.some((r) => r.subs && r.subs.length);
+		this.hasRunningSubagents = rows.some((r) => (r.subs && r.subs.length) || (r.tasks && r.tasks.length));
 		// Codex rows are appended below, so re-check after they land.
 		this.decorations.replace(rows.map((r) => [r.data && r.data.sessionId, r.state]));
 		this.seen.flush();
@@ -1698,7 +1835,8 @@ class ChatsProvider {
 	_item(row) {
 		const { tab, groupIndex, tabIndex, data, state, subs } = row;
 		const xprovSubs = row.xprovSubs || [];
-		const hasSubs = (subs && subs.length > 0) || xprovSubs.length > 0;
+		const tasks = row.tasks || [];
+		const hasSubs = (subs && subs.length > 0) || xprovSubs.length > 0 || tasks.length > 0;
 		const collapse = hasSubs
 			? vscode.TreeItemCollapsibleState.Expanded
 			: vscode.TreeItemCollapsibleState.None;
@@ -1763,6 +1901,25 @@ class ChatsProvider {
 				xchild.parentItem = item;
 				item.subagentItems.push(xchild);
 			}
+			const now = Date.now();
+			for (const task of tasks) {
+				const tchild = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${task.label}`, vscode.TreeItemCollapsibleState.None);
+				tchild.baseLabel = task.label;
+				tchild.contextValue = 'backgroundTask';
+				tchild.description = `${task.kind} · ${formatSpan(now - task.startedAt)}`;
+				const tmd = new vscode.MarkdownString();
+				tmd.appendMarkdown(`**${task.label}** _(background ${task.kind})_\n\n`);
+				tmd.appendMarkdown(`| | |\n|---|---|\n`);
+				if (task.summary && task.summary !== task.label) tmd.appendMarkdown(`| Summary | ${task.summary} |\n`);
+				tmd.appendMarkdown(`| Task ID | \`${task.id}\` |\n`);
+				tmd.appendMarkdown(`| Running for | ${formatSpan(now - task.startedAt)} |\n`);
+				if (task.until) tmd.appendMarkdown(`| Times out in | ${formatSpan(task.until - now)} |\n`);
+				tmd.appendMarkdown(`\n_The chat continues when this task reports back. The row disappears then._`);
+				tchild.tooltip = tmd;
+				tchild.id = `${item.id}:task:${task.id}`;
+				tchild.parentItem = item;
+				item.subagentItems.push(tchild);
+			}
 		}
 		item.iconPath = this.icon;
 		item.contextValue = 'claudeChat';
@@ -1783,11 +1940,13 @@ class ChatsProvider {
 		const pct = data.contextLimit ? Math.round((data.contextTokens / data.contextLimit) * 100) : 0;
 		const subagents = row.subagents || { all: [], cost: 0, messages: 0 };
 		const totalCost = data.cost + subagents.cost;
-		const worked = turnDuration(data, state === 'running', subagents);
+		// Pending background tasks keep the turn open: the chat resumes when they report back.
+		const worked = turnDuration(data, state === 'running' || tasks.length > 0, subagents);
 		const totalAgentCount = (subs ? subs.length : 0) + xprovSubs.length;
 		const live = state === 'running' || hasSubs;
 		item.description = [
 			totalAgentCount ? `${totalAgentCount} agent${totalAgentCount > 1 ? 's' : ''}` : null,
+			tasks.length ? `${tasks.length} task${tasks.length > 1 ? 's' : ''}` : null,
 			worked ? (live ? `⏱ ${worked}` : `${worked} turn`) : formatAge(data.lastActivity),
 			`${formatTokens(data.contextTokens)}/${formatTokens(data.contextLimit)}`,
 			formatCost(totalCost),
@@ -2283,6 +2442,7 @@ module.exports = {
 	_internal: {
 		readTranscript, projectDirFor, ratesFor, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
+		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,
 		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,
 		resolveCodexTarget, openCodexInSidebar, openCodexInEditor, newCodexChat,
