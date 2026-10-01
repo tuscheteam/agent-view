@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.13.25",
+  "version": "0.14.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -54,6 +54,103 @@
             "gpt-6-astra"
           ],
           "description": "Leaderboard names never recommended as subagent models (flagships priced for orchestration, not fan-out)."
+        },
+        "openEditorsTools.leaderboard.showDeepSeek": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "always",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Show the DeepSeek model the router serves while the model router is on",
+            "Always show the DeepSeek model the router serves",
+            "Never show DeepSeek models"
+          ],
+          "default": "auto",
+          "markdownDescription": "DeepSeek rows on the leaderboard. Only the model in `#openEditorsTools.modelRouter.pickerModels#` is shown (e.g. `deepseek-v4-flash`), with its rank in DeepSeek blue."
+        },
+        "openEditorsTools.chats.showBackgroundTasks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a spinner row under a chat for each background shell, agent, workflow or monitor it is still waiting on."
+        },
+        "openEditorsTools.chats.showCrossProviderSubagents": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Codex runs started from a Claude chat (and Claude runs started from a Codex thread) as subagent rows of that chat."
+        },
+        "openEditorsTools.subagentRecommendation.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Write `~/.agent-view/subagent-recommendation.json` after each leaderboard refresh. Off: the file is no longer updated."
+        },
+        "openEditorsTools.claudeCodeAutoRepair": {
+          "type": "boolean",
+          "default": true,
+          "description": "Re-apply the chat-rename fix to each new Claude Code install at startup."
+        },
+        "openEditorsTools.modelRouter.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Run the model router: Claude Code chats can switch to OpenRouter models (e.g. `deepseek/deepseek-v4-flash-0731`) with `/model`, while Claude models keep using your Claude login. Needs an OpenRouter key (**Agent View: Set OpenRouter API Key** or the `OPENROUTER_API_KEY` environment variable). Applies to chats opened after switching it on.",
+          "scope": "application"
+        },
+        "openEditorsTools.modelRouter.port": {
+          "type": "number",
+          "default": 47861,
+          "description": "Local port of the model router (127.0.0.1 only, 1024-65535). Shared by every VS Code window.",
+          "scope": "application",
+          "minimum": 1024,
+          "maximum": 65535
+        },
+        "openEditorsTools.modelRouter.requireZeroDataRetention": {
+          "type": "boolean",
+          "default": true,
+          "description": "Send OpenRouter requests only to providers that OpenRouter lists as zero data retention.",
+          "scope": "application"
+        },
+        "openEditorsTools.modelRouter.ignoredProviders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "deepseek",
+            "tencent",
+            "baidu",
+            "nex-agi",
+            "xiaomi",
+            "streamlake",
+            "alibaba",
+            "moonshotai",
+            "minimax",
+            "z-ai",
+            "siliconflow",
+            "seed",
+            "stepfun",
+            "novita",
+            "phala"
+          ],
+          "description": "OpenRouter provider slugs never used. The default keeps out providers headquartered in China, Hong Kong or Singapore and two with Chinese ties.",
+          "scope": "application"
+        },
+        "openEditorsTools.modelRouter.pickerModels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "deepseek/deepseek-v4-flash-0731"
+          ],
+          "description": "OpenRouter models listed in Claude Code's model menu while the router runs.",
+          "scope": "application"
+        },
+        "openEditorsTools.modelRouter.serverToolModel": {
+          "type": "string",
+          "default": "claude-sonnet-5",
+          "description": "Claude model that runs web search for chats on an OpenRouter model (OpenRouter models cannot run Anthropic's server tools).",
+          "scope": "application"
         }
       }
     },
@@ -197,6 +294,32 @@
       {
         "command": "openEditorsTools.openCodexInEditor",
         "title": "Open in Editor Tab",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.setOpenRouterKey",
+        "title": "Set OpenRouter API Key",
+        "category": "Agent View",
+        "icon": "$(key)"
+      },
+      {
+        "command": "openEditorsTools.clearOpenRouterKey",
+        "title": "Clear OpenRouter API Key",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.toggleModelRouter",
+        "title": "Model Router: Turn On / Off",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.modelRouterStatus",
+        "title": "Model Router: Status",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.requalifyProviders",
+        "title": "Model Router: Re-check OpenRouter Providers",
         "category": "Agent View"
       }
     ],

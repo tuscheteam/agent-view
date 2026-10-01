@@ -10,6 +10,7 @@ class LeaderboardViewProvider {
 		// a 120 px minimum body, which left dead space under the five bars; in
 		// here they take exactly the height they need.
 		this.usageBlock = null;
+		this.rowFilter = null;
 	}
 
 	resolveWebviewView(webviewView) {
@@ -104,7 +105,8 @@ class LeaderboardViewProvider {
 	}
 	.row:last-child { border-bottom: 0; }
 	/* The rank colour names the provider, the same pair the Usage bars use:
-	   foreground white for OpenAI, the Claude orange for Anthropic. It replaced
+	   foreground white for OpenAI, the Claude orange for Anthropic, and the
+	   blue of DeepSeek's logo (resources/deepseek.svg) for DeepSeek. It replaced
 	   a provider line under every model, which cost a text row per entry. */
 	.rank {
 		color: var(--vscode-descriptionForeground);
@@ -113,6 +115,7 @@ class LeaderboardViewProvider {
 	}
 	.rank.openai { color: var(--vscode-foreground); }
 	.rank.anthropic { color: #D97757; }
+	.rank.deepseek { color: #4D6BFE; }
 	.model { min-width: 0; }
 	.name {
 		overflow: hidden;
@@ -152,8 +155,10 @@ ${columns}
 		if (!data) {
 			return `<section class="col"><div class="col-head"><span class="col-title">${escapeHtml(title)}</span></div><div class="empty">No cached data yet.</div></section>`;
 		}
-		const rows = Array.isArray(data.rows) && data.rows.length
-			? data.rows.map(rowHtml).join('\n')
+		// rowFilter (set by register) hides DeepSeek rows unless asked for.
+		const shown = Array.isArray(data.rows) ? (this.rowFilter ? this.rowFilter(data.rows) : data.rows) : [];
+		const rows = shown.length
+			? shown.map(rowHtml).join('\n')
 			: '<div class="empty">No OpenAI or Anthropic models in this response.</div>';
 		return `<section class="col">
 	<div class="col-head"><span class="col-title">${escapeHtml(title)}</span><span class="col-time">${escapeHtml(shortTime(data.generatedAt))}</span></div>
@@ -174,10 +179,12 @@ function rowHtml(row) {
 
 // The orange rank already says Anthropic, so the "claude-" prefix only costs
 // the width that decides whether "fable-5-1" fits or ends in an ellipsis. The
-// row tooltip keeps the full name.
+// blue rank says DeepSeek the same way. The row tooltip keeps the full name.
 function shortName(row) {
 	const name = String(row.name || '');
-	return row.provider === 'anthropic' ? name.replace(/^claude-/i, '') : name;
+	if (row.provider === 'anthropic') return name.replace(/^claude-/i, '');
+	if (row.provider === 'deepseek') return name.replace(/^deepseek-/i, '');
+	return name;
 }
 
 function stateLine(snapshot) {
@@ -199,8 +206,8 @@ function noticeLine(snapshot) {
 function infoLines(snapshot) {
 	const quota = snapshot.reasoning && snapshot.reasoning.quota && snapshot.reasoning.quota.remaining;
 	return [
-		'Source: AI Stupid Level (aistupidlevel.info), OpenAI and Anthropic models only.',
-		'Rank colour: white = OpenAI, orange = Anthropic. Hover a row for the full model name.',
+		'Source: AI Stupid Level (aistupidlevel.info): OpenAI and Anthropic models, plus the DeepSeek model the model router serves.',
+		'Rank colour: white = OpenAI, orange = Anthropic, blue = DeepSeek. Hover a row for the full model name.',
 		stateLine(snapshot),
 		'Each refresh costs 2 API calls, spaced for the free 1/min limit.',
 		quota ? `API calls remaining after the last reasoning fetch: ${quota}` : null,
@@ -215,6 +222,7 @@ function formatScore(score) {
 function providerLabel(provider) {
 	if (provider === 'openai') return 'OpenAI';
 	if (provider === 'anthropic') return 'Anthropic';
+	if (provider === 'deepseek') return 'DeepSeek';
 	return provider || '';
 }
 

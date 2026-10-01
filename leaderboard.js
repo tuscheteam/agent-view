@@ -13,7 +13,9 @@ const REFRESH_HOURS = [8, 11, 14, 17, 20];
 const CODING_SORT = '7axis';
 const REQUEST_SPACING_MS = 65000;
 const TIMER_MAX_MS = 24 * 60 * 60 * 1000;
-const ALLOWED_PROVIDERS = new Set(['openai', 'anthropic']);
+// DeepSeek joined with the model router, which lets a Claude Code chat run
+// deepseek models through OpenRouter.
+const ALLOWED_PROVIDERS = new Set(['openai', 'anthropic', 'deepseek']);
 // Flagship models are priced for the orchestrator seat, not for fan-out, so
 // they never win the subagent recommendation even when they top the board.
 const DEFAULT_SUBAGENT_EXCLUDE = ['claude-fable-5-1', 'gpt-6-astra'];
@@ -37,6 +39,8 @@ class LeaderboardCache {
 		// change lands on the next refresh without reloading the extension.
 		this.excludedModels = options.excludedModels;
 		this.getExcluded = typeof options.getExcluded === 'function' ? options.getExcluded : null;
+		// Setting openEditorsTools.subagentRecommendation.enabled, read per write.
+		this.isRecommendationEnabled = typeof options.isRecommendationEnabled === 'function' ? options.isRecommendationEnabled : null;
 		this.cache = context.globalState.get(CACHE_KEY) || emptyCache();
 		// A coding column cached under another mode is wrong data with a right
 		// label; an empty column until the next fetch is the honest state.
@@ -210,6 +214,7 @@ class LeaderboardCache {
 	// write failure is logged and swallowed; a missing file just means no pick
 	// yet, never a broken refresh.
 	writeRecommendation(cache, options = {}) {
+		if (this.isRecommendationEnabled && !this.isRecommendationEnabled()) return false;
 		const coding = cache && cache.coding;
 		if (!coding || !Array.isArray(coding.rows)) return false;
 		const excluded = this._resolveExcluded(options);
@@ -313,6 +318,7 @@ function normalizeProvider(provider) {
 	const value = String(provider || '').trim().toLowerCase();
 	if (value === 'openai' || value === 'open ai') return 'openai';
 	if (value === 'anthropic' || value === 'claude') return 'anthropic';
+	if (value === 'deepseek' || value === 'deep seek' || value === 'deepseek-ai') return 'deepseek';
 	return value;
 }
 
@@ -400,6 +406,23 @@ function buildExcludeSet(excluded) {
 	return set;
 }
 
+// DeepSeek rows are fetched and cached but drawn only when asked for, and
+// then only for models the router actually serves: "deepseek-v4-flash" on the
+// board matches the routed "deepseek/deepseek-v4-flash-0731" (date suffix
+// dropped). Claude and OpenAI rows always show.
+function visibleRows(rows, { showDeepSeek = false, routedModels = [] } = {}) {
+	const bases = new Set();
+	for (const m of routedModels) {
+		const base = String(m).toLowerCase().split('/').pop().replace(/\[[^\]]*\]$/, '');
+		bases.add(base);
+		bases.add(base.replace(/-\d{4}$/, ''));
+	}
+	return (Array.isArray(rows) ? rows : []).filter((row) => {
+		if (row.provider !== 'deepseek') return true;
+		return showDeepSeek && bases.has(String(row.name).toLowerCase());
+	});
+}
+
 function emptyCache() {
 	return {
 		reasoning: null,
@@ -418,6 +441,7 @@ module.exports = {
 	slotKeyFor,
 	nextRefreshAt,
 	recommendSubagents,
+	visibleRows,
 	DEFAULT_SUBAGENT_EXCLUDE,
 	_internal: {
 		API_BASE,

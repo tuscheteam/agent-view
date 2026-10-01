@@ -7,7 +7,7 @@ const { UsageCache, watchCredentials } = require('./usage');
 const restyle = require('./restyle');
 const claudeFix = require('./claudeFix');
 const { UsageViewProvider } = require('./usageView');
-const { LeaderboardCache, DEFAULT_SUBAGENT_EXCLUDE } = require('./leaderboard');
+const { LeaderboardCache, DEFAULT_SUBAGENT_EXCLUDE, visibleRows } = require('./leaderboard');
 const { LeaderboardViewProvider, infoLines } = require('./leaderboardView');
 
 // A CHATS tree of our own, because the built-in OPEN EDITORS rows cannot carry
@@ -26,27 +26,144 @@ const CACHE_READ = 0.1;
 const CACHE_WRITE_5M = 1.25;
 const CACHE_WRITE_1H = 2;
 
+// cacheRead, where set, is the model's own cache-read price per MTok; others
+// read at CACHE_READ x input. Keys are matched by prefix in insertion order, so
+// a longer id (claude-opus-5-5) must come before its prefix (claude-opus-5).
 const PRICING = {
+	'claude-fable-5-1': { in: 10, out: 50, cacheRead: 0.25, ctx: 1000000 },
 	'claude-fable-5': { in: 10, out: 50, ctx: 1000000 },
 	'claude-mythos-5': { in: 10, out: 50, ctx: 1000000 },
+	'claude-opus-5-5': { in: 4, out: 20, cacheRead: 0.2, ctx: 1000000 },
 	'claude-opus-5': { in: 5, out: 25, ctx: 1000000 },
 	'claude-opus-4-8': { in: 5, out: 25, ctx: 1000000 },
 	'claude-opus-4-7': { in: 5, out: 25, ctx: 1000000 },
 	'claude-opus-4-6': { in: 5, out: 25, ctx: 1000000 },
 	'claude-opus-4-5': { in: 5, out: 25, ctx: 200000 },
-	'claude-sonnet-5': { in: 3, out: 15, ctx: 1000000 },
+	'claude-sonnet-5': { in: 2, out: 10, ctx: 1000000 },
 	'claude-sonnet-4-6': { in: 3, out: 15, ctx: 1000000 },
 	'claude-sonnet-4-5': { in: 3, out: 15, ctx: 1000000 },
 	'claude-haiku-4-5': { in: 1, out: 5, ctx: 200000 },
 };
 const DEFAULT_RATES = PRICING['claude-opus-5'];
 
+// Feature switches (package.json, all default on). Read on every use, so a
+// change applies at the next refresh without a reload.
+function settingOn(key) {
+	return vscode.workspace.getConfiguration('openEditorsTools').get(key, true) !== false;
+}
+
+// OpenRouter models ("vendor/model", reached through the model router) price
+// from the router's cost log, which holds what OpenRouter actually billed.
+// These rates only fill in for a reply the log has not recorded yet.
+const OPENROUTER_FALLBACK_RATES = { in: 0.1, out: 0.3, cacheRead: 0.02, ctx: 1000000 };
+
+// A model the router serves: listed in modelRouter.pickerModels. Other
+// "vendor/model" ids (OpenRouter used directly, Bedrock ARNs) keep the
+// Claude rates they had before the router existed.
+function isRoutedModel(model) {
+	if (!model || !model.includes('/')) return false;
+	let list = ['deepseek/deepseek-v4-flash-0731'];
+	try { list = vscode.workspace.getConfiguration('openEditorsTools').get('modelRouter.pickerModels', list); } catch (_) { /* tests without config */ }
+	return Array.isArray(list) && list.includes(model.replace(/\[1m\]$/i, ''));
+}
+
 function ratesFor(model) {
 	if (!model) return DEFAULT_RATES;
+	if (isRoutedModel(model)) return OPENROUTER_FALLBACK_RATES;
 	// Transcripts store the bare id ("claude-opus-5"); a dated or suffixed
 	// variant still starts with it.
 	const hit = Object.keys(PRICING).find((id) => model.startsWith(id));
 	return hit ? PRICING[hit] : DEFAULT_RATES;
+}
+
+// The router appends one JSON line per OpenRouter reply: { id, cost, ... }.
+// Re-read only when the file changed.
+const ROUTER_LEDGER = path.join(os.homedir(), '.agent-view', 'router-usage.jsonl');
+const routerLedger = { mtimeMs: -1, size: -1, costs: new Map() };
+function routerCosts() {
+	let stat;
+	try { stat = fs.statSync(ROUTER_LEDGER); } catch (_) { routerLedger.costs.clear(); routerLedger.mtimeMs = 0; return routerLedger; }
+	if (stat.mtimeMs === routerLedger.mtimeMs && stat.size === routerLedger.size) return routerLedger;
+	const costs = new Map();
+	try {
+		for (const line of fs.readFileSync(ROUTER_LEDGER, 'utf8').split('\n')) {
+			if (!line) continue;
+			try {
+				const r = JSON.parse(line);
+				if (r && r.id && typeof r.cost === 'number') costs.set(r.id, r.cost);
+			} catch (_) { /* half-written line */ }
+		}
+	} catch (_) { /* unreadable: keep the old map */ return routerLedger; }
+	routerLedger.costs = costs;
+	routerLedger.mtimeMs = stat.mtimeMs;
+	routerLedger.size = stat.size;
+	return routerLedger;
+}
+
+// Token counts and cost of one assistant message's usage block.
+function usageContribution(message) {
+	const usage = message.usage;
+	const creation = usage.cache_creation || {};
+	const write1h = creation.ephemeral_1h_input_tokens || 0;
+	// Older records carry only the total, so derive the 5-minute share
+	// rather than dropping it.
+	const writeTotal = usage.cache_creation_input_tokens || 0;
+	const write5m = creation.ephemeral_5m_input_tokens || Math.max(0, writeTotal - write1h);
+	const input = usage.input_tokens || 0;
+	const output = usage.output_tokens || 0;
+	const cacheRead = usage.cache_read_input_tokens || 0;
+	const model = message.model;
+	const billed = model && model.includes('/') && message.id ? routerCosts().costs.get(message.id) : undefined;
+	const routed = typeof billed === 'number' || isRoutedModel(model);
+	const rates = routed ? OPENROUTER_FALLBACK_RATES : ratesFor(model);
+	let cost;
+	if (routed) {
+		cost = typeof billed === 'number'
+			? billed
+			: ((input + writeTotal) * rates.in + output * rates.out + cacheRead * rates.cacheRead) / 1000000;
+	} else {
+		const readRate = typeof rates.cacheRead === 'number' ? rates.cacheRead : rates.in * CACHE_READ;
+		cost = (input * rates.in
+			+ output * rates.out
+			+ cacheRead * readRate
+			+ write5m * rates.in * CACHE_WRITE_5M
+			+ write1h * rates.in * CACHE_WRITE_1H) / 1000000;
+	}
+	return { input, output, cacheRead, write5m, write1h, writeTotal, cost, routed };
+}
+
+// Claude Code writes one assistant message as several transcript records (one
+// per content block), and every record repeats the message's full usage. Keyed
+// by message id, a repeat replaces the earlier contribution; summing every
+// record counted one real chat's tokens and cost nearly twice.
+class UsageTally {
+	constructor() {
+		this.byId = new Map();
+		this.loose = [];
+	}
+
+	add(message) {
+		const c = usageContribution(message);
+		if (message.id) this.byId.set(message.id, c);
+		else this.loose.push(c);
+		return c;
+	}
+
+	result() {
+		const totals = { input: 0, output: 0, cacheRead: 0, write5m: 0, write1h: 0 };
+		let cost = 0;
+		let routed = false;
+		for (const c of [...this.byId.values(), ...this.loose]) {
+			totals.input += c.input;
+			totals.output += c.output;
+			totals.cacheRead += c.cacheRead;
+			totals.write5m += c.write5m;
+			totals.write1h += c.write1h;
+			cost += c.cost;
+			if (c.routed) routed = true;
+		}
+		return { totals, cost, messages: this.byId.size + this.loose.length, routed };
+	}
 }
 
 // ~/.claude/projects/c--Users-alice-projects-my-app — every
@@ -78,7 +195,7 @@ function stampOf(record, fallback) {
 }
 
 async function readTranscript(file) {
-	const totals = { input: 0, output: 0, cacheRead: 0, write5m: 0, write1h: 0 };
+	const tally = new UsageTally();
 	// tool_use id -> tool name, cleared when the matching tool_result lands.
 	// Whatever is still here at EOF is what the agent is waiting on.
 	const pending = new Map();
@@ -91,8 +208,6 @@ async function readTranscript(file) {
 	let aiTitle = null;
 	let model = null;
 	let contextTokens = 0;
-	let cost = 0;
-	let messages = 0;
 	let lastStop = null;
 	// When the agent last finished speaking, and when you last spoke. Both drive
 	// the unread mark: a reply newer than your own last turn is one you have not
@@ -172,45 +287,24 @@ async function readTranscript(file) {
 		// Last one wins, so the row follows a mid-chat model switch. `<synthetic>`
 		// marks a replayed turn, not a model, and must not overwrite it.
 		if (message.model && message.model !== '<synthetic>') model = message.model;
-		const rates = ratesFor(message.model);
-
-		const creation = usage.cache_creation || {};
-		const write1h = creation.ephemeral_1h_input_tokens || 0;
-		// Older records carry only the total, so derive the 5-minute share
-		// rather than dropping it.
-		const writeTotal = usage.cache_creation_input_tokens || 0;
-		const write5m = creation.ephemeral_5m_input_tokens || Math.max(0, writeTotal - write1h);
-		const input = usage.input_tokens || 0;
-		const output = usage.output_tokens || 0;
-		const cacheRead = usage.cache_read_input_tokens || 0;
-
-		totals.input += input;
-		totals.output += output;
-		totals.cacheRead += cacheRead;
-		totals.write5m += write5m;
-		totals.write1h += write1h;
-		messages++;
-
-		cost += (input * rates.in
-			+ output * rates.out
-			+ cacheRead * rates.in * CACHE_READ
-			+ write5m * rates.in * CACHE_WRITE_5M
-			+ write1h * rates.in * CACHE_WRITE_1H) / 1000000;
+		const c = tally.add(message);
 
 		// Context in play is whatever the most recent request carried, not the
 		// running total — cache reads replay the same prefix every turn.
-		contextTokens = input + cacheRead + writeTotal;
+		contextTokens = c.input + c.cacheRead + c.writeTotal;
 	}
 
+	const sums = tally.result();
 	return {
 		title: customTitle || aiTitle,
 		titles,
 		model,
 		contextTokens,
 		contextLimit: ratesFor(model).ctx,
-		cost,
-		messages,
-		totals,
+		cost: sums.cost,
+		messages: sums.messages,
+		totals: sums.totals,
+		routed: sums.routed,
 		lastStop,
 		lastReplyAt,
 		lastUserAt,
@@ -367,7 +461,8 @@ function readSubagentSummary(file, stat) {
 	// that never changes again: on such a hit, re-check for the meta file once
 	// per refresh and rebuild only when it has appeared.
 	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size
-		&& (cached._metaApplied || !readSubagentMeta(file))) return cached;
+		&& (cached._metaApplied || !readSubagentMeta(file))
+		&& !(cached.routed && routerCosts().mtimeMs !== cached.ledgerMtimeMs)) return cached;
 
 	const summary = {
 		mtimeMs: stat.mtimeMs,
@@ -411,6 +506,7 @@ function readSubagentSummary(file, stat) {
 	let text;
 	try { text = fs.readFileSync(file, 'utf8'); } catch (_) { return summary; }
 
+	const tally = new UsageTally();
 	for (const line of text.split('\n')) {
 		if (!line) continue;
 		let record;
@@ -423,29 +519,15 @@ function readSubagentSummary(file, stat) {
 		// model and would price at the default rate.
 		if (message.model && message.model !== '<synthetic>') summary.model = message.model;
 
-		const usage = message.usage;
-		if (!usage) continue;
-		const rates = ratesFor(message.model);
-		const creation = usage.cache_creation || {};
-		const write1h = creation.ephemeral_1h_input_tokens || 0;
-		const writeTotal = usage.cache_creation_input_tokens || 0;
-		const write5m = creation.ephemeral_5m_input_tokens || Math.max(0, writeTotal - write1h);
-		const input = usage.input_tokens || 0;
-		const output = usage.output_tokens || 0;
-		const cacheRead = usage.cache_read_input_tokens || 0;
-
-		summary.messages++;
-		summary.totals.input += input;
-		summary.totals.output += output;
-		summary.totals.cacheRead += cacheRead;
-		summary.totals.write5m += write5m;
-		summary.totals.write1h += write1h;
-		summary.cost += (input * rates.in
-			+ output * rates.out
-			+ cacheRead * rates.in * CACHE_READ
-			+ write5m * rates.in * CACHE_WRITE_5M
-			+ write1h * rates.in * CACHE_WRITE_1H) / 1000000;
+		if (!message.usage) continue;
+		tally.add(message);
 	}
+	const sums = tally.result();
+	summary.messages = sums.messages;
+	summary.totals = sums.totals;
+	summary.cost = sums.cost;
+	summary.routed = sums.routed;
+	summary.ledgerMtimeMs = sums.routed ? routerCosts().mtimeMs : 0;
 
 	subagentCache.set(file, summary);
 	return summary;
@@ -593,7 +675,10 @@ class TranscriptIndex {
 
 			const cached = this.byFile.get(file);
 			let entry;
-			if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+			// A chat that used OpenRouter models is re-read when the router's
+			// cost log moves on, since its billed costs land there after the reply.
+			if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size
+				&& !(cached.routed && routerCosts().mtimeMs !== cached.ledgerMtimeMs)) {
 				entry = cached;
 			} else {
 				try {
@@ -601,6 +686,7 @@ class TranscriptIndex {
 				} catch (_) {
 					continue; // half-written line during an active session
 				}
+				entry.ledgerMtimeMs = entry.routed ? routerCosts().mtimeMs : 0;
 				entry.mtimeMs = stat.mtimeMs;
 				entry.size = stat.size;
 				entry.sessionId = name.replace(/\.jsonl$/, '');
@@ -1356,6 +1442,7 @@ class ChatsProvider {
 		// A codicon would render monochrome and look nothing like OPEN EDITORS.
 		this.icon = vscode.Uri.joinPath(extensionUri, 'resources', 'claude.svg');
 		this.codexIcon = vscode.Uri.joinPath(extensionUri, 'resources', 'codex.svg');
+		this.deepseekIcon = vscode.Uri.joinPath(extensionUri, 'resources', 'deepseek.svg');
 		this.codex = new CodexIndex();
 		// codexTabs() is a free function shared by commands that run outside
 		// any provider, so it reaches the thread index through this ref.
@@ -1489,7 +1576,7 @@ class ChatsProvider {
 				: { all: [], running: [], cost: 0, messages: 0 };
 			// A background agent, or a workflow's agents, still writing already
 			// have subagent rows; the task row takes over once they go quiet.
-			const tasks = data
+			const tasks = data && settingOn('chats.showBackgroundTasks')
 				? liveBackgroundTasks(data, live.get(data.sessionId))
 					.filter((task) => !subagents.running.some((s) => (task.kind === 'agent' && s.id === task.id)
 						|| (task.kind === 'workflow' && task.runId && s.runId === task.runId)))
@@ -1504,7 +1591,8 @@ class ChatsProvider {
 		// thread of the day to a long idle session and made it look busy.
 		const XPROV_PARENT_WINDOW_MS = 30 * 60 * 1000;
 		const xprovActiveCutoff = Date.now() - SUBAGENT_ACTIVE_MS;
-		for (const exec of this.codex.execById.values()) {
+		const showXprov = settingOn('chats.showCrossProviderSubagents');
+		for (const exec of showXprov ? this.codex.execById.values() : []) {
 			if (exec.lastActivity < xprovActiveCutoff) continue;
 			let best = null;
 			let bestGap = XPROV_PARENT_WINDOW_MS;
@@ -1542,7 +1630,7 @@ class ChatsProvider {
 		// subagent row.
 		const matchedClaudeSessions = new Set();
 		const codexRows = rows.filter((r) => r.kind === 'codex' || r.kind === 'codex-live');
-		for (const entry of this.index.byFile.values()) {
+		for (const entry of showXprov ? this.index.byFile.values() : []) {
 			if (openSessionIds.has(entry.sessionId)) continue;
 			if (entry.lastActivity < xprovActiveCutoff) continue;
 			let best = null;
@@ -1921,7 +2009,10 @@ class ChatsProvider {
 				item.subagentItems.push(tchild);
 			}
 		}
-		item.iconPath = this.icon;
+		// A chat whose latest reply came from DeepSeek (through the model
+		// router) shows DeepSeek's logo; the next Claude reply restores the
+		// asterisk.
+		item.iconPath = data && /^deepseek\//i.test(String(data.model || '')) ? this.deepseekIcon : this.icon;
 		item.contextValue = 'claudeChat';
 		// Carries the status decoration; nothing on disk is behind this URI.
 		if (data && data.sessionId) item.resourceUri = uriFor(data.sessionId);
@@ -2036,7 +2127,7 @@ function register(context) {
 	// Guard against Claude Code builds that ship a broken renameSession call
 	// (2.1.272/2.1.273 and any future build with the same minified shape).
 	// Runs on every activation so a fresh auto-update is re-patched silently.
-	Promise.resolve().then(() => claudeFix.apply()).then((results) => {
+	Promise.resolve().then(() => (settingOn('claudeCodeAutoRepair') ? claudeFix.apply() : [])).then((results) => {
 		const acted = results.filter((r) => r.action !== 'already' && r.action !== 'clean');
 		acted.forEach((r) => log(`claudeFix: ${r.action} — ${r.file}${r.error ? ` (${r.error})` : ''}`));
 		if (results.some((r) => r.action === 'patched')) {
@@ -2060,8 +2151,23 @@ function register(context) {
 	// next refresh; leaderboard.js stays vscode-free, so the getter lives here.
 	const leaderboard = new LeaderboardCache(context, () => leaderboardView.render(), log, {
 		getExcluded: () => vscode.workspace.getConfiguration('openEditorsTools').get('subagentExcludeModels', DEFAULT_SUBAGENT_EXCLUDE),
+		isRecommendationEnabled: () => settingOn('subagentRecommendation.enabled'),
 	});
 	const leaderboardView = new LeaderboardViewProvider(leaderboard, log);
+	// DeepSeek rows show only for the models the router serves: by default
+	// while the router is on, or always / never per leaderboard.showDeepSeek.
+	leaderboardView.rowFilter = (rows) => {
+		const c = vscode.workspace.getConfiguration('openEditorsTools');
+		const mode = c.get('leaderboard.showDeepSeek', 'auto');
+		const showDeepSeek = mode === 'always' || (mode === 'auto' && c.get('modelRouter.enabled', false));
+		return visibleRows(rows, { showDeepSeek, routedModels: c.get('modelRouter.pickerModels', ['deepseek/deepseek-v4-flash-0731']) });
+	};
+	if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
+		context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((e) => {
+			if (e.affectsConfiguration('openEditorsTools.leaderboard') || e.affectsConfiguration('openEditorsTools.modelRouter')) leaderboardView.render();
+			if (e.affectsConfiguration('openEditorsTools.chats')) provider.refresh();
+		}));
+	}
 	// While the Usage pane is collapsed or hidden its bars ride on top of the
 	// Leaderboard pane — see LeaderboardViewProvider.usageBlock.
 	leaderboardView.usageBlock = () => (usageView.isVisible() ? null : usageView.block());
@@ -2433,6 +2539,7 @@ function register(context) {
 		vscode.window.onDidChangeWindowState(() => provider.refresh()),
 		{ dispose: () => { if (pending) clearTimeout(pending); clearInterval(sweep); clearInterval(usageTick); leaderboard.dispose(); provider.stopSpinner(); watchers.forEach((w) => w.close()); } }
 	);
+	return { log };
 }
 
 // Exported so the transcript maths can be checked against real .jsonl files
@@ -2440,7 +2547,7 @@ function register(context) {
 module.exports = {
 	register,
 	_internal: {
-		readTranscript, projectDirFor, ratesFor, formatAge, formatTokens, formatCost,
+		readTranscript, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,

@@ -1,5 +1,6 @@
 const vscode = require('vscode');
 const chatsView = require('./chatsView');
+const modelRouter = require('./modelRouter');
 
 // Buttons live in the OPEN EDITORS pane header (MenuId.ViewTitle, scoped by the
 // `view` context key each ViewPane sets to its own id). The per-row right-click
@@ -71,9 +72,26 @@ function activate(context) {
 
 	// The CHATS tree — per-chat last activity, context size and API-equivalent
 	// cost, read out of Claude Code's own session transcripts.
-	chatsView.register(context);
+	let log = (line) => console.log(`[agent-view] ${line}`);
+	try { ({ log } = chatsView.register(context)); } catch (err) {
+		// Not rethrown: a failed activation gets no deactivate(), and the
+		// router below needs its shutdown to remove the environment entry.
+		console.error('[agent-view] chats panel failed to start', err);
+		vscode.window.showErrorMessage(`Agent View: the chats panel failed to start (${err && err.message ? err.message : err}).`);
+	}
+
+	// Opt-in router that lets a Claude Code chat switch to OpenRouter models.
+	// It registers even when the panel failed, because its startup pass is
+	// what removes an environment entry a crashed window left behind.
+	routerHandle = modelRouter.register(context, log, context.extension && context.extension.packageJSON
+		? context.extension.packageJSON.version : '0');
 }
 
-function deactivate() {}
+let routerHandle = null;
+
+// The router's ANTHROPIC_BASE_URL entry must not outlive this window.
+function deactivate() {
+	return routerHandle ? routerHandle.shutdown() : undefined;
+}
 
 module.exports = { activate, deactivate };
