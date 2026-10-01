@@ -137,6 +137,13 @@ requests; **Model Router: Re-check OpenRouter Providers** re-runs the check.
 
 Limits and trade-offs:
 
+- Picking a model from Claude Code's model menu can write it into
+  `~/.claude/settings.json` as the global default, and every chat that sits on
+  "Default" follows it — chats you never switched then run DeepSeek too. If that
+  happens, delete the `"model"` line there, or pin a Claude model instead
+  (`"model": "claude-opus-5-5"`). The `/model <id>` command applies to that
+  session only.
+
 - DeepSeek V4 Flash reads text only. Images and PDFs in the chat (pasted, or read
   with a tool) reach it as a one-line note; switch to a Claude model to look at them.
 - With any base URL other than Anthropic's, Claude Code sends the full conversation
