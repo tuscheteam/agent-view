@@ -221,7 +221,10 @@ class LeaderboardCache {
 		const { claude, codex } = recommendSubagents(coding, excluded);
 		const payload = {
 			generatedAt: coding.generatedAt || null,
-			writtenAt: this.now().toISOString(),
+			// Orchestrators treat a writtenAt older than 24 h as stale. The
+			// startup write re-emits cached data, so writtenAt carries the
+			// DATA's age; a fresh clock stamp would hide a days-old board.
+			writtenAt: coding.generatedAt || this.now().toISOString(),
 			source: 'aistupidlevel.info (sortBy=7axis coding board)',
 			excluded,
 			claude,

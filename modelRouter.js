@@ -28,6 +28,7 @@ const SECRET_FILE = path.join(os.homedir(), '.agent-view', 'router-secret');
 // one of these is set anywhere Claude Code reads it, the router stays out.
 const GATEWAY_VARS = ['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'];
 const QUALIFY_RETRY_MS = 3600e3;
+const SAFE_MODEL_KEY = 'openEditorsTools.modelRouter.lastSafeDefaultModel';
 const LEDGER = path.join(os.homedir(), '.agent-view', 'router-usage.jsonl');
 const PICKER_MARK = 'via Agent View';
 
@@ -109,6 +110,11 @@ function claudeSettingsPath() {
 	return path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'settings.json');
 }
 
+// Windows editors save settings.json with a BOM at times; JSON.parse refuses it.
+function readSettingsJson(file) {
+	return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+}
+
 // Where a gateway other than this router is configured, or null. Checked:
 // VS Code's own environment (inherited by every claude it starts), the env
 // block of Claude Code's user settings (applied after the launch environment),
@@ -117,7 +123,7 @@ function foreignGateway(ourBase, extEntries = [], env = process.env) {
 	const set = (name, value) => value && !/^(0|false)$/i.test(String(value)) && !(name === 'ANTHROPIC_BASE_URL' && value === ourBase);
 	for (const name of GATEWAY_VARS) if (set(name, env[name])) return `${name} in the VS Code environment`;
 	let settingsEnv = {};
-	try { settingsEnv = (JSON.parse(fs.readFileSync(claudeSettingsPath(), 'utf8')) || {}).env || {}; } catch (_) { settingsEnv = {}; }
+	try { settingsEnv = (readSettingsJson(claudeSettingsPath()) || {}).env || {}; } catch (_) { settingsEnv = {}; }
 	for (const name of GATEWAY_VARS) if (set(name, settingsEnv[name])) return `${name} in ${claudeSettingsPath()}`;
 	for (const e of extEntries) if (e && e.name !== 'ANTHROPIC_BASE_URL' && GATEWAY_VARS.includes(e.name) && set(e.name, e.value)) return `${e.name} in claudeCode.environmentVariables`;
 	return null;
@@ -130,7 +136,7 @@ function syncPickerRows(rows, log) {
 	const file = claudeSettingsPath();
 	let settings = {};
 	let text = null;
-	try { text = fs.readFileSync(file, 'utf8'); } catch (_) { text = null; }
+	try { text = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''); } catch (_) { text = null; }
 	if (text !== null) {
 		try { settings = JSON.parse(text); } catch (err) {
 			log(`model router: ${file} is not plain JSON, model menu left unchanged (${err.message})`);
@@ -220,6 +226,60 @@ function register(context, log, version) {
 			.finally(() => qualifying.delete(model));
 	};
 
+	// Claude Code's model menu writes a pick into ~/.claude/settings.json as
+	// the global default at times, and every chat on "Default" then follows
+	// it — chats nobody switched suddenly run DeepSeek. While the guard is on,
+	// a routed id landing in "model" is put back to the last non-routed value
+	// (or removed when there was none), and the window says so once.
+	let guardBusy = false;
+	const guardDefaultModel = async () => {
+		if (!config().get('modelRouter.enabled', false) || guardBusy) return;
+		const file = claudeSettingsPath();
+		let settings;
+		try { settings = readSettingsJson(file); } catch (_) { return; }
+		const current = typeof settings.model === 'string' ? settings.model : null;
+		const models = config().get('modelRouter.pickerModels', DEFAULT_PICKER_MODELS);
+		const routed = current && Array.isArray(models) && models.includes(current.replace(/\[1m\]$/i, ''));
+		if (!routed) {
+			// Remember what a sane default looks like, including "no line" —
+			// also while the guard itself is off, so switching it on later
+			// restores a current value, never one from before the off period.
+			await context.globalState.update(SAFE_MODEL_KEY, current === null ? '' : current);
+			return;
+		}
+		if (!config().get('modelRouter.defaultModelGuard', true)) return;
+		guardBusy = true;
+		try {
+			const safe = context.globalState.get(SAFE_MODEL_KEY);
+			if (safe) settings.model = safe; else delete settings.model;
+			fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
+			log(`model router: default model guard put ${file} back to ${safe || '(no default)'} after a menu pick set ${current}`);
+			vscode.window.showInformationMessage(`${current} was about to become the default model for ALL Claude Code chats. Agent View put the default back to ${safe || 'Claude Code\u2019s own'}; the chat you picked it in keeps its model. Switch off openEditorsTools.modelRouter.defaultModelGuard to allow it.`);
+		} catch (_) { /* read-only settings: leave it */ }
+		guardBusy = false;
+	};
+	let settingsWatcher = null;
+	const watchDefaultModel = (enabled) => {
+		if (!enabled || settingsWatcher) {
+			if (!enabled && settingsWatcher) { try { settingsWatcher.close(); } catch (_) { /* gone */ } settingsWatcher = null; }
+			return;
+		}
+		try {
+			let timer = null;
+			settingsWatcher = fs.watch(claudeSettingsPath(), (eventType) => {
+				clearTimeout(timer);
+				timer = setTimeout(() => { guardDefaultModel().catch(() => {}); }, 400);
+				if (eventType === 'rename') {
+					// An atomic save replaced the file; this watch follows the
+					// old inode on mac and linux and would go silent.
+					try { settingsWatcher.close(); } catch (_) { /* gone */ }
+					settingsWatcher = null;
+					setTimeout(() => { if (!closed) watchDefaultModel(true); }, 1000);
+				}
+			});
+		} catch (_) { settingsWatcher = null; /* file missing: created on first picker sync */ }
+	};
+
 	const policyFor = async (model) => {
 		maybeQualify(model);
 		return routerPolicy(model);
@@ -292,8 +352,11 @@ function register(context, log, version) {
 				router = null;
 			}
 			if (!enabled) {
+				watchDefaultModel(false);
 				await syncEnv(false, port);
-				if (reason === 'setting') await syncPicker(false);
+				// 'startup' too: a crashed window leaves rows that otherwise
+				// stay in the menu until the next settings change.
+				if (reason === 'setting' || reason === 'startup') await syncPicker(false);
 				return;
 			}
 			if (!router) {
@@ -314,6 +377,8 @@ function register(context, log, version) {
 			const inUse = serving && result !== 'foreign';
 			const quiet = reason === 'env' || reason === 'role';
 			await syncPicker(inUse, !quiet);
+			await guardDefaultModel();
+			watchDefaultModel(inUse);
 			if (!serving && !quiet) {
 				vscode.window.showWarningMessage(`Agent View model router could not start: ${router.lastError || router.role}. Claude Code keeps talking to Anthropic directly.`);
 			} else if (result === 'foreign' && !quiet) {
@@ -402,6 +467,7 @@ function register(context, log, version) {
 		// the router (milliseconds), then the environment entry.
 		async shutdown() {
 			closed = true;
+			watchDefaultModel(false);
 			if (!router) return;
 			// A standby window leaves the menu rows to the window that serves;
 			// that window may sit in another VS Code profile, which hears no
@@ -426,5 +492,5 @@ module.exports = {
 	routerPolicy,
 	DEFAULT_IGNORED_PROVIDERS,
 	DEFAULT_PICKER_MODELS,
-	_internal: { readRegistryEnv, syncPickerRows, pickerRowFor, claudeSettingsPath, appendLedger, foreignGateway, routerSecret, routerPort, LEDGER, PICKER_MARK, SECRET_FILE },
+	_internal: { readRegistryEnv, syncPickerRows, pickerRowFor, claudeSettingsPath, readSettingsJson, appendLedger, foreignGateway, routerSecret, routerPort, LEDGER, PICKER_MARK, SECRET_FILE, SAFE_MODEL_KEY },
 };

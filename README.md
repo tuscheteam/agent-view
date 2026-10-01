@@ -139,10 +139,14 @@ Limits and trade-offs:
 
 - Picking a model from Claude Code's model menu can write it into
   `~/.claude/settings.json` as the global default, and every chat that sits on
-  "Default" follows it — chats you never switched then run DeepSeek too. If that
-  happens, delete the `"model"` line there, or pin a Claude model instead
-  (`"model": "claude-opus-5-5"`). The `/model <id>` command applies to that
-  session only.
+  "Default" follows it — chats you never switched then run DeepSeek too. Agent
+  View guards against that: when a menu pick makes an OpenRouter model the
+  global default, the previous default is put back and a message says so, while
+  the chat the pick was made in keeps its model
+  (`openEditorsTools.modelRouter.defaultModelGuard`, on by default). The
+  `/model <id>` command applies to that session only.
+- A wrong or expired OpenRouter key comes back as a clear message, never as a
+  Claude login prompt.
 
 - DeepSeek V4 Flash reads text only. Images and PDFs in the chat (pasted, or read
   with a tool) reach it as a one-line note; switch to a Claude model to look at them.
@@ -218,6 +222,12 @@ code --install-extension agent-view-*.vsix
 ```
 
 Or in VS Code: Extensions view → `···` menu → *Install from VSIX…*
+
+In PowerShell, `*.vsix` does not expand — name the file:
+`code --install-extension agent-view-latest.vsix` (or the versioned name you downloaded).
+
+Uninstalling the extension also removes its Claude Code environment entries and
+model-menu rows (standard VS Code, Insiders and VSCodium installs).
 
 ## Updating
 

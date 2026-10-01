@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.14.1",
+  "version": "0.14.2",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -94,6 +94,12 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Run the model router: Claude Code chats can switch to OpenRouter models (e.g. `deepseek/deepseek-v4-flash-0731`) with `/model`, while Claude models keep using your Claude login. Needs an OpenRouter key (**Agent View: Set OpenRouter API Key** or the `OPENROUTER_API_KEY` environment variable). Applies to chats opened after switching it on.",
+          "scope": "application"
+        },
+        "openEditorsTools.modelRouter.defaultModelGuard": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When a model-menu pick writes an OpenRouter model into `~/.claude/settings.json` as the global default (which would switch every chat on \"Default\"), put the previous default back and say so. The chat the pick was made in keeps its model.",
           "scope": "application"
         },
         "openEditorsTools.modelRouter.port": {
@@ -488,5 +494,8 @@
   ],
   "extensionKind": [
     "workspace"
-  ]
+  ],
+  "scripts": {
+    "vscode:uninstall": "node ./uninstall.js"
+  }
 }

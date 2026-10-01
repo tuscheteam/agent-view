@@ -622,6 +622,20 @@ class ModelRouter {
 			if (status >= 400) {
 				const buf = await readAll(upRes);
 				const error = errorInfo(buf);
+				// 401/403 mean the OpenRouter key, not a provider: passed through
+				// as a 401 Claude Code would ask for a Claude /login, and blaming
+				// a provider would drop an innocent one from the ranking.
+				if (status === 401 || status === 403) {
+					this.stats.errors++;
+					this._note({ model, status, ms: Date.now() - started, provider: null, cost: null, id: null, error: error.text });
+					this.log(`model router: ${model} -> ${status} OpenRouter refused the request: ${error.text}`);
+					if (aborted) return;
+					// 401 is the key; 403 can also be moderation or key
+					// permissions, so it keeps OpenRouter's own words.
+					return anthropicError(res, 400, 'invalid_request_error', status === 401
+						? `Agent View model router: OpenRouter refused the API key (HTTP 401: ${error.text}). Run "Agent View: Set OpenRouter API Key" with a valid key.`
+						: `Agent View model router: OpenRouter refused the request (HTTP 403: ${error.text}). This can be moderation or key permissions; the key itself may be fine.`);
+				}
 				const culprit = slugForProvider(error.provider, order) || order[0];
 				const retryable = (status === 400 || status === 408 || status === 429 || status >= 500) && attempt < 2 && order.length > 1 && culprit;
 				if (retryable && !aborted) {
