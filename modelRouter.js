@@ -308,14 +308,26 @@ function register(context, log, version) {
 
 	// Add or remove our entries. ENABLE_TOOL_SEARCH keeps Claude Code's tool
 	// search on behind a non-Anthropic base URL; without it every Claude chat
-	// would send its full tool list each turn. A value someone else wrote
-	// (another gateway) is never touched.
+	// would send its full tool list each turn. CLAUDE_CODE_SUBAGENT_MODEL gives
+	// subagents a default model, so a chat that does not name one runs the
+	// cheap DeepSeek flash instead of inheriting the orchestrator's Claude
+	// model; the FORCE variant additionally ignores a model a chat names, which
+	// the setting modelRouter.forceSubagentModel switches on. A value someone
+	// else wrote (another gateway, a person's own setting) is never touched.
 	// An entry is ours when its value is the one this extension recorded
 	// writing, or (for the base URL only) points at the router's own port. A
 	// user's own ENABLE_TOOL_SEARCH survives switching the router off.
 	let foreignWhere = null;
+	const subagentEnv = (enabled) => {
+		const model = config().get('modelRouter.subagentModel', DEFAULT_PICKER_MODELS[1] || DEFAULT_PICKER_MODELS[0]);
+		if (!enabled || config().get('modelRouter.forceSubagentModel', false)) return { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: model };
+		// Only the default: a chat that names a model (an Opus reviewer in a
+		// Claude chat) keeps it.
+		return { CLAUDE_CODE_SUBAGENT_MODEL: model };
+	};
 	const syncEnv = async (wanted, port) => {
-		const desired = { ANTHROPIC_BASE_URL: baseUrl(port), ENABLE_TOOL_SEARCH: 'true' };
+		const subagent = subagentEnv(wanted);
+		const desired = { ANTHROPIC_BASE_URL: baseUrl(port), ENABLE_TOOL_SEARCH: 'true', ...subagent };
 		const claude = vscode.workspace.getConfiguration('claudeCode');
 		const inspected = claude.inspect('environmentVariables');
 		const current = Array.isArray(inspected && inspected.globalValue) ? inspected.globalValue : [];
@@ -329,6 +341,16 @@ function register(context, log, version) {
 		if (foreign) wanted = false;
 		let next = current.slice();
 		const nextWrote = { ...wrote };
+		// The subagent model has two spellings and only one is in use at a time
+		// (force on or off). Sweep the other one, or a toggle would leave both
+		// entries behind and the stale one would win.
+		const managed = new Set([...Object.keys(desired), 'CLAUDE_CODE_SUBAGENT_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE']);
+		for (const entry of current) {
+			if (!entry || !managed.has(entry.name) || desired[entry.name] !== undefined) continue;
+			if (wrote[entry.name] === undefined) continue;
+			next = next.filter((e) => !(e && e.name === entry.name));
+			delete nextWrote[entry.name];
+		}
 		for (const [name, value] of Object.entries(desired)) {
 			const entry = byName.get(name);
 			const ours = !entry || entry.value === wrote[name] || (name === 'ANTHROPIC_BASE_URL' && entry.value === value);

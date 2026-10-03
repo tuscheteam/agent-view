@@ -255,6 +255,31 @@ the repo to hear about new versions.
 Removes the Claude Code environment entries, the model-menu rows and the
 subagent patch (standard VS Code, Insiders and VSCodium installs).
 
+## What to know before you start
+
+- **A chat's model resets to your global default after a window reload or restart.**
+  Claude Code keeps no model per chat: `/model <id>` applies to the running chat, and
+  a chat the window restores starts on the default again. Re-run `/model` in the chats
+  where you want DeepSeek. The Chats panel shows the model a chat runs on now, and its
+  tooltip prints the exact `/model` line to switch back.
+- **Subagents get a default model of their own** while the router is on
+  (`modelRouter.subagentModel`, the cheap DeepSeek flash). A chat that names a model,
+  an Opus reviewer in a Claude chat for example, keeps it. Turn on
+  `modelRouter.forceSubagentModel` when nothing may bill to Claude: every subagent then
+  runs the DeepSeek model, whatever a chat asks for.
+- **Switching a chat between Claude and DeepSeek keeps the whole history.** One
+  transcript per chat; each request carries it to whichever model is current. Two
+  details differ: thinking blocks are not shared across providers (Claude's signed
+  blocks stay with Claude, DeepSeek's stay with DeepSeek), and a model that cannot read
+  images gets a one-line note in place of each image for that request. The transcript
+  keeps the original, so switching back to a Claude model shows the image again.
+- **DeepSeek V4.1 Flash reads images and PDFs**; the cheaper 0731 flash used for
+  subagents reads text only.
+- **Your own OpenRouter key.** A shared key bills its owner.
+- **The DeepSeek subagent option needs a patch** to Claude Code's own binary, which
+  each Claude Code update removes; Agent View offers the re-apply while the router runs.
+- **Sideloaded, so it does not auto-update.** Watch the repo's releases.
+
 ## Requirements
 
 - VS Code ≥ 1.90
@@ -324,6 +349,8 @@ running there.
 | `openEditorsTools.modelRouter.pickerModels` | `["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4-flash-0731"]` | OpenRouter models listed in Claude Code's model menu |
 | `openEditorsTools.modelRouter.requireZeroDataRetention` | `true` | `false` also admits non-ZDR providers into the ranking and probes (re-check provider order for it to take effect) |
 | `openEditorsTools.modelRouter.ignoredProviders` | Chinese / HK / SG providers | OpenRouter provider slugs never used |
+| `openEditorsTools.modelRouter.subagentModel` | `deepseek/deepseek-v4-flash-0731` | Default model for a subagent that does not name one |
+| `openEditorsTools.modelRouter.forceSubagentModel` | `false` | Force every subagent onto that model, ignoring a named model |
 | `openEditorsTools.modelRouter.port` | `47861` | Local router port |
 | `openEditorsTools.modelRouter.serverToolModel` | `claude-sonnet-5` | Claude model that runs web search for OpenRouter chats |
 

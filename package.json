@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -106,6 +106,18 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "When a model-menu pick writes an OpenRouter model into `~/.claude/settings.json` as the global default (which would switch every chat on \"Default\"), put the previous default back and say so. The chat the pick was made in keeps its model.",
+          "scope": "application"
+        },
+        "openEditorsTools.modelRouter.subagentModel": {
+          "type": "string",
+          "default": "deepseek/deepseek-v4-flash-0731",
+          "markdownDescription": "Model Claude Code gives a subagent that does not name one (written as `CLAUDE_CODE_SUBAGENT_MODEL` for chats this window launches). A chat that names a model, e.g. an Opus reviewer in a Claude chat, keeps it.",
+          "scope": "application"
+        },
+        "openEditorsTools.modelRouter.forceSubagentModel": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Force every subagent onto `modelRouter.subagentModel`, ignoring a model a chat names (Claude Code's `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`). Use it when the Claude or Codex quota is spent and nothing may bill to it.",
           "scope": "application"
         },
         "openEditorsTools.modelRouter.port": {
