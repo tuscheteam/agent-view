@@ -34,7 +34,17 @@ const STICKY_MS = 10 * 60 * 1000;
 // An OpenRouter model id always carries its vendor ("deepseek/..."); a Claude
 // model id never does.
 function routeFor(model) {
-	return typeof model === 'string' && model.includes('/') ? 'openrouter' : 'anthropic';
+	return typeof model === 'string' && (model.includes('/') || RESOLVE_ALIASES[model]) ? 'openrouter' : 'anthropic';
+}
+
+// Bare aliases subagents can request (the harness model enum is family
+// names): they resolve to the cheap text-only flash at the router. The
+// vision-capable v4.1-flash stays an explicit picker model for orchestrator
+// chats.
+const RESOLVE_ALIASES = { deepseek: 'deepseek/deepseek-v4-flash-0731' };
+
+function resolveAliasedModel(model) {
+	return RESOLVE_ALIASES[model] || model;
 }
 
 // "[1m]" and similar picker suffixes describe the context window to Claude
@@ -79,7 +89,7 @@ function anthropicBody(raw, json) {
 // Body for OpenRouter: the bare model id, the provider policy, and only what
 // a non-Anthropic model can take. Fields are adjusted by transformForOpenRouter.
 function openRouterBody(json, policy, sessionId, modelInfo = {}) {
-	const body = transformForOpenRouter({ ...json, model: bareModel(json.model) }, modelInfo);
+	const body = transformForOpenRouter({ ...json, model: resolveAliasedModel(bareModel(json.model)) }, modelInfo);
 	body.provider = { ...policy };
 	if (sessionId && !body.session_id) body.session_id = String(sessionId).slice(0, 256);
 	return body;
@@ -525,13 +535,13 @@ class ModelRouter {
 			if (raw.length && /json/i.test(req.headers['content-type'] || '')) {
 				try { json = JSON.parse(raw.toString('utf8')); } catch (_) { json = null; }
 			}
-			const model = json && json.model;
 			let rawOut = raw;
 			let jsonOut = json;
 			const headers = { ...req.headers };
 			delete headers.host;
 			let headersOut = headers;
 			let onDone = null;
+			const model = json && json.model;
 			if (routeFor(model) === 'openrouter' && req.method === 'POST' && req.url.startsWith('/v1/messages')) {
 				if (!isServerToolRequest(json)) return this._toOpenRouter(req, res, json);
 				// Web search from an OpenRouter chat: Anthropic runs it on a Claude
@@ -555,7 +565,21 @@ class ModelRouter {
 	async _toOpenRouter(req, res, json) {
 		this.stats.openrouter++;
 		const started = Date.now();
-		const key = await this.getKey();
+		// The client can hit Esc while the pre-flight awaits run (key, policy,
+		// model info). Listen from the start so that Esc stops the request
+		// before the upstream generation has even started.
+		let aborted = false;
+		let current = null;
+		res.on('close', () => { if (!res.writableFinished) { aborted = true; if (current) current.destroy(); } });
+		let key;
+		try {
+			key = await this.getKey();
+		} catch (err) {
+			this.stats.errors++;
+			if (aborted) return;
+			return anthropicError(res, 400, 'invalid_request_error',
+				`Agent View model router: could not read the OpenRouter key (${err && err.message ? err.message : err}). Run "Agent View: Set OpenRouter API Key" again.`);
+		}
 		if (!key) {
 			this.stats.errors++;
 			// Not 401: Claude Code reads a 401 as its own expired login and
@@ -563,15 +587,29 @@ class ModelRouter {
 			return anthropicError(res, 400, 'invalid_request_error',
 				'Agent View model router: no OpenRouter key. Run "Agent View: Set OpenRouter API Key" or set the OPENROUTER_API_KEY environment variable.');
 		}
+		const sessionId = sessionIdOf(json) || req.headers['x-claude-code-session-id'] || null;
+		const model = resolveAliasedModel(bareModel(json.model));
+		let modelInfo = { images: false, documents: false };
+		try { modelInfo = (await this.getModelInfo(model)) || modelInfo; } catch (_) { /* text-only */ }
 		if (req.url.startsWith('/v1/messages/count_tokens')) {
 			// OpenRouter has no token counter for these models; a rough
 			// four-characters-per-token estimate keeps Claude Code's context
-			// gauge moving.
-			const body = JSON.stringify({ input_tokens: Math.ceil(JSON.stringify(json.messages || []).length / 4) });
-			res.writeHead(200, { 'content-type': 'application/json' });
-			return res.end(body);
+			// gauge moving. The estimate runs on the body as it will actually
+			// go out (bare model, media replaced for this model, tools kept),
+			// not on the raw request with base64 media and Anthropic-only
+			// blocks. No provider policy is needed here — the counter works
+			// even when no provider is qualified yet.
+			if (!aborted) {
+				const sent = transformForOpenRouter({ ...json, model }, modelInfo);
+				let length = JSON.stringify(Array.isArray(sent.messages) ? sent.messages : json.messages || []).length;
+				if (Array.isArray(sent.tools)) length += JSON.stringify(sent.tools).length;
+				if (sent.system) length += JSON.stringify(sent.system).length;
+				const body = JSON.stringify({ input_tokens: Math.max(1, Math.ceil(length / 4)) });
+				res.writeHead(200, { 'content-type': 'application/json' });
+				res.end(body);
+			}
+			return;
 		}
-		const model = bareModel(json.model);
 		let policy;
 		// The policy carries the provider ignore list, so a request never leaves
 		// without one.
@@ -582,9 +620,7 @@ class ModelRouter {
 			// retries first.
 			return anthropicError(res, 400, 'invalid_request_error', `Agent View model router: request not sent, no provider policy (${why}).`);
 		}
-		let modelInfo = { images: false, documents: false };
-		try { modelInfo = (await this.getModelInfo(model)) || modelInfo; } catch (_) { /* text-only */ }
-		const sessionId = sessionIdOf(json) || req.headers['x-claude-code-session-id'] || null;
+		if (aborted) return;
 		const ranked = Array.isArray(policy.order) ? policy.order.slice() : [];
 		policy = this._stickyFirst(sessionId, model, this._withoutCooling(model, policy));
 		const headers = {};
@@ -594,10 +630,6 @@ class ModelRouter {
 		if (!headers['anthropic-version']) headers['anthropic-version'] = '2023-06-01';
 		headers['http-referer'] = 'https://github.com/tuscheteam/agent-view';
 		headers['x-title'] = 'Agent View';
-
-		let aborted = false;
-		let current = null;
-		res.on('close', () => { if (!res.writableFinished) { aborted = true; if (current) current.destroy(); } });
 
 		// OpenRouter tries the ordered providers but does not move on when one
 		// rejects the request itself (HTTP 400). The router then retries without
@@ -636,13 +668,18 @@ class ModelRouter {
 						? `Agent View model router: OpenRouter refused the API key (HTTP 401: ${error.text}). Run "Agent View: Set OpenRouter API Key" with a valid key.`
 						: `Agent View model router: OpenRouter refused the request (HTTP 403: ${error.text}). This can be moderation or key permissions; the key itself may be fine.`);
 				}
-				const culprit = slugForProvider(error.provider, order) || order[0];
-				const retryable = (status === 400 || status === 408 || status === 429 || status >= 500) && attempt < 2 && order.length > 1 && culprit;
+				// An error that names no provider is OpenRouter's own (account
+				// 429, gateway 5xx): it is retried on the same order, but no
+				// provider is blamed, cooled or dropped for it.
+				const culprit = error.provider ? slugForProvider(error.provider, order) : null;
+				const retryable = (status === 400 || status === 408 || status === 429 || status >= 500) && attempt < 2 && order.length > 1 && (!error.provider || culprit);
 				if (retryable && !aborted) {
-					failed.push({ slug: culprit, status, error: error.text });
-					if (status !== 400) this._cool(model, culprit);
-					policy = { ...policy, order: order.filter((s) => s !== culprit), ...(Array.isArray(policy.only) ? { only: policy.only.filter((s) => s !== culprit) } : {}) };
-					this.log(`model router: ${model} ${culprit} -> ${status} ${error.text}; retrying on ${policy.order[0]}`);
+					if (culprit) {
+						failed.push({ slug: culprit, status, error: error.text });
+						if (status !== 400) this._cool(model, culprit);
+						policy = { ...policy, order: order.filter((s) => s !== culprit), ...(Array.isArray(policy.only) ? { only: policy.only.filter((s) => s !== culprit) } : {}) };
+					}
+					this.log(`model router: ${model} -> ${status} ${error.text}; retrying on ${policy.order[0]}`);
 					continue;
 				}
 				this.stats.errors++;
@@ -814,7 +851,7 @@ module.exports = {
 	HEALTH_PATH,
 	DEFAULT_PORT,
 	_internal: {
-		routeFor, bareModel, filterThinking, anthropicBody, openRouterBody, transformForOpenRouter, sessionIdOf, usageOf,
+		routeFor, bareModel, resolveAliasedModel, RESOLVE_ALIASES, filterThinking, anthropicBody, openRouterBody, transformForOpenRouter, sessionIdOf, usageOf,
 		isServerToolRequest, serverToolRequest, stripPatterns, errorText, errorInfo, slugForProvider, replaceMedia,
 		ToolIdRewriter, rewriteToolIdsInMessage, toolIdFor,
 	},

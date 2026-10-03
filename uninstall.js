@@ -10,7 +10,9 @@
 // - ANTHROPIC_BASE_URL entries pointing at 127.0.0.1 (any port), plus the
 //   ENABLE_TOOL_SEARCH entry that travels with them, from
 //   claudeCode.environmentVariables in each VS Code variant's user settings;
-// - model-menu rows marked "via Agent View" in ~/.claude/settings.json.
+// - model-menu rows marked "via Agent View" in ~/.claude/settings.json, and
+//   the global default model when it is one of those rows (a user's own
+//   vendor model stays);
 // A settings file that does not parse as plain JSON (JSONC comments) is left
 // untouched; the README's manual steps cover that case.
 const fs = require('fs');
@@ -54,17 +56,38 @@ function stripRouterEnv(file) {
 
 function stripPickerRows() {
 	const file = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'settings.json');
-	let settings;
+	let settings = {};
 	try { settings = readJson(file); } catch (_) { return false; }
+	let wrote = false;
+	// Ids of Agent View's own rows, needed again below to decide whether the
+	// global default model is one of them — after the rows are gone the marker
+	// no longer exists to check.
+	const ours = new Set();
 	const picker = settings.modelPicker;
-	if (!picker || !Array.isArray(picker.options)) return false;
-	const keep = picker.options.filter((o) => !(o && typeof o.description === 'string' && o.description.includes('via Agent View')));
-	if (keep.length === picker.options.length) return false;
-	if (keep.length) picker.options = keep;
-	else {
-		const { options: _drop, ...rest } = picker;
-		if (Object.keys(rest).length) settings.modelPicker = rest; else delete settings.modelPicker;
+	if (picker && Array.isArray(picker.options)) {
+		for (const o of picker.options) {
+			if (o && typeof o.description === 'string' && o.description.includes('via Agent View')) {
+				ours.add(String(o.model || '').replace(/\[1m\]$/i, ''));
+			}
+		}
+		const keep = picker.options.filter((o) => !(o && typeof o.description === 'string' && o.description.includes('via Agent View')));
+		if (keep.length !== picker.options.length) {
+			if (keep.length) picker.options = keep;
+			else {
+				const { options: _drop, ...rest } = picker;
+				if (Object.keys(rest).length) settings.modelPicker = rest; else delete settings.modelPicker;
+			}
+			wrote = true;
+		}
 	}
+	// A menu pick the guard never saw may sit in the global default; after the
+	// uninstall there is no guard. Remove only ids Agent View itself installs
+	// rows for — a user's own vendor model stays.
+	if (typeof settings.model === 'string' && ours.has(settings.model.replace(/\[1m\]$/i, ''))) {
+		delete settings.model;
+		wrote = true;
+	}
+	if (!wrote) return false;
 	fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`);
 	return true;
 }
@@ -74,4 +97,7 @@ try {
 		try { if (stripRouterEnv(file)) console.log(`agent-view uninstall: removed router environment entries from ${file}`); } catch (_) { /* locked or read-only */ }
 	}
 	try { if (stripPickerRows()) console.log('agent-view uninstall: removed Agent View rows from the Claude Code model menu'); } catch (_) { /* locked or read-only */ }
+	// Without the router a bare "deepseek" subagent has nowhere to go: give
+	// Claude Code its original Agent tool model list back.
+	try { require('./tools/patch-claude.cjs').main(['--undo']); } catch (_) { /* binary in use or gone */ }
 } catch (_) { /* never fail the uninstall */ }

@@ -38,7 +38,10 @@ const PICKER_MARK = 'via Agent View';
 // OpenRouter's own fallbacks.
 const DEFAULT_IGNORED_PROVIDERS = ['deepseek', 'tencent', 'baidu', 'nex-agi', 'xiaomi', 'streamlake', 'alibaba',
 	'moonshotai', 'minimax', 'z-ai', 'siliconflow', 'seed', 'stepfun', 'novita', 'phala'];
-const DEFAULT_PICKER_MODELS = ['deepseek/deepseek-v4-flash-0731'];
+// v4.1-flash reads images (orchestrator chats); 0731 is the cheaper text-only
+// flash that bare "deepseek" subagents run. Both listed, so the default-model
+// guard also catches a 0731 pick.
+const DEFAULT_PICKER_MODELS = ['deepseek/deepseek-v4.1-flash', 'deepseek/deepseek-v4-flash-0731'];
 
 function readRegistryEnv(name) {
 	if (process.platform !== 'win32') return Promise.resolve('');
@@ -94,10 +97,25 @@ function ignoredProviders() {
 // headquarters OpenRouter does not list.
 async function routerPolicy(model, rankingImpl = ranking) {
 	const ignore = ignoredProviders();
+	const zdr = config().get('modelRouter.requireZeroDataRetention', true);
 	const policy = { data_collection: 'deny', ignore, allow_fallbacks: true };
-	if (config().get('modelRouter.requireZeroDataRetention', true)) policy.zdr = true;
-	const rank = await rankingImpl.rankingFor(model, { ignore });
-	const ranked = (rank.ranked || []).filter((slug) => !ignore.includes(slug.split('/')[0]));
+	if (zdr) policy.zdr = true;
+	const rank = await rankingImpl.rankingFor(model, { ignore, requireZdr: zdr });
+	// ignoredProviders strings are matched how the user wrote them: the base
+	// slug, a spelled-out base with a provider tag, any case, or part of a
+	// longer id. One shared predicate keeps the pin in provider.only/order and
+	// the local filter consistent.
+	const ignoresSlug = (slug) => {
+		const base = slug.split('/')[0].toLowerCase();
+		return ignore.some((i) => {
+			const token = String(i).trim().toLowerCase();
+			// A token matches at a slug separator, so a short token like "seed"
+			// cannot drop an unrelated "see", "seeder" or "sea" provider.
+			const bounds = (s, p) => s.length === p.length || s[p.length] === '/' || s[p.length] === '-';
+			return token && (token === base || bounds(base, token.length) && base.startsWith(token) || bounds(token, base.length) && token.startsWith(base) || bounds(slug.toLowerCase(), token.length) && slug.toLowerCase().startsWith(token));
+		});
+	};
+	const ranked = (rank.ranked || []).filter((slug) => !ignoresSlug(slug));
 	if (!ranked.length) {
 		throw new Error(`no qualified provider for ${model} yet. Run "Agent View: Model Router: Re-check OpenRouter Providers"`);
 	}
@@ -213,14 +231,15 @@ function register(context, log, version) {
 	const maybeQualify = async (model) => {
 		if (qualifying.has(model) || !router || router.role !== 'owner') return;
 		if (Date.now() - (lastQualify.get(model) || 0) < QUALIFY_RETRY_MS) return;
-		const rank = await ranking.rankingFor(model, { ignore: ignoredProviders() });
+		const requireZdr = config().get('modelRouter.requireZeroDataRetention', true);
+		const rank = await ranking.rankingFor(model, { ignore: ignoredProviders(), requireZdr });
 		if (rank.fresh) return;
 		const key = await getKey();
 		if (!key || qualifying.has(model)) return;
 		qualifying.add(model);
 		lastQualify.set(model, Date.now());
-		log(`model router: checking ${model} providers (zero data retention, reasoning kept out of answers, cache)`);
-		ranking.qualify(model, key, { ignore: ignoredProviders(), log })
+		log(`model router: checking ${model} providers (${requireZdr ? 'zero data retention, ' : ''}reasoning kept out of answers, cache)`);
+		ranking.qualify(model, key, { ignore: ignoredProviders(), requireZdr, log })
 			.then((r) => log(`model router: ${model} order ${r.ranked.join(' > ') || '(none qualified)'}${Object.keys(r.unprobed || {}).length ? `; unprobed ${Object.keys(r.unprobed).join(', ')}` : ''}; check cost $${(r.spent || 0).toFixed(4)}`))
 			.catch((err) => log(`model router: provider check for ${model} failed (${err && err.message ? err.message : err})`))
 			.finally(() => qualifying.delete(model));
@@ -425,9 +444,10 @@ function register(context, log, version) {
 			const models = config().get('modelRouter.pickerModels', DEFAULT_PICKER_MODELS);
 			await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Checking OpenRouter providers' }, async () => {
 				const lines = [];
+				const requireZdr = config().get('modelRouter.requireZeroDataRetention', true);
 				for (const model of models) {
 					try {
-						const r = await ranking.qualify(model, key, { ignore: ignoredProviders(), log });
+						const r = await ranking.qualify(model, key, { ignore: ignoredProviders(), requireZdr, log });
 						lines.push(`${model}: ${r.ranked.join(' > ') || '(none qualified)'} ($${(r.spent || 0).toFixed(4)})`);
 					} catch (err) { lines.push(`${model}: failed (${err.message})`); }
 				}
@@ -440,7 +460,7 @@ function register(context, log, version) {
 			const s = router ? router.status() : { role: 'stopped', port: routerPort(), last: [] };
 			const models = config().get('modelRouter.pickerModels', DEFAULT_PICKER_MODELS);
 			const orders = await Promise.all(models.map(async (m) => {
-				const r = await ranking.rankingFor(m, { ignore: ignoredProviders() });
+				const r = await ranking.rankingFor(m, { ignore: ignoredProviders(), requireZdr: config().get('modelRouter.requireZeroDataRetention', true) });
 				return `${m}: ${r.ranked.slice(0, 4).join(' > ') || 'none qualified, requests refused'} (${r.source}${r.at ? `, ${r.at.slice(0, 10)}` : ''})`;
 			}));
 			const lines = [

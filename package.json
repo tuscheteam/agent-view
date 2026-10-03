@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.14.2",
+  "version": "0.15.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -23,6 +23,12 @@
           "type": "boolean",
           "default": false,
           "description": "Move the editor you just activated to the top of its group, so OPEN EDITORS reads most-recent-first. Pinned editors keep their own block at the top and are never reordered."
+        },
+        "openEditorsTools.codexClosedDays": {
+          "type": "number",
+          "default": 30,
+          "markdownDescription": "Codex chats with no activity in this many days are collapsed into one \"N older Codex chats hidden\" row. `0` lists every Codex chat Codex itself still shows. Claude chats use `openEditorsTools.closedChatHours`.",
+          "scope": "application"
         },
         "openEditorsTools.closedChatHours": {
           "type": "number",
@@ -93,7 +99,7 @@
         "openEditorsTools.modelRouter.enabled": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Run the model router: Claude Code chats can switch to OpenRouter models (e.g. `deepseek/deepseek-v4-flash-0731`) with `/model`, while Claude models keep using your Claude login. Needs an OpenRouter key (**Agent View: Set OpenRouter API Key** or the `OPENROUTER_API_KEY` environment variable). Applies to chats opened after switching it on.",
+          "markdownDescription": "Run the model router: Claude Code chats can switch to OpenRouter models (e.g. `deepseek/deepseek-v4.1-flash`) with `/model`, while Claude models keep using your Claude login. Needs an OpenRouter key (**Agent View: Set OpenRouter API Key** or the `OPENROUTER_API_KEY` environment variable). Applies to chats opened after switching it on.",
           "scope": "application"
         },
         "openEditorsTools.modelRouter.defaultModelGuard": {
@@ -147,6 +153,7 @@
             "type": "string"
           },
           "default": [
+            "deepseek/deepseek-v4.1-flash",
             "deepseek/deepseek-v4-flash-0731"
           ],
           "description": "OpenRouter models listed in Claude Code's model menu while the router runs.",
@@ -326,6 +333,21 @@
       {
         "command": "openEditorsTools.requalifyProviders",
         "title": "Model Router: Re-check OpenRouter Providers",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.reapplyClaudePatch",
+        "title": "Claude Code: Re-apply DeepSeek Subagent Patch",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.showAllCodexChats",
+        "title": "Show All Codex Chats",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.checkClaudePatch",
+        "title": "Claude Code: Check DeepSeek Subagent Patch",
         "category": "Agent View"
       }
     ],

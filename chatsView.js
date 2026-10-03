@@ -77,24 +77,51 @@ function ratesFor(model) {
 }
 
 // The router appends one JSON line per OpenRouter reply: { id, cost, ... }.
-// Re-read only when the file changed.
+// Only the bytes after the last read are parsed, so a long session never
+// re-reads the whole log (a chat relay and the parse run on this thread).
 const ROUTER_LEDGER = path.join(os.homedir(), '.agent-view', 'router-usage.jsonl');
-const routerLedger = { mtimeMs: -1, size: -1, costs: new Map() };
+const routerLedger = { mtimeMs: -1, size: 0, ino: -1, costs: new Map() };
 function routerCosts() {
 	let stat;
-	try { stat = fs.statSync(ROUTER_LEDGER); } catch (_) { routerLedger.costs.clear(); routerLedger.mtimeMs = 0; return routerLedger; }
-	if (stat.mtimeMs === routerLedger.mtimeMs && stat.size === routerLedger.size) return routerLedger;
-	const costs = new Map();
-	try {
-		for (const line of fs.readFileSync(ROUTER_LEDGER, 'utf8').split('\n')) {
+	try { stat = fs.statSync(ROUTER_LEDGER); } catch (_) { routerLedger.costs.clear(); routerLedger.mtimeMs = 0; routerLedger.size = 0; routerLedger.ino = -1; return routerLedger; }
+	if (stat.mtimeMs === routerLedger.mtimeMs && stat.size === routerLedger.size && (stat.ino === undefined || stat.ino === routerLedger.ino)) return routerLedger;
+	// The file was replaced (rotated): its bytes have nothing to do with the
+	// offsets we hold. Start over.
+	if (stat.ino !== undefined && routerLedger.ino !== -1 && stat.ino !== routerLedger.ino) { routerLedger.costs.clear(); routerLedger.size = 0; }
+	routerLedger.ino = stat.ino === undefined ? routerLedger.ino : stat.ino;
+	let fd = null;
+	const tally = (lines) => {
+		for (const line of lines) {
 			if (!line) continue;
 			try {
 				const r = JSON.parse(line);
-				if (r && r.id && typeof r.cost === 'number') costs.set(r.id, r.cost);
+				if (r && r.id && typeof r.cost === 'number') routerLedger.costs.set(r.id, r.cost);
 			} catch (_) { /* half-written line */ }
 		}
-	} catch (_) { /* unreadable: keep the old map */ return routerLedger; }
-	routerLedger.costs = costs;
+	};
+	try {
+		// Read from the last offset: earlier bytes are already in the map.
+		fd = fs.openSync(ROUTER_LEDGER, fs.constants.O_RDONLY);
+		if (routerLedger.size > stat.size) { routerLedger.costs.clear(); routerLedger.size = 0; }
+		const buf = Buffer.alloc(stat.size - routerLedger.size);
+		if (buf.length) {
+			fs.readSync(fd, buf, 0, buf.length, routerLedger.size);
+			// Only up to the last newline: a half-written tail line must stay
+			// in the pending range or its cost is lost for good when the next
+			// chunk arrives.
+			const text = buf.toString('utf8');
+			const lastLf = text.lastIndexOf('\n');
+			const consumed = lastLf >= 0 ? routerLedger.size + lastLf + 1 : routerLedger.size;
+			tally(text.slice(0, lastLf >= 0 ? lastLf + 1 : 0).split('\n'));
+			routerLedger.size = consumed;
+		}
+	} catch (_) {
+		try { if (fd) fs.closeSync(fd); } catch (__) { /* none */ }
+		// Older Node runtimes lack openSync/readSync: fall back to a full read.
+		try { routerLedger.costs.clear(); tally(fs.readFileSync(ROUTER_LEDGER, 'utf8').split('\n')); }
+		catch (_) { return routerLedger; }
+	}
+	try { fs.closeSync(fd); } catch (_) { /* none */ }
 	routerLedger.mtimeMs = stat.mtimeMs;
 	routerLedger.size = stat.size;
 	return routerLedger;
@@ -207,6 +234,13 @@ async function readTranscript(file) {
 	let customTitle = null;
 	let aiTitle = null;
 	let model = null;
+	// When the last reply's model landed, and the last model switch Claude
+	// Code confirmed ("Set model to `x`"). currentModelOf() weighs both
+	// against the process start: Claude Code keeps no model per chat, so a
+	// chat restarted by a window reload runs the global default again.
+	let modelAt = 0;
+	let pickedModel = null;
+	let pickedAt = 0;
 	let contextTokens = 0;
 	let lastStop = null;
 	// When the agent last finished speaking, and when you last spoke. Both drive
@@ -235,6 +269,15 @@ async function readTranscript(file) {
 
 		if (record.type === 'custom-title' && record.customTitle) { customTitle = record.customTitle; titles.add(record.customTitle); }
 		else if (record.type === 'ai-title' && record.aiTitle) { aiTitle = record.aiTitle; titles.add(record.aiTitle); }
+
+		// A confirmed model switch arrives as a user message or as a system
+		// record, both carrying Claude Code's own stdout line.
+		if (!record.isSidechain && line.includes('Set model to')) {
+			const text = typeof record.content === 'string' ? record.content
+				: record.message && typeof record.message.content === 'string' ? record.message.content : '';
+			const picked = /<local-command-stdout>Set model to `([^`]+)`/.exec(text);
+			if (picked) { pickedModel = picked[1]; pickedAt = stampOf(record, pickedAt); }
+		}
 
 		const message = record.message;
 		let resultInfo = null;
@@ -285,8 +328,9 @@ async function readTranscript(file) {
 		if (!usage) continue;
 
 		// Last one wins, so the row follows a mid-chat model switch. `<synthetic>`
-		// marks a replayed turn, not a model, and must not overwrite it.
-		if (message.model && message.model !== '<synthetic>') model = message.model;
+		// marks a replayed turn, not a model, and must not overwrite it. A
+		// sidechain record is a SUBAGENT turn: it does not speak for the chat.
+		if (!record.isSidechain && message.model && message.model !== '<synthetic>') { model = message.model; modelAt = stampOf(record, modelAt); }
 		const c = tally.add(message);
 
 		// Context in play is whatever the most recent request carried, not the
@@ -299,6 +343,9 @@ async function readTranscript(file) {
 		title: customTitle || aiTitle,
 		titles,
 		model,
+		modelAt,
+		pickedModel,
+		pickedAt,
 		contextTokens,
 		contextLimit: ratesFor(model).ctx,
 		cost: sums.cost,
@@ -516,8 +563,11 @@ function readSubagentSummary(file, stat) {
 
 		if (!summary.name && message.role === 'user') summary.name = promptLabel(message.content);
 		// `<synthetic>` is what a replayed or cached turn reports; it is not a
-		// model and would price at the default rate.
-		if (message.model && message.model !== '<synthetic>') summary.model = message.model;
+		// model and would price at the default rate. A sidechain record is a
+		// SUBAGENT turn stored in the same file, so its model must not become
+		// the chat's own: an Opus chat whose subagent ran DeepSeek would
+		// otherwise wear the DeepSeek logo and be priced as routed.
+		if (!record.isSidechain && message.model && message.model !== '<synthetic>') summary.model = message.model;
 
 		if (!message.usage) continue;
 		tally.add(message);
@@ -628,6 +678,64 @@ function liveSessionIds() {
 		} catch (_) { /* being written right now */ }
 	}
 	return ids;
+}
+
+// Settings files, parsed and cached by mtime.
+const settingsCache = new Map();
+function readSettingsFile(file) {
+	let stat;
+	try { stat = fs.statSync(file); } catch (_) { settingsCache.delete(file); return null; }
+	const hit = settingsCache.get(file);
+	if (hit && hit.mtimeMs === stat.mtimeMs) return hit.json;
+	let json = null;
+	try { json = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); } catch (_) { return hit ? hit.json : null; }
+	settingsCache.set(file, { mtimeMs: stat.mtimeMs, json });
+	return json;
+}
+
+// The model a new chat process starts on, or null for Claude Code's built-in
+// default. The VS Code panel keeps no model per chat: a menu pick writes the
+// user setting, and every chat process starts on the first "model" found in
+// project-local, project, then user settings (managed policy aside),
+// including a chat that a window reload restored.
+function claudeDefaultModel(workspaceDir) {
+	const files = workspaceDir
+		? [path.join(workspaceDir, '.claude', 'settings.local.json'), path.join(workspaceDir, '.claude', 'settings.json')]
+		: [];
+	files.push(path.join(claudeConfigDir(), 'settings.json'));
+	for (const file of files) {
+		const json = readSettingsFile(file);
+		if (json && typeof json.model === 'string' && json.model.trim()) return json.model.trim();
+	}
+	return null;
+}
+
+// Model ids listed in Claude Code's model menu (user settings). They carry the
+// "[1m]" context suffix that transcript records leave out.
+function pickerModelIds() {
+	const json = readSettingsFile(path.join(claudeConfigDir(), 'settings.json'));
+	const options = json && json.modelPicker && Array.isArray(json.modelPicker.options) ? json.modelPicker.options : [];
+	return options.map((o) => o && o.model).filter((m) => typeof m === 'string');
+}
+
+const bareModelId = (m) => String(m || '').replace(/\[[^\]]*\]$/, '');
+
+// The model a chat runs on right now, which can differ from the model of its
+// last reply. The latest of three events wins: the last reply, the last
+// confirmed /model pick, and the start of the chat's process (a process that
+// started after both runs on the global default). A tab with no live process
+// starts one on the global default with its next message.
+//   -> { model, reason: 'reply' | 'picked' | 'restarted' }
+function currentModelOf(data, liveStart, defaultModel) {
+	if (!data) return { model: null, reason: 'reply' };
+	if (liveStart === undefined || liveStart === null) return { model: defaultModel, reason: 'restarted' };
+	const replyAt = data.modelAt || 0;
+	const pickedAt = data.pickedAt || 0;
+	if (liveStart > replyAt && liveStart > pickedAt) return { model: defaultModel, reason: 'restarted' };
+	// Claude Code records a pick by display text: "Default (Opus 5.5)",
+	// "Opus 5.5", or the id for a menu row it does not name.
+	if (pickedAt > replyAt) return { model: /^default\b/i.test(String(data.pickedModel)) ? defaultModel : data.pickedModel, reason: 'picked' };
+	return { model: data.model, reason: 'reply' };
 }
 
 // Only states that want something from you earn a dot. A chat you have already
@@ -744,6 +852,14 @@ const CODEX_VIEW_TYPE = 'chatgpt.conversationEditor';
 // recently touched thread gets the benefit of the doubt and renders as a live
 // row. Local work keeps the row honest through the rollout file's mtime.
 const CODEX_LIVE_MS = 3 * 60 * 60 * 1000;
+// Codex keeps every chat in its own sidebar, and its threads cost nothing to
+// list (one sqlite table, already loaded). A pinned thread always shows; the
+// rest fall outside the window only after codexClosedDays. Zero = no window.
+function codexInWindow(thread, cutoff) {
+	if (!thread) return false;
+	if (thread.pinned) return true;
+	return !cutoff || thread.lastActivity >= cutoff;
+}
 const CODEX_SCHEME = 'openai-codex';
 const CODEX_AUTHORITY = 'route';
 
@@ -871,7 +987,14 @@ class CodexIndex {
 	}
 
 	refresh() {
-		if (DatabaseSync && this._fromDatabase()) return;
+		if (DatabaseSync) {
+			if (this._fromDatabase()) return;
+			// The database exists but could not be read (locked mid-write, WAL
+			// unreadable, a newer schema). Falling back to the JSONL index here
+			// would replace a full chat list with a stale handful — the
+			// "chats disappeared" report. Keep the last good read instead.
+			if (this.source === 'sqlite' && this.byId.size) return;
+		}
 		this._fromSessionIndex();
 	}
 
@@ -889,7 +1012,7 @@ class CodexIndex {
 			const have = new Set(db.prepare('PRAGMA table_info(threads)').all().map((c) => c.name));
 			const wanted = ['id', 'name', 'title', 'tokens_used', 'model', 'reasoning_effort',
 				'updated_at_ms', 'archived', 'thread_source', 'source', 'agent_nickname',
-				'agent_path', 'rollout_path', 'recency_at_ms', 'first_user_message'];
+				'agent_path', 'rollout_path', 'recency_at_ms', 'first_user_message', 'is_pinned'];
 			const cols = wanted.filter((c) => have.has(c));
 			if (!cols.includes('id')) return false;
 			const rows = db.prepare(`SELECT ${cols.join(', ')} FROM threads`).all();
@@ -929,6 +1052,7 @@ class CodexIndex {
 					effort: row.reasoning_effort,
 					lastActivity: Number(row.updated_at_ms) || 0,
 					archived: !!row.archived,
+					pinned: !!row.is_pinned,
 				};
 				// updated_at_ms stalls the moment work goes to the cloud; the
 				// rollout file keeps moving for local work. Take the newest of
@@ -1546,6 +1670,7 @@ class ChatsProvider {
 
 		this.codex.refresh();
 		const live = liveSessionIds();
+		const defaultModel = claudeDefaultModel(folder && folder.uri.fsPath);
 
 		const projectDir = folder && projectDirFor(folder.uri.fsPath);
 		// Titled rows claim their transcript first, so an untitled tab cannot
@@ -1581,7 +1706,8 @@ class ChatsProvider {
 					.filter((task) => !subagents.running.some((s) => (task.kind === 'agent' && s.id === task.id)
 						|| (task.kind === 'workflow' && task.runId && s.runId === task.runId)))
 				: [];
-			return { ...t, kind: 'claude', data, state, subagents, subs: subagents.running, tasks };
+			return { ...t, kind: 'claude', data, state, subagents, subs: subagents.running, tasks,
+				current: currentModelOf(data, data && live.has(data.sessionId) ? live.get(data.sessionId) : null, defaultModel) };
 		});
 		// Cross-provider: a Codex exec thread that wrote within the last
 		// SUBAGENT_ACTIVE_MS is shown under the Claude session closest to
@@ -1689,9 +1815,17 @@ class ChatsProvider {
 			}
 			const openCodexIds = new Set(rows.filter((r) => r.kind === 'codex').map((r) => r.conversationId));
 			const liveSince = Date.now() - CODEX_LIVE_MS;
+			// Codex gets its own window. Its sidebar keeps weeks of chats, and one
+			// that vanished from this panel after 48 quiet hours read as lost even
+			// though Codex still lists it. What the window hides is counted and
+			// offered at the bottom, never dropped in silence.
+			const codexDays = vscode.workspace.getConfiguration('openEditorsTools').get('codexClosedDays', 30);
+			const codexCutoff = codexDays > 0 ? Date.now() - codexDays * 86400e3 : 0;
+			let codexHidden = 0;
 			for (const [id, thread] of this.codex.byId) {
-				if (thread.archived || !thread.title || thread.lastActivity < cutoff) continue;
+				if (thread.archived || !thread.title) continue;
 				if (openCodexIds.has(id)) continue;
+				if (!codexInWindow(thread, codexCutoff)) { codexHidden++; continue; }
 				if (thread.lastActivity >= liveSince) {
 					const subs = this.codex.subagentsFor(id, Date.now() - SUBAGENT_ACTIVE_MS);
 					rows.push({ kind: 'codex-live', conversationId: id, data: thread, subs });
@@ -1699,6 +1833,7 @@ class ChatsProvider {
 				}
 				rows.push({ kind: 'codex-closed', conversationId: id, data: thread });
 			}
+			if (codexHidden) rows.push({ kind: 'codex-hidden', count: codexHidden, days: codexDays });
 		}
 
 		// Most recent activity first. Tabs we cannot match (a brand new chat with
@@ -1721,7 +1856,8 @@ class ChatsProvider {
 			const item = row.kind === 'codex' ? this._codexItem(row)
 				: row.kind === 'codex-live' ? this._codexLiveItem(row)
 				: row.kind === 'claude-closed' ? this._closedClaudeItem(row.data)
-				: row.kind === 'codex-closed' ? this._closedCodexItem(row)
+				: row.kind === 'codex-hidden' ? this._hiddenCodexItem(row)
+					: row.kind === 'codex-closed' ? this._closedCodexItem(row)
 				: this._item(row);
 			item.expandable = Boolean(item.subagentItems && item.subagentItems.length);
 			return { item, tab: row.tab };
@@ -1824,6 +1960,25 @@ class ChatsProvider {
 			'sidebar',
 		].filter(Boolean).join(' · ');
 		item.tooltip = `${data.title} — running in the Codex sidebar. Click to open it.`;
+		return item;
+	}
+
+	// Not a chat: what the Codex window hid, with the setting behind it and the
+	// one click that shows everything. Silence was the bug this prevents.
+	_hiddenCodexItem(row) {
+		const item = new vscode.TreeItem(`${row.count} older Codex chat${row.count === 1 ? '' : 's'} hidden`, vscode.TreeItemCollapsibleState.None);
+		item.id = 'codex-hidden';
+		item.iconPath = new vscode.ThemeIcon('history');
+		item.contextValue = 'codexHidden';
+		item.description = `${row.days} d window`;
+		const md = new vscode.MarkdownString();
+		const older = [...this.codex.byId.values()].filter((t) => t.title && !t.archived)
+			.sort((a, b) => b.lastActivity - a.lastActivity).slice(-row.count);
+		md.appendMarkdown(`${row.count} Codex chat${row.count === 1 ? '' : 's'} with no activity in the last ${row.days} days. Codex itself still lists them.\n\n`);
+		for (const t of older.slice(0, 8)) md.appendMarkdown(`- ${t.title}\n`);
+		md.appendMarkdown(`\nClick to show every Codex chat (sets \`openEditorsTools.codexClosedDays\` to 0).`);
+		item.tooltip = md;
+		item.command = { command: 'openEditorsTools.showAllCodexChats', title: 'Show all Codex chats' };
 		return item;
 	}
 
@@ -2012,7 +2167,11 @@ class ChatsProvider {
 		// A chat whose latest reply came from DeepSeek (through the model
 		// router) shows DeepSeek's logo; the next Claude reply restores the
 		// asterisk.
-		item.iconPath = data && /^deepseek\//i.test(String(data.model || '')) ? this.deepseekIcon : this.icon;
+		// The logo shows the model the chat runs on NOW: a DeepSeek chat that
+		// a window reload restarted runs the global default again (Claude Code
+		// keeps no model per chat), and its logo must not promise DeepSeek.
+		const current = row.current || { model: data && data.model, reason: 'reply' };
+		item.iconPath = /^deepseek\//i.test(String(current.model || '')) ? this.deepseekIcon : this.icon;
 		item.contextValue = 'claudeChat';
 		// Carries the status decoration; nothing on disk is behind this URI.
 		if (data && data.sessionId) item.resourceUri = uriFor(data.sessionId);
@@ -2049,7 +2208,15 @@ class ChatsProvider {
 		md.appendMarkdown(`**${tab.label}**\n\n`);
 		md.appendMarkdown(`| | |\n|---|---|\n`);
 		md.appendMarkdown(`| Status | ${(DECORATION[state] && DECORATION[state].tooltip) || 'Idle'}${data.pendingTools.length ? ` (${data.pendingTools.join(', ')})` : ''} |\n`);
-		md.appendMarkdown(`| Model | \`${data.model || 'unknown'}\` |\n`);
+		const restarted = row.current && row.current.reason === 'restarted';
+		const nowModel = row.current ? row.current.model : data.model;
+		md.appendMarkdown(`| Model | ${nowModel ? `\`${nowModel}\`` : restarted ? 'Claude Code default' : '`unknown`'} |\n`);
+		// The last reply's model is worth a row when it differs in kind from the
+		// current one (OpenRouter vs Claude); "Opus 5.5" vs "claude-opus-5-5" is
+		// the same model in two spellings.
+		const routed = (m) => String(m || '').includes('/');
+		const switchedKind = data.model && (restarted || (row.current && row.current.reason === 'picked')) && routed(data.model) !== routed(nowModel);
+		if (switchedKind) md.appendMarkdown(`| Last reply | \`${data.model}\` |\n`);
 		md.appendMarkdown(`| Last activity | ${formatAge(data.lastActivity)} |\n`);
 		md.appendMarkdown(`| Context in play | ${data.contextTokens.toLocaleString()} / ${data.contextLimit.toLocaleString()} (${pct}%) |\n`);
 		md.appendMarkdown(`| Assistant turns | ${data.messages.toLocaleString()} |\n`);
@@ -2065,6 +2232,11 @@ class ChatsProvider {
 		}
 		md.appendMarkdown(`| API-equivalent cost | **${formatCost(totalCost)}** |\n\n`);
 		md.appendMarkdown(`_Cost is what these tokens would bill at list API rates — cache reads at 0.1x input, writes at 1.25x (5m) / 2x (1h). A Claude subscription is not billed this way._`);
+		if (restarted && routed(data.model) && bareModelId(data.model) !== bareModelId(nowModel)) {
+			// The menu row's id keeps the "[1m]" suffix, and with it the 1M window.
+			const id = pickerModelIds().find((m) => bareModelId(m) === bareModelId(data.model)) || data.model;
+			md.appendMarkdown(`\n\n_Claude Code restarted this chat on its default model (it keeps no model per chat). Type \`/model ${id}\` in the chat to continue on ${bareModelId(data.model).split('/').pop()}._`);
+		}
 		item.tooltip = md;
 		return item;
 	}
@@ -2165,7 +2337,7 @@ function register(context) {
 	if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
 		context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((e) => {
 			if (e.affectsConfiguration('openEditorsTools.leaderboard') || e.affectsConfiguration('openEditorsTools.modelRouter')) leaderboardView.render();
-			if (e.affectsConfiguration('openEditorsTools.chats')) provider.refresh();
+			if (e.affectsConfiguration('openEditorsTools.chats') || e.affectsConfiguration('openEditorsTools.codexClosedDays') || e.affectsConfiguration('openEditorsTools.closedChatHours')) provider.refresh();
 		}));
 	}
 	// While the Usage pane is collapsed or hidden its bars ride on top of the
@@ -2287,6 +2459,12 @@ function register(context) {
 		vscode.commands.registerCommand('openEditorsTools.openCodexHere', async (conversationId) => {
 			if (resolveCodexTarget() === 'sidebar') { await openCodexInSidebar(conversationId); return; }
 			await openCodexInEditor(conversationId);
+		}),
+		// The "N older Codex chats hidden" row: lift the window entirely.
+		vscode.commands.registerCommand('openEditorsTools.showAllCodexChats', async () => {
+			await vscode.workspace.getConfiguration('openEditorsTools').update('codexClosedDays', 0, vscode.ConfigurationTarget.Global);
+			provider.refresh();
+			vscode.window.showInformationMessage('Agent View now lists every Codex chat, however old. Set openEditorsTools.codexClosedDays back to a number of days to hide the quiet ones again.');
 		}),
 		// Two explicit row commands so either surface is one right-click away
 		// regardless of the setting. Both take the tree item and read its
@@ -2547,7 +2725,7 @@ function register(context) {
 module.exports = {
 	register,
 	_internal: {
-		readTranscript, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
+		readTranscript, currentModelOf, claudeDefaultModel, pickerModelIds, codexInWindow, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,

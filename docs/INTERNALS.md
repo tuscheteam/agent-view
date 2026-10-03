@@ -175,17 +175,18 @@ Because of that, all actions target the **active** editor, not the row under the
 
 ## Install
 
-Copy this folder into the extensions directory, using the `publisher.name-version`
-convention for the folder name:
+Package and install a `.vsix`, then run `Developer: Reload Window`:
 
 ```sh
-cp package.json extension.js README.md \
-   ~/.vscode/extensions/tuscheteam.agent-view-<version>/
+npx @vscode/vsce package
+code --install-extension agent-view-<version>.vsix --force
 ```
 
-VS Code 1.132 scans that directory and registers the folder in
-`~/.vscode/extensions/extensions.json` on its own — no `.vsix` needed. Run
-`Developer: Reload Window` afterwards; a plain window reload picks up new files too.
+Copying files into a new `tuscheteam.agent-view-<version>` folder does **not**
+install it. VS Code 1.139 scanned such folders while the copy was still running,
+logged `Unable to read file ...package.json`, never retried, and kept loading the
+version listed in `~/.vscode/extensions/extensions.json`. Check that file (or the
+extension host log) after an install to see which folder actually runs.
 
 Do **not** delete the folder without also removing its `extensions.json` entry, or
 `code --install-extension` fails with `Please restart VS Code before reinstalling`.

@@ -34,8 +34,13 @@ const UNPROBED_MAX_AGE_MS = 24 * 3600e3;
 // A provider that rejected a real request comes back after two weeks.
 const REJECT_TTL_MS = 14 * 24 * 3600e3;
 
-// Measured 2026-10-01 for deepseek/deepseek-v4-flash-0731, so a first chat is
-// routed well before any qualification has run on the user's machine.
+// Shipped orders, so a first chat is routed before any qualification has run
+// on the user's machine. A seed never counts as fresh: the first routed request
+// starts a live qualification that replaces it.
+//   v4-flash-0731 (subagents): probed 2026-10-01, three providers leaked
+//     reasoning into the answer.
+//   v4.1-flash (vision, orchestrator chats): ZDR price order 2026-10-01, not
+//     yet probed.
 const SEED = {
 	'deepseek/deepseek-v4-flash-0731': {
 		at: '2026-10-01T09:00:00.000Z',
@@ -46,6 +51,12 @@ const SEED = {
 			'baseten/fp8': 'reasoning leaked into the answer',
 			'morph/bf16': 'reasoning leaked into the answer',
 		},
+	},
+	'deepseek/deepseek-v4.1-flash': {
+		at: '2026-10-01T12:00:00.000Z',
+		source: 'seed',
+		ranked: ['relace/fp4', 'open-inference/fp4', 'inference-net', 'wafer', 'morph/fp8', 'sail-research/fp4'],
+		excluded: {},
 	},
 };
 
@@ -86,11 +97,11 @@ async function getJson(fetchImpl, url, key) {
 // download of the three lists (one near 1 MB) serves both for ten minutes.
 // Each caller gets its own copy, since qualify() writes into "excluded".
 const listCache = new Map();
-function candidates(model, { fetchImpl = globalThis.fetch, ignore = [], now = Date.now() } = {}) {
-	const key = `${model}|${[...ignore].sort().join(',')}`;
+function candidates(model, { fetchImpl = globalThis.fetch, ignore = [], requireZdr = true, now = Date.now() } = {}) {
+	const key = `${model}|${[...ignore].sort().join(',')}|zdr${requireZdr ? 1 : 0}`;
 	let hit = listCache.get(key);
 	if (!hit || hit.fetchImpl !== fetchImpl || now >= hit.until) {
-		const promise = fetchCandidates(model, { fetchImpl, ignore });
+		const promise = fetchCandidates(model, { fetchImpl, ignore, requireZdr });
 		hit = { promise, fetchImpl, until: now + 600e3 };
 		listCache.set(key, hit);
 		promise.catch(() => { if (listCache.get(key) === hit) listCache.delete(key); });
@@ -98,10 +109,11 @@ function candidates(model, { fetchImpl = globalThis.fetch, ignore = [], now = Da
 	return hit.promise.then((r) => ({ eligible: r.eligible.map((e) => ({ ...e })), excluded: { ...r.excluded } }));
 }
 
-async function fetchCandidates(model, { fetchImpl, ignore }) {
+async function fetchCandidates(model, { fetchImpl, ignore, requireZdr = true }) {
 	const [endpoints, zdr, providers] = await Promise.all([
 		getJson(fetchImpl, `${API}/models/${model}/endpoints`),
-		getJson(fetchImpl, `${API}/endpoints/zdr`),
+		// The zdr list is not needed when the user allows any data retention.
+		requireZdr ? getJson(fetchImpl, `${API}/endpoints/zdr`) : Promise.resolve({ data: [] }),
 		getJson(fetchImpl, `${API}/providers`),
 	]);
 	const hq = new Map((providers.data || []).map((p) => [p.slug, p.headquarters || null]));
@@ -115,13 +127,16 @@ async function fetchCandidates(model, { fetchImpl, ignore }) {
 	for (const ep of (endpoints.data && endpoints.data.endpoints) || []) {
 		const slug = String(ep.tag || ep.provider_slug || ep.provider_name);
 		const base = slug.split('/')[0];
+		const lslug = slug.toLowerCase();
+		const lbase = base.toLowerCase();
 		const p = ep.pricing || {};
 		const price = { input: Number(p.prompt) * 1e6, output: Number(p.completion) * 1e6, cacheRead: Number(p.input_cache_read || p.prompt) * 1e6 };
-		if (!zdrNames.has(String(ep.provider_name).toLowerCase()) && !zdrNames.has(base)) { excluded[slug] = 'not zero data retention'; continue; }
+		if (requireZdr && !zdrNames.has(String(ep.provider_name).toLowerCase()) && !zdrNames.has(lbase)) { excluded[slug] = 'not zero data retention'; continue; }
+		if (!requireZdr && ignored.has(lbase) && !ignored.has(lslug)) { excluded[slug] = 'ignored'; continue; }
 		const where = hq.get(base) || KNOWN_HQ[base] || null;
 		if (!where) { excluded[slug] = 'headquarters unknown'; continue; }
 		if (EXCLUDED_HQ.has(where)) { excluded[slug] = `headquarters ${where}`; continue; }
-		if (ignored.has(base) || ignored.has(slug)) { excluded[slug] = 'ignored'; continue; }
+		if (ignored.has(lbase) || ignored.has(lslug)) { excluded[slug] = 'ignored'; continue; }
 		eligible.push({ slug, provider: ep.provider_name, price, context: ep.context_length, quantization: ep.quantization || null, score: score(price, true) });
 	}
 	eligible.sort((a, b) => a.score - b.score);
@@ -138,7 +153,7 @@ async function post(fetchImpl, url, init) {
 	}
 }
 
-async function probe(fetchImpl, key, model, slug, question) {
+async function probe(fetchImpl, key, model, slug, question, zdr = true) {
 	const res = await post(fetchImpl, `${API}/messages`, {
 		method: 'POST',
 		headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
@@ -148,7 +163,7 @@ async function probe(fetchImpl, key, model, slug, question) {
 			system: [{ type: 'text', text: FILLER, cache_control: { type: 'ephemeral' } }],
 			messages: [{ role: 'user', content: question }],
 			thinking: { type: 'adaptive' },
-			provider: { only: [slug], allow_fallbacks: false, zdr: true, data_collection: 'deny' },
+			provider: { only: [slug], allow_fallbacks: false, zdr, data_collection: 'deny' },
 			session_id: `agent-view-qualify-${slug}`,
 		}),
 	});
@@ -183,7 +198,7 @@ const PROBE_TOOL = {
 	},
 };
 
-async function probeTool(fetchImpl, key, model, slug) {
+async function probeTool(fetchImpl, key, model, slug, zdr = true) {
 	const res = await post(fetchImpl, `${API}/messages`, {
 		method: 'POST',
 		headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
@@ -192,7 +207,7 @@ async function probeTool(fetchImpl, key, model, slug) {
 			max_tokens: 400,
 			tools: [PROBE_TOOL],
 			messages: [{ role: 'user', content: 'What is the weather in Berlin? Use the get_weather tool.' }],
-			provider: { only: [slug], allow_fallbacks: false, zdr: true, data_collection: 'deny' },
+			provider: { only: [slug], allow_fallbacks: false, zdr, data_collection: 'deny' },
 		}),
 	});
 	const body = await res.json().catch(() => ({}));
@@ -226,25 +241,25 @@ async function withRetry(fn, delayMs) {
 // Live check of the cheapest candidates: two plain calls with the same
 // ~9k-token prefix (reasoning kept out of the answer, cache hit) and one tool
 // call. Costs well under a cent per provider.
-async function qualify(model, key, { fetchImpl = globalThis.fetch, ignore = [], top = 8, log = () => {}, retryDelayMs = 5000 } = {}) {
-	const { eligible, excluded } = await candidates(model, { fetchImpl, ignore });
+async function qualify(model, key, { fetchImpl = globalThis.fetch, ignore = [], requireZdr = true, top = 8, log = () => {}, retryDelayMs = 5000 } = {}) {
+	const { eligible, excluded } = await candidates(model, { fetchImpl, ignore, requireZdr });
 	const rejected = rejectionsFor(model);
 	Object.assign(excluded, rejected);
 	const tested = [];
 	const unprobed = {};
 	let spent = 0;
 	for (const c of eligible.filter((e) => !rejected[e.slug]).slice(0, top)) {
-		const a = await withRetry(() => probe(fetchImpl, key, model, c.slug, 'What is 17 times 23? Answer with the number only.'), retryDelayMs);
+		const a = await withRetry(() => probe(fetchImpl, key, model, c.slug, 'What is 17 times 23? Answer with the number only.', requireZdr), retryDelayMs);
 		if (transient(a)) { unprobed[c.slug] = `HTTP ${a.status}`; continue; }
 		if (!a.ok) { excluded[c.slug] = `probe failed (HTTP ${a.status})`; continue; }
 		spent += a.cost;
-		const b = await withRetry(() => probe(fetchImpl, key, model, c.slug, 'What is 19 times 21? Answer with the number only.'), retryDelayMs);
+		const b = await withRetry(() => probe(fetchImpl, key, model, c.slug, 'What is 19 times 21? Answer with the number only.', requireZdr), retryDelayMs);
 		if (transient(b)) { unprobed[c.slug] = `HTTP ${b.status}`; continue; }
 		if (!b.ok) { excluded[c.slug] = `probe failed (HTTP ${b.status})`; continue; }
 		spent += b.cost;
 		const clean = !a.textFirst && /^\s*391\s*\.?\s*$/.test(a.text) && !b.textFirst && /^\s*399\s*\.?\s*$/.test(b.text);
 		if (!clean) { excluded[c.slug] = 'reasoning leaked into the answer'; continue; }
-		const t = await withRetry(() => probeTool(fetchImpl, key, model, c.slug), retryDelayMs);
+		const t = await withRetry(() => probeTool(fetchImpl, key, model, c.slug, requireZdr), retryDelayMs);
 		spent += t.cost || 0;
 		if (transient(t)) { unprobed[c.slug] = `HTTP ${t.status}`; continue; }
 		if (!t.ok) { excluded[c.slug] = `tool call failed${t.status ? ` (HTTP ${t.status})` : ''}`; continue; }
@@ -264,6 +279,7 @@ async function qualify(model, key, { fetchImpl = globalThis.fetch, ignore = [], 
 	const entry = {
 		at: new Date().toISOString(),
 		source: 'probe',
+		zdr: requireZdr,
 		ranked: tested.map((t) => t.slug).filter((slug) => !late[slug]),
 		excluded: { ...excluded, ...late },
 		unprobed,
@@ -280,9 +296,10 @@ async function qualify(model, key, { fetchImpl = globalThis.fetch, ignore = [], 
 function demote(model, slug, reason, now = Date.now()) {
 	const store = readStore();
 	store.models = store.models || {};
-	const current = store.models[model] || (SEED[model] ? { ...SEED[model] } : { at: new Date(now).toISOString(), source: 'price', ranked: [], excluded: {} });
+	const current = store.models[model] || (SEED[model] ? { ...SEED[model], zdr: true } : { at: new Date(now).toISOString(), source: 'price', zdr: true, ranked: [], excluded: {} });
 	store.models[model] = {
 		...current,
+		zdr: current.zdr === undefined ? true : current.zdr,
 		ranked: (current.ranked || []).filter((s) => s !== slug),
 		excluded: { ...(current.excluded || {}), [slug]: reason },
 		rejectedAt: { ...(current.rejectedAt || {}), [slug]: new Date(now).toISOString() },
@@ -296,27 +313,31 @@ function demote(model, slug, reason, now = Date.now()) {
 // reject a request. A seed shipped after the last probe wins over a stale
 // probe. Never throws; with an empty list the router refuses the request.
 const priceCache = new Map();
-async function rankingFor(model, { fetchImpl = globalThis.fetch, ignore = [], now = Date.now() } = {}) {
+async function rankingFor(model, { fetchImpl = globalThis.fetch, ignore = [], requireZdr = true, now = Date.now() } = {}) {
 	const stored = (readStore().models || {})[model];
 	const rejected = rejectionsFor(model, now);
 	const minus = (r) => ({ ...r, ranked: (r.ranked || []).filter((s) => !rejected[s]), excluded: { ...(r.excluded || {}), ...rejected } });
 	const seed = SEED[model];
-	if (stored && stored.source === 'probe') {
+	// A probe carries the data-retention mode it ran under; a ranking probed
+	// with the other mode is not swapped in. The seed was verified ZDR-only,
+	// so it serves only the ZDR path; the price list below admits non-ZDR
+	// providers when the user allows them.
+	if (stored && stored.source === 'probe' && (stored.zdr === undefined ? true : stored.zdr) === requireZdr) {
 		const maxAge = stored.unprobed && Object.keys(stored.unprobed).length ? UNPROBED_MAX_AGE_MS : QUALIFY_MAX_AGE_MS;
 		const fresh = now - Date.parse(stored.at) < maxAge;
 		const own = minus(stored);
-		const seedNewer = seed && Date.parse(seed.at) > Date.parse(stored.at);
+		const seedNewer = requireZdr && seed && Date.parse(seed.at) > Date.parse(stored.at);
 		if (own.ranked.length && (fresh || !seedNewer)) return { ...own, fresh };
 	}
-	if (seed) return { ...minus(seed), fresh: false };
+	if (requireZdr && seed) return { ...minus(seed), fresh: false };
 	// The price list costs three downloads (one near 1 MB); it is kept for an
 	// hour, a failed fetch for ten minutes, so a chat request never waits on it
 	// twice.
-	const key = `${model}|${[...ignore].sort().join(',')}`;
+	const key = `${model}|${[...ignore].sort().join(',')}|zdr${requireZdr ? 1 : 0}`;
 	const hit = priceCache.get(key);
 	if (hit && now < hit.until) return hit.value ? { ...minus(hit.value), fresh: false } : { at: null, source: 'none', ranked: [], excluded: rejected, fresh: false };
 	try {
-		const { eligible, excluded } = await candidates(model, { fetchImpl, ignore });
+		const { eligible, excluded } = await candidates(model, { fetchImpl, ignore, requireZdr });
 		const value = { at: new Date(now).toISOString(), source: 'price', ranked: eligible.map((e) => e.slug), excluded };
 		priceCache.set(key, { value, until: now + 3600e3 });
 		return { ...minus(value), fresh: false };

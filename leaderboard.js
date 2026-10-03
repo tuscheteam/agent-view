@@ -21,6 +21,35 @@ const ALLOWED_PROVIDERS = new Set(['openai', 'anthropic', 'deepseek']);
 const DEFAULT_SUBAGENT_EXCLUDE = ['claude-fable-5-1', 'gpt-6-astra'];
 const RECOMMENDATION_DIR = '.agent-view';
 const RECOMMENDATION_FILE = 'subagent-recommendation.json';
+// One fetch per slot across all windows: every window reads this file before
+// it calls the API, and the window that fetched writes it. Without it, N
+// windows each fetch every slot and blow through the free tier's ten calls a
+// day.
+const SHARED_FILE = 'leaderboard-cache.json';
+
+function sharedCachePath(homeDir) {
+	return path.join(homeDir, RECOMMENDATION_DIR, SHARED_FILE);
+}
+
+// { slotKey, coding, reasoning, at } or null. Any window's fresh result.
+function readSharedCache(homeDir) {
+	try { return JSON.parse(fs.readFileSync(sharedCachePath(homeDir), 'utf8')); } catch (_) { return null; }
+}
+
+function writeSharedCache(homeDir, payload) {
+	try {
+		const text = `${JSON.stringify(payload, null, 2)}\n`;
+		const dir = path.join(homeDir, RECOMMENDATION_DIR);
+		fs.mkdirSync(dir, { recursive: true });
+		const tmp = `${sharedCachePath(homeDir)}.${process.pid}.tmp`;
+		fs.writeFileSync(tmp, text);
+		try { fs.renameSync(tmp, sharedCachePath(homeDir)); } catch (_) {
+			// Windows refuses the rename while another process holds the file.
+			fs.writeFileSync(sharedCachePath(homeDir), text);
+			try { fs.unlinkSync(tmp); } catch (__) { /* next write replaces it */ }
+		}
+	} catch (_) { /* read-only home: each window keeps its own cache */ }
+}
 
 class LeaderboardCache {
 	constructor(context, onChange, log, options = {}) {
@@ -121,6 +150,35 @@ class LeaderboardCache {
 			return false;
 		}
 
+		// Another window may already have fetched this slot. Adopt its result
+		// and skip the API call — one fetch per slot per machine, not one per
+		// window.
+		const shared = readSharedCache(this.homeDir);
+		if (reason !== 'manual' && shared && shared.slotKey === slotKey && shared.coding && Array.isArray(shared.coding.rows) && shared.coding.rows.length
+			&& !(codingOnly && (!shared.reasoning || !Array.isArray(shared.reasoning.rows)))) {
+			// A manual refresh wants a live answer, not another window's data.
+			this.inFlight = true;
+			try {
+				this.cache = {
+					...this.cache,
+					reasoning: (codingOnly && this.cache.reasoning) || shared.reasoning || this.cache.reasoning,
+					coding: shared.coding,
+					lastSlotKey: slotKey,
+					lastSuccessAt: this.now().toISOString(),
+					lastError: null,
+					lastReason: `${reason} (shared)`,
+				};
+				await this._save();
+				this.writeRecommendation(this.cache);
+				this._notify();
+				this.log(`ASL leaderboard taken from another window (slot=${slotKey})`);
+			} finally {
+				this.inFlight = false;
+			}
+			this._scheduleTimer();
+			return false;
+		}
+
 		this.inFlight = true;
 		this.cache = {
 			...this.cache,
@@ -151,6 +209,7 @@ class LeaderboardCache {
 			};
 			await this._save();
 			this.log(`ASL leaderboard refresh complete (${reason}, slot=${slotKey})`);
+			writeSharedCache(this.homeDir, { slotKey, coding: this.cache.coding, reasoning: this.cache.reasoning, at: this.now().toISOString() });
 			this.writeRecommendation(this.cache);
 			return true;
 		} catch (err) {
@@ -419,6 +478,8 @@ function visibleRows(rows, { showDeepSeek = false, routedModels = [] } = {}) {
 		const base = String(m).toLowerCase().split('/').pop().replace(/\[[^\]]*\]$/, '');
 		bases.add(base);
 		bases.add(base.replace(/-\d{4}$/, ''));
+		// "deepseek-v4.1-flash" is the "deepseek-v4-flash" of the board.
+		bases.add(base.replace(/\.\d+/, ''));
 	}
 	return (Array.isArray(rows) ? rows : []).filter((row) => {
 		if (row.provider !== 'deepseek') return true;

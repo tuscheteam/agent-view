@@ -148,7 +148,7 @@ Limits and trade-offs:
 - A wrong or expired OpenRouter key comes back as a clear message, never as a
   Claude login prompt.
 
-- DeepSeek V4 Flash reads text only. Images and PDFs in the chat (pasted, or read
+- DeepSeek V4.1 Flash reads images and PDFs. A bare `deepseek` subagent model id resolves to it at the router.
   with a tool) reach it as a one-line note; switch to a Claude model to look at them.
 - With any base URL other than Anthropic's, Claude Code sends the full conversation
   with every request, for Claude models too. The prompt cache keeps the cost the
@@ -229,6 +229,38 @@ In PowerShell, `*.vsix` does not expand — name the file:
 Uninstalling the extension also removes its Claude Code environment entries and
 model-menu rows (standard VS Code, Insiders and VSCodium installs).
 
+## DeepSeek chats and subagents
+
+Two DeepSeek models sit in Claude Code's model menu while the router is on:
+
+- **DeepSeek V4.1 Flash** reads images and PDFs. Use it for chats.
+- **DeepSeek V4 Flash 0731** is cheaper and text-only. A subagent requested as
+  plain `deepseek` runs on it.
+
+Claude Code keeps no model per chat. A pick from the model menu becomes the
+global default (Agent View puts the previous default back, see
+`modelRouter.defaultModelGuard`), and a chat that a window reload restores
+starts on that default again. The Chats panel shows the model a chat runs on
+now. Its tooltip names the last reply's model and the `/model` command that
+switches back.
+
+`deepseek` as a subagent model needs a small patch to Claude Code's own
+binary, because the Agent tool accepts only a fixed list of model names. Every
+Claude Code update ships a fresh binary without the patch. While the router is
+on, Agent View notices this after an update and offers to re-apply it once per
+version. The palette commands **Agent View: Claude Code: Check DeepSeek Subagent
+Patch** and **Re-apply DeepSeek Subagent Patch** do the same on demand.
+
+The patch swaps one string in place: the Agent tool's model list
+`sonnet, opus, haiku, fable` becomes `deepseek, opus, haiku`, so subagents can no
+longer ask for sonnet or fable. The other copies of that list in the binary stay
+untouched, and the result is verified after writing. The new binary is written
+next to the old one and renamed into place, so open chats keep the old binary
+until they are reopened. On macOS it gets an ad-hoc signature first. Undoing
+writes the original list back (`node tools/patch-claude.cjs --undo`), and
+uninstalling Agent View does the same. Patching Anthropic's file is a
+workaround: Anthropic support does not cover a patched binary.
+
 ## Updating
 
 One line, any time — it replaces the installed version in place. macOS / Linux / Git Bash:
@@ -266,6 +298,7 @@ running there.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
+| `openEditorsTools.codexClosedDays` | `30` | Codex chats quiet for this many days collapse into one "older Codex chats hidden" row (click it to show all). `0` lists every Codex chat |
 | `openEditorsTools.closedChatHours` | `48` | How long closed chats stay listed. `0` hides them |
 | `openEditorsTools.recentFirst` | `false` | Move the editor you just activated to the top of its group |
 | `openEditorsTools.codexOpenTarget` | `auto` | Where a Codex row opens: `sidebar` panel, `editor` tab, or `auto` |
@@ -276,8 +309,8 @@ running there.
 | `openEditorsTools.subagentExcludeModels` | `["claude-fable-5-1", "gpt-6-astra"]` | Models never recommended as subagents |
 | `openEditorsTools.claudeCodeAutoRepair` | `true` | Re-apply the chat-rename fix to new Claude Code installs at startup |
 | `openEditorsTools.modelRouter.enabled` | `false` | Run the model router (OpenRouter models in Claude Code) |
-| `openEditorsTools.modelRouter.pickerModels` | `["deepseek/deepseek-v4-flash-0731"]` | OpenRouter models listed in Claude Code's model menu |
-| `openEditorsTools.modelRouter.requireZeroDataRetention` | `true` | Only zero-data-retention providers |
+| `openEditorsTools.modelRouter.pickerModels` | `["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4-flash-0731"]` | OpenRouter models listed in Claude Code's model menu |
+| `openEditorsTools.modelRouter.requireZeroDataRetention` | `true` | `false` also admits non-ZDR providers into the ranking and probes (re-check provider order for it to take effect) |
 | `openEditorsTools.modelRouter.ignoredProviders` | Chinese / HK / SG providers | OpenRouter provider slugs never used |
 | `openEditorsTools.modelRouter.port` | `47861` | Local router port |
 | `openEditorsTools.modelRouter.serverToolModel` | `claude-sonnet-5` | Claude model that runs web search for OpenRouter chats |
@@ -293,7 +326,9 @@ Everything runs locally. Concretely, the extension:
 - opens Codex's local thread database `~/.codex/state_5.sqlite` read-only, and spawns
   `codex app-server` locally to read rate limits — Codex handles its own credentials;
 - sends your AI Stupid Level API key only to `https://aistupidlevel.info/api/v1/models`
-  for the reasoning and coding leaderboard calls;
+  for the reasoning and coding leaderboard calls — one fetch per time slot across all
+  your windows (windows share `~/.agent-view/leaderboard-cache.json`), so the free
+  tier's ten daily calls are never exceeded by having two windows open;
 - caches usage for 5 minutes;
 - with the model router on: passes Claude requests to `api.anthropic.com` unchanged, sends
   requests for OpenRouter models with your OpenRouter key to `openrouter.ai`, reads

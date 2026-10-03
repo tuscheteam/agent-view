@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const chatsView = require('./chatsView');
 const modelRouter = require('./modelRouter');
+const claudePatch = require('./claudePatch');
 
 // Buttons live in the OPEN EDITORS pane header (MenuId.ViewTitle, scoped by the
 // `view` context key each ViewPane sets to its own id). The per-row right-click
@@ -21,6 +22,7 @@ async function forwardCommand(id) {
 
 function activate(context) {
 	const forward = (id) => () => forwardCommand(id);
+
 
 	context.subscriptions.push(
 		// openEditorsTools.newClaudeChat and .newCodexChat are registered in
@@ -85,6 +87,9 @@ function activate(context) {
 	// what removes an environment entry a crashed window left behind.
 	routerHandle = modelRouter.register(context, log, context.extension && context.extension.packageJSON
 		? context.extension.packageJSON.version : '0');
+
+	// Re-offers the "deepseek" subagent patch after a Claude Code update.
+	try { claudePatch.register(context, log); } catch (err) { console.error('[agent-view] claude patch check failed to start', err); }
 }
 
 let routerHandle = null;
