@@ -207,27 +207,59 @@ A chat you renamed in Codex keeps that name here even after you resume it.
 stored token lasts 8 hours and only Claude Code renews it. The bars come back
 by themselves within a second of your next Claude message.
 
+## Install or update
+
+One command per OS. It installs Agent View the first time and replaces an older
+copy in place, so "already installed" needs no different line.
+
+**macOS / Linux** (Terminal):
+
+```sh
+curl -sL -o /tmp/agent-view.vsix https://github.com/tuscheteam/agent-view/releases/latest/download/agent-view-latest.vsix && code --install-extension /tmp/agent-view.vsix --force
+```
+
+**Windows** (PowerShell):
+
+```powershell
+iwr https://github.com/tuscheteam/agent-view/releases/latest/download/agent-view-latest.vsix -OutFile $env:TEMP\agent-view.vsix; code --install-extension $env:TEMP\agent-view.vsix --force
+```
+
+If `code` is not on your PATH:
+
+- macOS: `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` — or run
+  *Shell Command: Install 'code' command in PATH* from the command palette once.
+- Windows: `& "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd"`.
+- VSCodium, Insiders: same path with the variant's folder name.
+
+Then reload the window: command palette (`Cmd/Ctrl+Shift+P`) → *Developer: Reload
+Window*. No terminal? Download `agent-view-latest.vsix` from
+[Releases](https://github.com/tuscheteam/agent-view/releases) and use the
+Extensions view → `···` → *Install from VSIX…*.
+
+Sideloaded extensions do not auto-update. Click *Watch → Custom → Releases* on
+the repo to hear about new versions.
+
+### First run
+
+1. Command palette → **Agent View: Set OpenRouter API Key**. The key is the
+   friend's own (a shared key bills the owner).
+2. **Agent View: Model Router** on (Config → `openEditorsTools.modelRouter.enabled`).
+   Chats opened from then on list the DeepSeek models in `/model`.
+3. If the "deepseek subagents" offer appears, choose **Re-apply**. It patches
+   Claude Code's own binary once per Claude Code version.
+4. Open the Agent View panel: View → Open View… → *Agent View*, or click the
+   icon in the panel bar.
+
+### Uninstall
+
+Removes the Claude Code environment entries, the model-menu rows and the
+subagent patch (standard VS Code, Insiders and VSCodium installs).
+
 ## Requirements
 
 - VS Code ≥ 1.90
 - [Claude Code](https://marketplace.visualstudio.com/items?itemName=Anthropic.claude-code) extension, signed in
 - [Codex (ChatGPT)](https://marketplace.visualstudio.com/items?itemName=openai.chatgpt) extension — optional; Codex rows and buttons appear only if present
-
-## Install
-
-Download the `.vsix` from [Releases](https://github.com/tuscheteam/agent-view/releases), then:
-
-```sh
-code --install-extension agent-view-*.vsix
-```
-
-Or in VS Code: Extensions view → `···` menu → *Install from VSIX…*
-
-In PowerShell, `*.vsix` does not expand — name the file:
-`code --install-extension agent-view-latest.vsix` (or the versioned name you downloaded).
-
-Uninstalling the extension also removes its Claude Code environment entries and
-model-menu rows (standard VS Code, Insiders and VSCodium installs).
 
 ## DeepSeek chats and subagents
 
@@ -260,26 +292,6 @@ until they are reopened. On macOS it gets an ad-hoc signature first. Undoing
 writes the original list back (`node tools/patch-claude.cjs --undo`), and
 uninstalling Agent View does the same. Patching Anthropic's file is a
 workaround: Anthropic support does not cover a patched binary.
-
-## Updating
-
-One line, any time — it replaces the installed version in place. macOS / Linux / Git Bash:
-
-```sh
-curl -sL -o agent-view.vsix https://github.com/tuscheteam/agent-view/releases/latest/download/agent-view-latest.vsix && code --install-extension agent-view.vsix
-```
-
-Windows PowerShell:
-
-```powershell
-iwr https://github.com/tuscheteam/agent-view/releases/latest/download/agent-view-latest.vsix -OutFile agent-view.vsix; code --install-extension agent-view.vsix
-```
-
-Then reload the window. No terminal: download that same file and use the
-Extensions view → `···` → *Install from VSIX…*.
-
-Sideloaded extensions do not auto-update. To hear about new versions, click
-*Watch → Custom → Releases* on the repo.
 
 ## Remote-SSH
 
