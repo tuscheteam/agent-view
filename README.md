@@ -47,12 +47,25 @@ Panel**. Open in Middle puts the chat in a tab in the Claude column. Open in
 Side Panel moves it to the secondary side bar: a Codex chat loads into the Codex
 sidebar, and a Claude chat goes to Claude Code's own sidebar view. A Claude chat
 that has a tab loses that tab on the move, and a chat in the middle of a turn
-asks first, because closing the tab stops the turn. A Claude chat that runs
-without a tab in this window (the side panel, another window or a terminal)
-shows "open elsewhere" and sorts with the open chats. Claude Code keeps a chat
-its own side panel holds in that side panel: Open in Middle on such a chat
-reveals the side panel and says so, because Claude Code has no command to move
-a chat out of it.
+asks first, because closing the tab stops the turn.
+
+Claude Code shows a chat in its side panel for as long as that chat's process
+runs, and answers every later open of the chat (a click in the list, its history
+picker, Open in Middle) by showing it in the side panel again. So the side panel
+holds one chat at a time, and a chat it showed earlier stays attached until its
+process ends. Agent View ends that process for you: when another chat takes the
+side panel, each chat it displaced that sits between turns is closed, and its
+row moves to the closed list. A displaced chat in the middle of a turn, or with a
+background shell, agent or monitor still running, keeps running; Open in Middle
+asks before it ends all of that. Agent View ends a process only when it is
+certain the process is Claude's own and the only one for that chat. Turn the
+release off with `openEditorsTools.chats.releaseSidePanelChats`.
+
+The chat the side panel shows now cannot be freed: Open in Middle on it says so.
+Put another chat in the side panel first (right-click → Open in Side Panel), then
+open this one in the middle. Rows of chats Agent View placed in the side panel
+read "in side panel"; a chat that runs without a tab for another reason (another
+window, a terminal, Claude Code's own side panel) reads "open elsewhere".
 
 ## Buttons
 
@@ -345,6 +358,7 @@ running there.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
+| `openEditorsTools.chats.releaseSidePanelChats` | `true` | End the process of each chat a new side-panel chat displaced, while it sits between turns, so it can open in the middle again |
 | `openEditorsTools.codexClosedDays` | `30` | Codex chats quiet for this many days collapse into one "older Codex chats hidden" row (click it to show all). `0` lists every Codex chat |
 | `openEditorsTools.closedChatHours` | `48` | How long closed chats stay listed. `0` hides them |
 | `openEditorsTools.recentFirst` | `false` | Move the editor you just activated to the top of its group |

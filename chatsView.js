@@ -3,6 +3,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
+const { promisify } = require('util');
+const execFileAsync = promisify(require('child_process').execFile);
 const { UsageCache, watchCredentials } = require('./usage');
 const restyle = require('./restyle');
 const claudeFix = require('./claudeFix');
@@ -680,6 +682,107 @@ function liveSessionIds() {
 	return ids;
 }
 
+// The registry record of one live session: its process id, whether it is
+// between turns, when it started, and how many live records name it (a
+// terminal `claude --resume` or another window adds one). A record whose
+// process is gone is a leftover of a crash or a kill and does not count; with
+// `includeDead` the newest leftover comes back when nothing runs. Null when
+// no record qualifies.
+function liveSessionRecord(sessionId, includeDead = false) {
+	const dir = path.join(claudeConfigDir(), 'sessions');
+	let names;
+	try { names = fs.readdirSync(dir); } catch (_) { return null; }
+	const recs = [];
+	for (const name of names) {
+		if (!name.endsWith('.json')) continue;
+		try {
+			const file = path.join(dir, name);
+			const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+			if (rec.sessionId !== sessionId) continue;
+			const pid = Number(rec.pid) || 0;
+			recs.push({ pid, status: String(rec.status || ''), startedAt: Number(rec.startedAt) || 0, procStart: String(rec.procStart || ''), file, dir, running: !!pid && processTools.alive(pid) });
+		} catch (_) { /* being written right now */ }
+	}
+	const running = recs.filter((r) => r.running);
+	const pool = running.length ? running : (includeDead ? recs : []);
+	if (!pool.length) return null;
+	const best = pool.reduce((x, y) => (y.startedAt > x.startedAt ? y : x));
+	return { ...best, count: running.length || 1 };
+}
+
+// Ending one Claude process. Claude Code keeps a channel on every session its
+// side panel ever showed, and answers each later open of such a session by
+// showing it in the side panel again. The channel closes when the process
+// ends, which is the only release there is. Overridable so a test can end a
+// stand-in process without matching the real image name.
+const processTools = {
+	alive(pid) {
+		try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
+	},
+	// The image name of a pid, or '' when there is no such process.
+	async imageName(pid) {
+		try {
+			if (process.platform === 'win32') {
+				const { stdout } = await execFileAsync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { timeout: 5000, windowsHide: true });
+				const m = /^"([^"]+)"/.exec(stdout.trim());
+				return m ? m[1] : '';
+			}
+			return (await execFileAsync('ps', ['-p', String(pid), '-o', 'comm='], { timeout: 5000 })).stdout.trim();
+		} catch (_) { return ''; }
+	},
+	// When the process started, as the Windows FILETIME the registry stores in
+	// `procStart`; '' where that cannot be read.
+	async startTime(pid) {
+		if (process.platform !== 'win32') return '';
+		try {
+			const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+				`[System.Diagnostics.Process]::GetProcessById(${Number(pid)}).StartTime.ToFileTimeUtc()`], { timeout: 8000, windowsHide: true });
+			return /^\d+$/.test(stdout.trim()) ? stdout.trim() : '';
+		} catch (_) { return ''; }
+	},
+	// The whole tree on Windows: a hard kill of the parent alone leaves its MCP
+	// servers running.
+	async kill(pid) {
+		if (process.platform === 'win32') {
+			try { await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 8000, windowsHide: true }); } catch (_) { /* gone already */ }
+			return;
+		}
+		try { process.kill(pid, 'SIGTERM'); } catch (_) { /* gone already */ }
+	},
+};
+
+// 'ended' when the session's process was stopped, 'gone' when none ran, and
+// 'refused' when it cannot be told safely which process holds the session: a
+// pid that is not Claude (a stale record whose pid another program reuses), a
+// process that started at another time than the record says, a process that
+// survives the kill, or several live records for one session.
+async function endClaudeProcess(sessionId) {
+	const rec = liveSessionRecord(sessionId, true);
+	if (!rec) return 'gone';
+	// A killed process cannot remove its own record, nor its key file.
+	const dropRecord = () => {
+		try { fs.unlinkSync(rec.file); } catch (_) { /* already removed */ }
+		try {
+			for (const name of fs.readdirSync(rec.dir)) {
+				if (name.startsWith(`${rec.pid}.`) && name.endsWith('.key')) fs.unlinkSync(path.join(rec.dir, name));
+			}
+		} catch (_) { /* nothing to remove */ }
+	};
+	if (rec.count > 1) return 'refused';
+	if (!rec.pid || !processTools.alive(rec.pid)) { dropRecord(); return 'gone'; }
+	const image = path.basename(String(await processTools.imageName(rec.pid))).replace(/\.exe$/i, '').toLowerCase();
+	if (image !== 'claude') return 'refused';
+	if (rec.procStart) {
+		const started = await processTools.startTime(rec.pid);
+		if (started && Math.abs(Number(started) - Number(rec.procStart)) > 5e7) return 'refused';
+	}
+	await processTools.kill(rec.pid);
+	for (let i = 0; i < 20 && processTools.alive(rec.pid); i++) await new Promise((r) => setTimeout(r, 150));
+	if (processTools.alive(rec.pid)) return 'refused';
+	dropRecord();
+	return 'ended';
+}
+
 // Settings files, parsed and cached by mtime.
 const settingsCache = new Map();
 function readSettingsFile(file) {
@@ -818,17 +921,29 @@ class TranscriptIndex {
 		return label ? this.byTitle.get(label.trim().toLowerCase()) : undefined;
 	}
 
+	entryFor(sessionId) {
+		for (const entry of this.byFile.values()) if (entry.sessionId === sessionId) return entry;
+		return undefined;
+	}
+
 	// Fallback for tabs the title index cannot place: a brand-new chat has no
 	// title record yet, and a just-renamed chat has a label no record carries.
 	// Candidates are unclaimed transcripts that are either running right now
 	// (their session id appears in ~/.claude/sessions) or untitled and recent.
 	// Live beats recent: a running session's transcript belongs to SOME open
 	// tab, however old its last write.
-	unclaimedSince(cutoffMs, claimed, live) {
+	// `untitledOnly` is for a tab that still carries Claude Code's default label:
+	// a chat that has a title would show it, so a titled transcript is not its
+	// own. `exclude` holds sessions known to run outside any tab (the side
+	// panel); without it a fresh "Claude Code" tab took the side-panel chat's
+	// row and the chat vanished from the list.
+	unclaimedSince(cutoffMs, claimed, live, { untitledOnly = false, exclude = null } = {}) {
 		let best = null;
 		const rank = (entry) => (live && live.has(entry.sessionId) ? 1 : 0);
 		for (const entry of this.byFile.values()) {
 			if (claimed.has(entry.sessionId)) continue;
+			if (exclude && exclude.has(entry.sessionId)) continue;
+			if (untitledOnly && entry.title) continue;
 			const isLive = live && live.has(entry.sessionId);
 			if (!isLive && (entry.title || entry.lastActivity < cutoffMs)) continue;
 			if (!best || rank(entry) > rank(best)
@@ -1259,6 +1374,81 @@ function openClaudeInSidePanel(sessionId, hosted) {
 	sidePanelMoves = run.catch(() => {});
 	return run;
 }
+
+// The Claude sessions Agent View put in Claude Code's side panel, oldest
+// first. The side panel shows the last one. Every earlier one keeps a live
+// process there, and Claude Code answers each later open of such a session
+// (a click in the list, the history picker, Open in Middle) by showing it in
+// the side panel again. Ending that process is the only release Claude Code
+// leaves, so a displaced chat that sits between turns gives its process up.
+const sidePanelChats = [];
+let placementLog = () => {};
+let transcriptIndex = null;
+function forgetSidePanelChat(sessionId) {
+	const i = sidePanelChats.indexOf(sessionId);
+	if (i !== -1) sidePanelChats.splice(i, 1);
+}
+function noteSidePanelChat(sessionId) {
+	forgetSidePanelChat(sessionId);
+	sidePanelChats.push(sessionId);
+}
+function sidePanelCurrent() { return sidePanelChats.length ? sidePanelChats[sidePanelChats.length - 1] : null; }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A chat that sits between turns can give its process up; one that works on a
+// turn, or still owns a background shell, agent or monitor, cannot (those die
+// with the process).
+function chatIsBusy(sessionId, rec) {
+	if (rec.status !== 'idle') return true;
+	const entry = transcriptIndex && transcriptIndex.entryFor(sessionId);
+	return liveBackgroundTasks(entry, rec.startedAt).length > 0;
+}
+
+// True once Claude Code has let the session go. A busy chat is left alone,
+// or asked about when the user moves that very chat.
+async function releaseSidePanelChat(sessionId, askIfBusy) {
+	const rec = liveSessionRecord(sessionId);
+	if (rec && chatIsBusy(sessionId, rec)) {
+		if (!askIfBusy) return false;
+		const pick = await vscode.window.showWarningMessage(
+			'This chat is working, or still runs background work. Moving it out of the side panel stops all of it.',
+			{ modal: true }, 'Move anyway');
+		if (pick !== 'Move anyway') return false;
+	}
+	const result = await endClaudeProcess(sessionId);
+	placementLog(`side panel: release ${sessionId} -> ${result}`);
+	if (result === 'refused') {
+		if (askIfBusy) vscode.window.showInformationMessage('Agent View could not tell for certain which process runs this chat, so it left it running. Close the chat in the side panel, or reload the window, to free it.');
+		return false;
+	}
+	forgetSidePanelChat(sessionId);
+	// Claude Code closes the channel when its query loop notices the exit.
+	if (result === 'ended') await sleep(600);
+	return true;
+}
+
+// After another chat takes the side panel, the chats it displaced end their
+// processes while they sit between turns. The new chat has to be running
+// first: until then the displaced one is still on screen. A later placement
+// makes this one stale, and the chat on screen is never ended.
+async function releaseDisplacedChats(newId, since, newIdWasLive) {
+	if (!settingOn('chats.releaseSidePanelChats')) return;
+	if (newIdWasLive) {
+		await sleep(1500);
+	} else {
+		let started = false;
+		for (let i = 0; i < 40 && !started; i++) {
+			const rec = liveSessionRecord(newId);
+			started = !!rec && rec.startedAt >= since;
+			if (!started) await sleep(250);
+		}
+		if (!started) { placementLog(`side panel: ${newId} did not start, displaced chats stay`); return; }
+	}
+	for (const id of [...sidePanelChats]) {
+		if (sidePanelCurrent() !== newId) return;
+		if (id !== newId) await releaseSidePanelChat(id, false);
+	}
+}
 async function moveClaudeToSidePanel(sessionId, hosted) {
 	const cfg = () => vscode.workspace.getConfiguration('claudeCode');
 	const inspected = cfg().inspect('preferredLocation') || {};
@@ -1277,6 +1467,9 @@ async function moveClaudeToSidePanel(sessionId, hosted) {
 	}
 	const prev = inspected.globalValue;
 	const flip = cfg().get('preferredLocation') !== 'sidebar';
+	// A chat with no tab keeps its running process into the side panel.
+	const wasLive = !hosted && !!liveSessionRecord(sessionId);
+	const since = Date.now() - 1000;
 	if (flip) await cfg().update('preferredLocation', 'sidebar', vscode.ConfigurationTarget.Global);
 	try {
 		if (hosted) {
@@ -1285,6 +1478,7 @@ async function moveClaudeToSidePanel(sessionId, hosted) {
 			// webview is disposed; a tab still registered routes back to "panel".
 			await new Promise((r) => setTimeout(r, 200));
 		}
+		const tabsBefore = claudeTabs().length;
 		try {
 			await vscode.commands.executeCommand('claude-vscode.editor.open', sessionId, undefined, undefined, undefined, undefined,
 				{ programmatic: 'honor-preferred-location' });
@@ -1293,6 +1487,20 @@ async function moveClaudeToSidePanel(sessionId, hosted) {
 			if (hosted) await Promise.resolve(vscode.commands.executeCommand('claude-vscode.editor.open', sessionId)).catch(() => {});
 			throw err;
 		}
+		// Claude Code opens a tab when it does not route the session to the
+		// side panel; such a chat is not held there.
+		let tab = false;
+		for (let i = 0; i < 5 && !tab; i++) {
+			if (i) await sleep(100);
+			tab = claudeTabs().length > tabsBefore;
+		}
+		if (tab) {
+			placementLog(`side panel: ${sessionId} opened as a tab, not tracked`);
+			return true;
+		}
+		noteSidePanelChat(sessionId);
+		placementLog(`side panel: ${sessionId} placed (tab=${hosted ? 'closed' : 'none'}, tracked=${sidePanelChats.length})`);
+		releaseDisplacedChats(sessionId, since, wasLive).catch((err) => placementLog(`side panel: release failed — ${err.message}`));
 		return true;
 	} finally {
 		if (flip) await cfg().update('preferredLocation', prev, vscode.ConfigurationTarget.Global);
@@ -1776,6 +1984,9 @@ class ChatsProvider {
 			if (hit) claimed.add(hit.sessionId);
 		}
 		const untitledCutoff = Date.now() - 3600000;
+		// Chats in the side panel have no tab, whatever their transcript says.
+		const sideHeld = new Set(sidePanelChats);
+		const DEFAULT_TAB_LABEL = /^claude code$/i;
 
 		// The one chat you are actually looking at right now, if any.
 		const activeGroup = vscode.window.tabGroups.all.find((g) => g.isActive);
@@ -1783,7 +1994,8 @@ class ChatsProvider {
 
 		const rows = claudeTabs().map((t) => {
 			const data = this.index.lookup(t.tab.label)
-				|| this.index.unclaimedSince(untitledCutoff, claimed, live);
+				|| this.index.unclaimedSince(untitledCutoff, claimed, live,
+					{ untitledOnly: DEFAULT_TAB_LABEL.test(String(t.tab.label || '').trim()), exclude: sideHeld });
 			this.seen.seed(data);
 			if (data && t.tab === activeTab) this.seen.mark(data.sessionId);
 			const state = stateOf(data, data && live.has(data.sessionId), this.seen);
@@ -1885,6 +2097,11 @@ class ChatsProvider {
 		// claude-vscode.editor.open takes a session id (the panel registry is
 		// keyed on it), which is how the extension's own sessions list opens
 		// them.
+		// A chat that has a tab again, or whose process is gone and is not the
+		// one on screen, is no longer held by the side panel.
+		for (const r of rows) if (r.kind === 'claude' && r.data) forgetSidePanelChat(r.data.sessionId);
+		for (const id of [...sidePanelChats]) if (id !== sidePanelCurrent() && !live.has(id)) forgetSidePanelChat(id);
+
 		const hours = vscode.workspace.getConfiguration('openEditorsTools').get('closedChatHours', 48);
 		if (hours > 0) {
 			const cutoff = Date.now() - hours * 3600000;
@@ -1908,7 +2125,8 @@ class ChatsProvider {
 				this.seen.seed(entry);
 				// A live process with no tab here: the chat sits in the side
 				// panel, another window or a terminal. Not closed.
-				rows.push({ kind: 'claude-closed', data: entry, live: live.has(entry.sessionId) });
+				const isLive = live.has(entry.sessionId);
+				rows.push({ kind: 'claude-closed', data: entry, live: isLive, side: isLive && sideHeld.has(entry.sessionId) });
 			}
 			const openCodexIds = new Set(rows.filter((r) => r.kind === 'codex').map((r) => r.conversationId));
 			const liveSince = Date.now() - CODEX_LIVE_MS;
@@ -1952,7 +2170,7 @@ class ChatsProvider {
 		const items = rows.map((row) => {
 			const item = row.kind === 'codex' ? this._codexItem(row)
 				: row.kind === 'codex-live' ? this._codexLiveItem(row)
-				: row.kind === 'claude-closed' ? this._closedClaudeItem(row.data, row.live)
+				: row.kind === 'claude-closed' ? this._closedClaudeItem(row.data, row.live, row.side)
 				: row.kind === 'codex-hidden' ? this._hiddenCodexItem(row)
 					: row.kind === 'codex-closed' ? this._closedCodexItem(row)
 				: this._item(row);
@@ -1995,7 +2213,7 @@ class ChatsProvider {
 		if (key && this.log) this.log(`unrecognised tabs: ${key}`);
 	}
 
-	_closedClaudeItem(data, live = false) {
+	_closedClaudeItem(data, live = false, inSidePanel = false) {
 		const item = new vscode.TreeItem(data.title, vscode.TreeItemCollapsibleState.None);
 		item.id = `closed:${data.sessionId}`;
 		// Codicon, not the logo — closed rows should read as a different class
@@ -2003,10 +2221,13 @@ class ChatsProvider {
 		// keeps the logo: it is open, in the side panel or somewhere else.
 		item.iconPath = live ? this.icon : new vscode.ThemeIcon('history');
 		item.contextValue = 'closedClaudeChat';
-		item.description = [formatAge(data.lastActivity), live ? 'open elsewhere' : 'closed', formatCost(data.cost)].join(' · ');
-		item.tooltip = live
-			? `${data.title} — running without a tab in this window (the side panel, another window or a terminal). Click to open it here in a tab; a chat in Claude Code's side panel opens there.`
-			: `${data.title} — closed. Click to reopen this session in a tab.`;
+		const where = inSidePanel ? 'in side panel' : live ? 'open elsewhere' : 'closed';
+		item.description = [formatAge(data.lastActivity), where, formatCost(data.cost)].join(' · ');
+		item.tooltip = inSidePanel
+			? `${data.title} — in Claude Code's side panel. Click to show it there. Right-click → Open in Middle moves it into a tab once another chat has taken the side panel.`
+			: live
+				? `${data.title} — running without a tab in this window (another window, a terminal or Claude Code's own side panel). Click to open it here in a tab; a chat in Claude Code's side panel opens there.`
+				: `${data.title} — closed. Click to reopen this session in a tab.`;
 		item.command = {
 			command: 'openEditorsTools.reopenClaudeSession',
 			title: 'Reopen session',
@@ -2391,6 +2612,7 @@ function register(context) {
 	firstRun(context);
 	gatherOnce(context);
 	const index = new TranscriptIndex();
+	transcriptIndex = index;
 	// One channel for everything this extension does that can fail quietly:
 	// usage fetches, webview resolution, layout moves. Opened from
 	// "Agent View: Show Log".
@@ -2398,6 +2620,7 @@ function register(context) {
 	const log = (message) => output.appendLine(`${new Date().toISOString().slice(11, 19)}  ${message}`);
 	// Let the free-function Codex commands trace the sidebar route they open.
 	codexLog = log;
+	placementLog = log;
 	log(`activated on ${process.platform}, remote=${vscode.env.remoteName || 'local'}`);
 
 	if (context.globalState.get('openEditorsTools.restyle')) {
@@ -2590,6 +2813,7 @@ function register(context) {
 		// Right-click on any chat row: the same two places for Claude and Codex.
 		vscode.commands.registerCommand('openEditorsTools.openChatInMiddle', async (item) => {
 			const target = placementTarget(item);
+			placementLog(`middle: ${item && item.contextValue} ${item && item.id} -> ${target ? target.kind : 'ignored'}, command=${item && item.command && item.command.command}`);
 			if (!target) return;
 			// A row with a tab (its click is focusChat): move that tab.
 			const tabAt = item.command && item.command.command === 'openEditorsTools.focusChat' ? item.command.arguments : null;
@@ -2606,6 +2830,16 @@ function register(context) {
 			// A side-panel move in flight has the setting flipped; reading it
 			// now would make the flip look like the user's preference.
 			await sidePanelMoves;
+			// A chat Agent View put in the side panel: Claude Code shows it
+			// there whenever it is opened, until its process ends. The chat
+			// the side panel shows now cannot be freed; an earlier one can.
+			if (sidePanelChats.includes(target.sessionId)) {
+				if (target.sessionId === sidePanelCurrent() && liveSessionRecord(target.sessionId)) {
+					vscode.window.showInformationMessage('Claude Code\'s side panel shows this chat and keeps showing it until another chat takes its place. Right-click another chat → Open in Side Panel, then open this one in the middle.');
+					return;
+				}
+				if (target.sessionId !== sidePanelCurrent() && !(await releaseSidePanelChat(target.sessionId, true))) return;
+			}
 			const column = claudeColumn();
 			if (column !== null) await focusGroup(column);
 			const tabsBefore = claudeTabs().length;
@@ -2636,6 +2870,7 @@ function register(context) {
 		}),
 		vscode.commands.registerCommand('openEditorsTools.openChatInSidePanel', async (item) => {
 			const target = placementTarget(item);
+			placementLog(`side panel: ${item && item.contextValue} ${item && item.id} -> ${target ? target.kind : 'ignored'}`);
 			if (!target) return;
 			if (target.kind === 'codex') {
 				if (requireCodex()) await openCodexInSidebar(target.conversationId);
@@ -2729,6 +2964,8 @@ function register(context) {
 			if (picked) await vscode.commands.executeCommand('openEditorsTools.reopenClaudeSession', picked.sessionId);
 		}),
 		vscode.commands.registerCommand('openEditorsTools.reopenClaudeSession', async (sessionId) => {
+			// A click on a chat the side panel holds shows it there again.
+			if (sidePanelChats.includes(sessionId) && liveSessionRecord(sessionId)) noteSidePanelChat(sessionId);
 			try {
 				await vscode.commands.executeCommand('claude-vscode.editor.open', sessionId);
 			} catch (err) {
@@ -2896,6 +3133,7 @@ module.exports = {
 	_internal: {
 		readTranscript, currentModelOf, claudeDefaultModel, pickerModelIds, codexInWindow, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
+		liveSessionRecord, endClaudeProcess, processTools, sidePanelChats,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,
 		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,

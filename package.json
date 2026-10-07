@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.15.4",
+  "version": "0.15.5",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -80,6 +80,11 @@
           "type": "boolean",
           "default": true,
           "description": "Show a spinner row under a chat for each background shell, agent, workflow or monitor it is still waiting on."
+        },
+        "openEditorsTools.chats.releaseSidePanelChats": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When one chat takes Claude Code's side panel, end the process of each chat it displaced that sits between turns. Claude Code keeps showing a chat in the side panel for as long as its process runs, so a displaced chat could not open in the middle until then. A chat in the middle of a turn is never ended without asking. The chat's transcript stays; opening it again resumes it."
         },
         "openEditorsTools.chats.showCrossProviderSubagents": {
           "type": "boolean",
