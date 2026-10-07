@@ -1428,9 +1428,16 @@ async function newCodexInTab() {
 	// panel opened.
 	const codexCol = codexColumn();
 	const claudeCol = claudeColumn();
+	const side = sideColumnIndex();
+	// The column right of the Claude column, unless that is the side column.
+	const right = claudeCol === null ? -1
+		: vscode.window.tabGroups.all.findIndex((g, i) => columnPosition(i) === columnPosition(claudeCol) + 1);
+	// No column right of the Claude column: the agent goes into the Claude
+	// column and one step right, which makes the Codex column.
+	const makeRight = codexCol === null && claudeCol !== null && right === -1;
 	const targetIndex = codexCol !== null ? codexCol
-		: claudeCol !== null ? claudeCol + 1
-		: null;
+		: right !== -1 && right !== side ? right
+		: claudeCol;
 	const before = new Set(codexTabs().map((t) => t.tab));
 	await vscode.commands.executeCommand('chatgpt.newCodexPanel');
 	if (targetIndex === null) return;
@@ -1443,16 +1450,13 @@ async function newCodexInTab() {
 		await new Promise((r) => setTimeout(r, 150));
 		fresh = codexTabs().find((t) => !before.has(t.tab)) || null;
 	}
-	if (!fresh || fresh.groupIndex === targetIndex) return;
+	if (!fresh) return;
+	if (fresh.groupIndex === targetIndex && !makeRight) return;
 
-	// Activate it where it is, then move it by group distance.
+	// Activate it where it is, then move it into the target column.
 	await vscode.commands.executeCommand('openEditorsTools.focusChat', fresh.groupIndex, fresh.tabIndex);
-	const distance = Math.abs(fresh.groupIndex - targetIndex);
-	await vscode.commands.executeCommand('moveActiveEditor', {
-		to: fresh.groupIndex > targetIndex ? 'left' : 'right',
-		by: 'group',
-		value: distance,
-	});
+	if (fresh.groupIndex !== targetIndex) await moveActiveEditorToGroup(targetIndex);
+	if (makeRight) await vscode.commands.executeCommand('moveActiveEditor', { to: 'right', by: 'group' });
 }
 
 // Which surface a Codex thread opens on: navigate the existing Codex sidebar
@@ -1491,19 +1495,31 @@ async function openCodexInSidebar(conversationId) {
 // Claude column (ViewColumn is 1-based, so Claude group index N is column
 // N + 2), else wherever the host puts it.
 async function openCodexInEditor(conversationId) {
+	await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE, codexViewColumn());
+}
+
+// Where a Codex editor tab opens: the Codex column, else the column right of
+// the Claude column (a new one when there is none), never the side column;
+// with the side column next to the Claude column, the Claude column itself.
+function codexViewColumn() {
 	const codexCol = codexColumn();
+	if (codexCol !== null) return columnPosition(codexCol);
 	const claudeCol = claudeColumn();
-	const viewColumn = codexCol !== null
-		? vscode.window.tabGroups.all[codexCol].viewColumn
-		: claudeCol !== null ? claudeCol + 2
-		: undefined;
-	await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE, viewColumn);
+	if (claudeCol === null) return undefined;
+	const side = sideColumnIndex();
+	const next = columnPosition(claudeCol) + 1;
+	return side !== null && columnPosition(side) === next ? columnPosition(claudeCol) : next;
 }
 
 // ── Right-click placement ──────────────────────────────────────────────────
-// Every chat row offers Open in Middle (a tab in the Claude column) and Open
-// in Side Panel (the secondary side bar, which hosts both Claude Code's and
-// Codex's sidebar views).
+// Every chat row offers Open in Middle and Open in Side Panel. For a Codex
+// chat the side panel is Codex's own sidebar view. For a Claude chat it is an
+// editor column at the right edge, the side column. Claude Code 2.1.289
+// cannot hand a running process between its own side panel and a tab: a tab
+// opened on a chat its side panel holds only reveals the side panel, or
+// starts a second process after asking. A tab moved between editor columns
+// keeps its webview and its process. So every Claude move is a tab move, and
+// a running turn, its background shells and its monitors keep going.
 
 // A Codex thread as a tab in the Claude column, the middle of the
 // three-column layout. openCodexInEditor targets the Codex column.
@@ -1513,49 +1529,141 @@ async function openCodexInMiddle(conversationId) {
 	await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE, viewColumn);
 }
 
-// A Claude session in Claude Code's own side-bar view. Claude Code routes a
-// session there only when the open is programmatic with
-// 'honor-preferred-location', claudeCode.preferredLocation is "sidebar", and
-// no tab holds the session (its target decider, read in 2.1.289). The setting
-// is flipped for that one call and put back, so the user's choice for new
-// chats stays. The flip comes before the tab closes: a settings write that
-// fails then leaves the chat where it was. A chat mid-turn asks before its
-// turn is cut off. Moves run one at a time; two overlapping moves would
-// restore the setting under each other. Returns true when the open was sent.
+// Moves that rewrite claudeCode.preferredLocation or end a process run one
+// at a time; two overlapping ones would restore the setting under each other.
 let sidePanelMoves = Promise.resolve();
-function openClaudeInSidePanel(sessionId, hosted) {
-	const run = sidePanelMoves.then(() => moveClaudeToSidePanel(sessionId, hosted));
-	sidePanelMoves = run.catch(() => {});
-	return run;
-}
-
-// The Claude sessions Agent View put in Claude Code's side panel, oldest
-// first. Every one keeps a live process there, and Claude Code answers each
-// later open of such a session (a click in the list, the history picker, Open
-// in Middle) by showing it in the side panel again. Ending that process is
-// the only release Claude Code leaves, so a displaced chat that sits between
-// turns gives its process up.
-const sidePanelChats = [];
-// The one the side panel shows, when Agent View knows it: set when Agent View
-// places or re-shows a chat there, cleared when the side panel switches to a
-// fresh chat or the shown chat leaves. Not the list's last entry: after a
-// fresh chat, the last entry is an earlier displaced chat, and treating it as
-// shown would replace whatever the user now works on in the side panel.
-let sidePanelShown = null;
 let placementLog = () => {};
 let transcriptIndex = null;
-function forgetSidePanelChat(sessionId) {
-	const i = sidePanelChats.indexOf(sessionId);
-	if (i !== -1) sidePanelChats.splice(i, 1);
-	if (sidePanelShown === sessionId) sidePanelShown = null;
-}
-function noteSidePanelChat(sessionId) {
-	forgetSidePanelChat(sessionId);
-	sidePanelChats.push(sessionId);
-	sidePanelShown = sessionId;
-}
-function sidePanelCurrent() { return sidePanelShown; }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The Claude sessions whose tabs live in the side column, kept per workspace
+// so the column is known again after a window reload.
+const SIDE_COLUMN_KEY = 'openEditorsTools.sideColumnSessions';
+// A new side column takes this share of the editor width, like a side panel.
+const SIDE_COLUMN_SHARE = 0.3;
+const sideColumnSessions = new Set();
+let sideColumnStore = null;
+function loadSideColumn(store) {
+	sideColumnStore = store || null;
+	sideColumnSessions.clear();
+	try {
+		const saved = store ? store.get(SIDE_COLUMN_KEY, []) : [];
+		for (const id of Array.isArray(saved) ? saved : []) if (typeof id === 'string') sideColumnSessions.add(id);
+	} catch (_) { /* nothing saved */ }
+}
+function saveSideColumn() {
+	if (!sideColumnStore) return;
+	Promise.resolve(sideColumnStore.update(SIDE_COLUMN_KEY, [...sideColumnSessions])).catch(() => {});
+}
+
+// Which session a Claude tab shows: the last render's answer, else the one
+// transcript its label names. A tab that moved is a new Tab object, so the
+// render map can be one move behind.
+function ownerOfTab(tab) {
+	const known = lastTabOwners.get(tab);
+	if (known) return known;
+	if (!transcriptIndex) return null;
+	const key = titleKey(tab.label);
+	if (!key || /^claude code$/.test(key)) return null;
+	let owner = null;
+	for (const entry of transcriptIndex.byFile.values()) {
+		if (!entryCarries(entry, key)) continue;
+		if (owner && owner !== entry.sessionId) return null;
+		owner = entry.sessionId;
+	}
+	return owner;
+}
+function isSideTab(t) {
+	const sid = ownerOfTab(t.tab);
+	return !!sid && sideColumnSessions.has(sid);
+}
+// The right-most editor group, by column.
+function rightmostGroup() {
+	const all = vscode.window.tabGroups.all;
+	let best = -1;
+	for (let i = 0; i < all.length; i++) if (best === -1 || columnPosition(i) > columnPosition(best)) best = i;
+	return best === -1 ? null : best;
+}
+// The side column's group index, or null. It lives at the right edge: the
+// right-most group, when that group holds a side chat and is not the only
+// group (a lone group is the middle, whatever it holds).
+function sideColumnIndex() {
+	if (vscode.window.tabGroups.all.length < 2) return null;
+	const right = rightmostGroup();
+	return claudeTabs().some((t) => t.groupIndex === right && isSideTab(t)) ? right : null;
+}
+// Moves and layouts in flight: the side list is not pruned meanwhile, since a
+// tab on its way still sits in its old group.
+let placementsInFlight = 0;
+async function whilePlacing(fn) {
+	placementsInFlight++;
+	try { return await fn(); } finally { placementsInFlight--; }
+}
+// Where a session's tab sits now, or null.
+function sessionTab(sessionId) {
+	return claudeTabs().find((t) => ownerOfTab(t.tab) === sessionId) || null;
+}
+// Focus a session's tab and confirm it is the active one: a row's saved
+// indices can be stale, and a group past the fifth has no focus command.
+async function focusSessionTab(sessionId) {
+	const t = sessionTab(sessionId);
+	if (!t) return null;
+	await vscode.commands.executeCommand('openEditorsTools.focusChat', t.groupIndex, t.tabIndex);
+	const active = activeClaudeTab();
+	if (!active || ownerOfTab(active.tab) !== sessionId) {
+		placementLog(`placement: could not focus the tab of ${sessionId}`);
+		return null;
+	}
+	return active;
+}
+
+// A new side column narrows to a side panel's width. Only a flat row of
+// columns is resized; a nested layout is left as the user built it.
+async function sizeSideColumn() {
+	try {
+		const layout = await vscode.commands.executeCommand('vscode.getEditorLayout');
+		if (!layout || layout.orientation !== 0 || !Array.isArray(layout.groups) || layout.groups.length < 2) return;
+		if (layout.groups.some((g) => Array.isArray(g.groups) && g.groups.length)) return;
+		const sizes = layout.groups.map((g) => Number(g.size) > 0 ? Number(g.size) : 1);
+		const total = sizes.reduce((a, b) => a + b, 0);
+		const last = sizes.length - 1;
+		const rest = total - sizes[last];
+		const groups = sizes.map((size, i) => ({ size: i === last ? total * SIDE_COLUMN_SHARE : (size / rest) * total * (1 - SIDE_COLUMN_SHARE) }));
+		await vscode.commands.executeCommand('vscode.setEditorLayout', { orientation: 0, groups });
+	} catch (err) {
+		placementLog(`side column: resize skipped — ${err.message}`);
+	}
+}
+
+// A Claude tab moves into the side column: the existing one, or a new editor
+// group at the right edge. The tab moves, so the chat keeps running.
+function moveTabToSideColumn(sessionId) {
+	return whilePlacing(async () => {
+		const side = sideColumnIndex();
+		const wasMember = sideColumnSessions.has(sessionId);
+		const tab = await focusSessionTab(sessionId);
+		if (!tab) return false;
+		if (side !== null && tab.groupIndex === side && wasMember) return true;
+		sideColumnSessions.add(sessionId);
+		try {
+			if (side !== null) {
+				if (tab.groupIndex !== side) await moveActiveEditorToGroup(side);
+			} else {
+				// No side column yet. Into the right-most group, then one
+				// further right, which makes the new group.
+				if (tab.groupIndex !== rightmostGroup()) await vscode.commands.executeCommand('moveActiveEditor', { to: 'last', by: 'group' });
+				await vscode.commands.executeCommand('moveActiveEditor', { to: 'right', by: 'group' });
+				await sizeSideColumn();
+				placementLog(`side column: new column for ${sessionId}`);
+			}
+		} catch (err) {
+			if (!wasMember) sideColumnSessions.delete(sessionId);
+			throw err;
+		}
+		saveSideColumn();
+		return true;
+	});
+}
 
 // A chat that sits between turns can give its process up; one that works on a
 // turn, or still owns a background shell, agent or monitor, cannot (those die
@@ -1566,114 +1674,13 @@ function chatIsBusy(sessionId, rec) {
 	return liveBackgroundTasks(entry, rec.startedAt).length > 0;
 }
 
-// True once Claude Code has let the session go. A busy chat is left alone,
-// or asked about when the user moves that very chat.
-async function releaseSidePanelChat(sessionId, askIfBusy) {
-	const rec = liveSessionRecord(sessionId);
-	if (rec && chatIsBusy(sessionId, rec)) {
-		if (!askIfBusy) return false;
-		const pick = await vscode.window.showWarningMessage(
-			'This chat is working, or still runs background work. Moving it out of the side panel stops all of it.',
-			{ modal: true }, 'Move anyway');
-		if (pick !== 'Move anyway') return false;
-	}
-	const result = await endClaudeProcess(sessionId);
-	placementLog(`side panel: release ${sessionId} -> ${result}`);
-	if (result === 'refused' || result === 'unknown') {
-		if (askIfBusy) vscode.window.showInformationMessage('Agent View could not tell for certain which process runs this chat, so it left it running. Close the chat in the side panel, or reload the window, to free it.');
-		return false;
-	}
-	forgetSidePanelChat(sessionId);
-	// Claude Code closes the channel when its query loop notices the exit.
-	if (result === 'ended') await sleep(600);
-	return true;
-}
-
-// After another chat takes the side panel, the chats it displaced end their
-// processes while they sit between turns. The new chat has to be running
-// first: until then the displaced one is still on screen. A later placement
-// makes this one stale, and the chat on screen is never ended.
-async function releaseDisplacedChats(newId, since, newIdWasLive) {
-	if (!settingOn('chats.releaseSidePanelChats')) return;
-	if (newIdWasLive) {
-		await sleep(1500);
-	} else {
-		let started = false;
-		for (let i = 0; i < 40 && !started; i++) {
-			const rec = liveSessionRecord(newId);
-			started = !!rec && rec.startedAt >= since;
-			if (!started) await sleep(250);
-		}
-		if (!started) { placementLog(`side panel: ${newId} did not start, displaced chats stay`); return; }
-	}
-	for (const id of [...sidePanelChats]) {
-		if (sidePanelCurrent() !== newId) return;
-		if (id !== newId) await releaseSidePanelChat(id, false);
-	}
-}
-async function moveClaudeToSidePanel(sessionId, hosted) {
-	const cfg = () => vscode.workspace.getConfiguration('claudeCode');
-	const inspected = cfg().inspect('preferredLocation') || {};
-	// A workspace value outranks the global flip: refuse before closing a tab.
-	for (const v of [inspected.workspaceValue, inspected.workspaceFolderValue]) {
-		if (v !== undefined && v !== 'sidebar') {
-			vscode.window.showWarningMessage('A workspace setting claudeCode.preferredLocation keeps Claude Code chats out of the side panel. Remove it to use Open in Side Panel.');
-			return false;
-		}
-	}
-	if (hosted && hosted.running) {
-		const pick = await vscode.window.showWarningMessage(
-			'This chat is working on a turn. Moving it to the side panel closes its tab and stops that turn.',
-			{ modal: true }, 'Move anyway');
-		if (pick !== 'Move anyway') return false;
-	}
-	const prev = inspected.globalValue;
-	const flip = cfg().get('preferredLocation') !== 'sidebar';
-	// A chat with no tab keeps its running process into the side panel.
-	const wasLive = !hosted && !!liveSessionRecord(sessionId);
-	const since = Date.now() - 1000;
-	if (flip) await cfg().update('preferredLocation', 'sidebar', vscode.ConfigurationTarget.Global);
-	try {
-		if (hosted) {
-			await vscode.window.tabGroups.close(hosted.tab, true);
-			// Claude Code drops the session from its panel registry when the
-			// webview is disposed; a tab still registered routes back to "panel".
-			await new Promise((r) => setTimeout(r, 200));
-		}
-		const tabsBefore = claudeTabs().length;
-		try {
-			await vscode.commands.executeCommand('claude-vscode.editor.open', sessionId, undefined, undefined, undefined, undefined,
-				{ programmatic: 'honor-preferred-location' });
-		} catch (err) {
-			// The tab is gone: give the chat a tab back before reporting.
-			if (hosted) await Promise.resolve(vscode.commands.executeCommand('claude-vscode.editor.open', sessionId)).catch(() => {});
-			throw err;
-		}
-		// Claude Code opens a tab when it does not route the session to the
-		// side panel; such a chat is not held there.
-		let tab = false;
-		for (let i = 0; i < 5 && !tab; i++) {
-			if (i) await sleep(100);
-			tab = claudeTabs().length > tabsBefore;
-		}
-		if (tab) {
-			placementLog(`side panel: ${sessionId} opened as a tab, not tracked`);
-			return true;
-		}
-		noteSidePanelChat(sessionId);
-		placementLog(`side panel: ${sessionId} placed (tab=${hosted ? 'closed' : 'none'}, tracked=${sidePanelChats.length})`);
-		releaseDisplacedChats(sessionId, since, wasLive).catch((err) => placementLog(`side panel: release failed — ${err.message}`));
-		return true;
-	} finally {
-		if (flip) await cfg().update('preferredLocation', prev, vscode.ConfigurationTarget.Global);
-	}
-}
-
 // Claude Code's side panel switches to a fresh, empty chat: the one way to
 // make it stop showing a session (activating it with no session id starts a
-// new one, read in 2.1.289). Same one-call setting flip as
-// moveClaudeToSidePanel. False when a workspace setting pins chats out of the
-// side panel, or Claude Code refused.
+// new one, read in 2.1.289). Claude Code routes an open there only when the
+// open is programmatic with 'honor-preferred-location' and
+// claudeCode.preferredLocation is "sidebar", so the setting is flipped for
+// that one call and put back. False when a workspace setting pins chats out
+// of the side panel, or Claude Code refused.
 async function showFreshChatInSidePanel() {
 	const cfg = () => vscode.workspace.getConfiguration('claudeCode');
 	const inspected = cfg().inspect('preferredLocation') || {};
@@ -1686,7 +1693,6 @@ async function showFreshChatInSidePanel() {
 	try {
 		await vscode.commands.executeCommand('claude-vscode.editor.open', undefined, undefined, undefined, undefined, undefined,
 			{ programmatic: 'honor-preferred-location' });
-		sidePanelShown = null;
 		if (claudeState.sidePanelSession) claudeState.sidePanelSession = null;
 		return true;
 	} catch (err) {
@@ -1700,6 +1706,12 @@ async function showFreshChatInSidePanel() {
 // A tab in this window shows the session: its label carries the session's
 // title. Read live from the tab strip, not from the last render.
 let lastTabOwners = new Map();
+function activeClaudeTab() {
+	const groups = vscode.window.tabGroups.all;
+	const g = groups.findIndex((x) => x.isActive);
+	if (g === -1) return null;
+	return claudeTabs().find((t) => t.groupIndex === g && groups[g].activeTab === t.tab) || null;
+}
 function tabShowsSession(sessionId) {
 	const entry = transcriptIndex && transcriptIndex.entryFor(sessionId);
 	if (!entry || !entry.title) return false;
@@ -1714,9 +1726,17 @@ function tabShowsSession(sessionId) {
 // title), 'no-tab' when Claude Code put it elsewhere (its side panel),
 // 'error' when the open threw. A user who picked "sidebar" for new chats
 // keeps it: after a plain open Claude Code records "panel", unawaited.
-async function openClaudeInMiddleTab(sessionId) {
+// `keepInSide`: the caller moves the tab into the side column next, so no
+// middle is split off for it.
+async function openClaudeInMiddleTab(sessionId, { keepInSide = false } = {}) {
 	const column = claudeColumn();
+	const side = sideColumnIndex();
+	// No middle yet (every Claude tab in the side column): the tab opens in
+	// the side column, and once it is there it splits off into a new middle.
+	// A group made ahead of the open would stay behind, empty, if it failed.
+	const splitOff = column === null && side !== null && !keepInSide;
 	if (column !== null) await focusGroup(column);
+	else if (side !== null) await focusGroup(side);
 	const tabsBefore = claudeTabs().length;
 	const location = () => (vscode.workspace.getConfiguration('claudeCode').inspect('preferredLocation') || {}).globalValue;
 	const prevLocation = location();
@@ -1735,21 +1755,37 @@ async function openClaudeInMiddleTab(sessionId) {
 	// Claude Code creates the tab inside the open itself; three seconds also
 	// cover a slow window.
 	await settle(tabCame, 12);
-	return tabCame() ? 'tab' : 'no-tab';
+	if (!tabCame()) return 'no-tab';
+	if (splitOff) await splitOffMiddle(sessionId);
+	return 'tab';
 }
 
-// Open in Middle for a chat Claude Code's side panel holds. Claude Code
-// answers every open of such a chat by showing it in the side panel, for as
-// long as the side panel shows it or keeps a process on it. So: end the
-// chat's process (its transcript stays), open it as a tab, and check that a
-// tab came. When the side panel showed the chat, Claude Code revealed and
+// A Claude tab in the side column, not a member of it, becomes the middle: a
+// new group directly left of the side column (the neighbour there may be the
+// Codex column), then the side column back to a side panel's width.
+async function splitOffMiddle(sessionId) {
+	const active = activeClaudeTab();
+	if (active && !ownerOfTab(active.tab)) lastTabOwners.set(active.tab, sessionId);
+	const tab = await focusSessionTab(sessionId);
+	if (!tab || tab.groupIndex !== sideColumnIndex()) return;
+	await vscode.commands.executeCommand('workbench.action.newGroupLeft');
+	if (!(await focusSessionTab(sessionId))) return;
+	await vscode.commands.executeCommand('moveActiveEditor', { to: 'left', by: 'group' });
+	await sizeSideColumn();
+}
+
+// A chat in Claude Code's own side panel (put there through Claude Code's
+// UI) moving to a tab. Claude Code answers every open of such a chat by
+// showing it in the side panel, for as long as the side panel shows it or
+// keeps a process on it, and it has no hand-over. So, as the one way out: end
+// the chat's process (its transcript stays), open it as a tab, and check that
+// a tab came. When the side panel showed the chat, Claude Code revealed and
 // resumed it there instead; the second round switches the side panel to a
-// fresh chat (now certain to replace this one) and tries again. Only a chat
-// Agent View itself last placed in the side panel gets the fresh chat in the
-// first round: Claude Code's saved state can be a minute old, and a fresh
-// chat in place of whatever the side panel shows now would discard its
+// fresh chat (now certain to replace this one) and tries again. The first
+// round never does: Claude Code's saved state can be a minute old, and a
+// fresh chat in place of whatever the side panel shows now would discard its
 // draft. A chat at work, or one that still runs background work, asks first,
-// and is checked again right before its process ends.
+// and is checked again right before each step that would stop it.
 const middleMoves = new Set();
 function moveOutOfSidePanel(sessionId) {
 	const run = sidePanelMoves.then(() => moveOutOfSidePanelNow(sessionId));
@@ -1767,13 +1803,12 @@ async function moveOutOfSidePanelNow(sessionId) {
 		consented = pick === 'Move anyway';
 		return consented;
 	};
-	const shownByUs = sidePanelCurrent() === sessionId;
 	for (let round = 0; round < 2; round++) {
 		// Round 2 ends the process Claude Code resumed while revealing the
 		// chat; a turn typed into it since is asked about anew.
 		if (round > 0) consented = false;
 		if (!(await askIfBusy())) return false;
-		if (shownByUs || round > 0) {
+		if (round > 0) {
 			if (!(await showFreshChatInSidePanel())) break;
 			await sleep(700);
 			if (!(await askIfBusy())) return false;
@@ -1786,7 +1821,6 @@ async function moveOutOfSidePanelNow(sessionId) {
 				: 'Agent View could not tell for certain which process runs this chat, so it left it running. Close the chat in the side panel, or reload the window, to free it.');
 			return false;
 		}
-		forgetSidePanelChat(sessionId);
 		if (claudeState.sidePanelSession === sessionId) claudeState.sidePanelSession = null;
 		if (result === 'ended') await sleep(600);
 		const opened = await openClaudeInMiddleTab(sessionId);
@@ -1798,15 +1832,35 @@ async function moveOutOfSidePanelNow(sessionId) {
 }
 
 // A chat tab that is already open moves into the Claude column, so no second
-// editor opens on the same thread. Same move as newCodexInTab.
-async function moveTabToClaudeColumn(groupIndex, tabIndex) {
-	await vscode.commands.executeCommand('openEditorsTools.focusChat', groupIndex, tabIndex);
-	const target = claudeColumn();
-	if (target === null || target === groupIndex) return;
-	await vscode.commands.executeCommand('moveActiveEditor', {
-		to: groupIndex > target ? 'left' : 'right',
-		by: 'group',
-		value: Math.abs(groupIndex - target),
+// editor opens on the same thread. Same move as newCodexInTab. A tab leaving
+// the side column leaves its list; with every Claude tab in the side column,
+// the middle is a new group left of it.
+async function moveTabToClaudeColumn(groupIndex, tabIndex, sessionId = null) {
+	return whilePlacing(async () => {
+		const target = claudeColumn();
+		let tab = { groupIndex, tabIndex };
+		if (sessionId) {
+			tab = await focusSessionTab(sessionId);
+			if (!tab) return;
+		} else {
+			await vscode.commands.executeCommand('openEditorsTools.focusChat', groupIndex, tabIndex);
+		}
+		const fromSide = !!sessionId && sideColumnSessions.delete(sessionId);
+		if (fromSide) saveSideColumn();
+		if (target === tab.groupIndex) return;
+		if (target === null) {
+			// Every Claude tab sat in the side column: the middle is a new,
+			// empty group directly left of it (the neighbour there may be the
+			// Codex column).
+			if (fromSide && sessionId) {
+				await vscode.commands.executeCommand('workbench.action.newGroupLeft');
+				if (!(await focusSessionTab(sessionId))) return;
+				await vscode.commands.executeCommand('moveActiveEditor', { to: 'left', by: 'group' });
+				if (vscode.window.tabGroups.all.length > 1 && sideColumnIndex() !== null) await sizeSideColumn();
+			}
+			return;
+		}
+		await moveActiveEditorToGroup(target);
 	});
 }
 
@@ -1958,7 +2012,12 @@ function columnOf(tabs) {
 	return active !== undefined ? active : tied[0];
 }
 
-function claudeColumn() { return columnOf(claudeTabs()); }
+// The middle: where most Claude tabs sit, side-column tabs not counted. Null
+// when every Claude tab sits in the side column; a group left of it can be
+// the Codex column, so no guess is made.
+function claudeColumn() {
+	return columnOf(claudeTabs().filter((t) => !isSideTab(t)));
+}
 
 // Conversation tabs only: the "New Codex Agent" home page has no conversation
 // id and says nothing about where conversations live.
@@ -1974,9 +2033,28 @@ const FOCUS_GROUP_COMMANDS = [
 	'workbench.action.focusFifthEditorGroup',
 ];
 
+// Indices here are tabGroups.all indices, which follow creation order. The
+// focus-Nth-group commands and moveActiveEditor's 'position' count columns
+// left to right; a group's viewColumn is that count. They differ once a group
+// was added to the left of another.
+function columnPosition(index) {
+	const g = vscode.window.tabGroups.all[index];
+	return g && g.viewColumn ? g.viewColumn : index + 1;
+}
 async function focusGroup(index) {
-	const cmd = FOCUS_GROUP_COMMANDS[index];
+	const cmd = FOCUS_GROUP_COMMANDS[columnPosition(index) - 1];
 	if (cmd) await vscode.commands.executeCommand(cmd);
+}
+// Focus a column by its left-to-right position (1-based).
+async function focusColumn(pos) {
+	const cmd = FOCUS_GROUP_COMMANDS[pos - 1];
+	if (cmd) await vscode.commands.executeCommand(cmd);
+}
+// The active editor moves into the group at this index. moveActiveEditor's
+// 'left' and 'right' go one group only and ignore a value (read in VS Code's
+// source); 'position' takes the absolute column.
+async function moveActiveEditorToGroup(index) {
+	await vscode.commands.executeCommand('moveActiveEditor', { to: 'position', by: 'group', value: columnPosition(index) });
 }
 
 // There is no API to activate an arbitrary tab, and a webview tab has no URI
@@ -2272,7 +2350,7 @@ class ChatsProvider {
 		// the ones Agent View put there, and the one Claude Code's saved state
 		// says its side panel shows.
 		const statedSide = claudeState.sidePanelSession && live.has(claudeState.sidePanelSession) ? claudeState.sidePanelSession : null;
-		const sideHeld = new Set(sidePanelChats);
+		const sideHeld = new Set();
 		if (statedSide) sideHeld.add(statedSide);
 		const DEFAULT_TAB_LABEL = /^claude code$/i;
 
@@ -2431,14 +2509,26 @@ class ChatsProvider {
 		// claude-vscode.editor.open takes a session id (the panel registry is
 		// keyed on it), which is how the extension's own sessions list opens
 		// them.
-		// A chat that has a tab again, or whose process is gone and is not the
-		// one on screen, is no longer held by the side panel.
-		for (const r of rows) if (r.kind === 'claude' && r.data) forgetSidePanelChat(r.data.sessionId);
-		for (const id of [...sidePanelChats]) if (id !== sidePanelCurrent() && !live.has(id)) forgetSidePanelChat(id);
+		// The side column follows its tabs: a chat closed, or dragged out of
+		// the right-edge column by hand, leaves it. Not while a move runs (a
+		// tab on its way still sits in its old group), and not before any tab
+		// exists (a window still restoring).
+		const claudeRows = rows.filter((r) => r.kind === 'claude' && r.data);
+		lastTabOwners = new Map(claudeRows.map((r) => [r.tab, r.data.sessionId]));
+		if (!placementsInFlight && claudeTabs().length) {
+			const sideIdx = sideColumnIndex();
+			let sideChanged = false;
+			for (const sid of [...sideColumnSessions]) {
+				const r = claudeRows.find((x) => x.data.sessionId === sid);
+				if (!r || r.groupIndex !== sideIdx) { sideColumnSessions.delete(sid); sideChanged = true; }
+			}
+			if (sideChanged) saveSideColumn();
+		}
+		for (const r of claudeRows) r.inSide = sideColumnSessions.has(r.data.sessionId);
 		// The session Claude Code's saved state names for its side panel labels
-		// a row and keeps tabs off it. It never joins sidePanelChats: that list
-		// decides which processes end, and a saved state can be old (the same
-		// session resumed in a terminal is live too).
+		// a row and keeps tabs off it. Nothing ends a process because of it: a
+		// saved state can be old (the same session resumed in a terminal is
+		// live too).
 
 		const hours = vscode.workspace.getConfiguration('openEditorsTools').get('closedChatHours', 720);
 		if (hours > 0) {
@@ -2571,10 +2661,10 @@ class ChatsProvider {
 		// keeps the logo: it is open, in the side panel or somewhere else.
 		item.iconPath = live ? this.icon : new vscode.ThemeIcon('history');
 		item.contextValue = 'closedClaudeChat';
-		const where = inSidePanel ? 'in side panel' : live ? 'open elsewhere' : 'closed';
+		const where = inSidePanel ? "in Claude's side panel" : live ? 'open elsewhere' : 'closed';
 		item.description = [formatAge(data.lastActivity), where, formatCost(data.cost)].join(' · ');
 		item.tooltip = inSidePanel
-			? `${data.title} — in Claude Code's side panel. Click to show it there. Right-click → Open in Middle moves it into a tab once another chat has taken the side panel.`
+			? `${data.title} — in Claude Code's own side panel. Click to show it there. Right-click → Open in Middle or Open in Side Panel moves it into a tab; Claude Code cannot hand a running chat out of its side panel, so that move restarts the chat's process (its transcript stays).`
 			: live
 				? `${data.title} — running without a tab in this window (another window, a terminal or Claude Code's own side panel). Click to open it here in a tab; a chat in Claude Code's side panel opens there.`
 				: `${data.title} — closed. Click to reopen this session in a tab.`;
@@ -2904,6 +2994,7 @@ class ChatsProvider {
 			worked ? (live ? `⏱ ${worked}` : `${worked} turn`) : formatAge(data.lastActivity),
 			`${formatTokens(data.contextTokens)}/${formatTokens(data.contextLimit)}`,
 			formatCost(totalCost),
+			row.inSide ? 'side panel' : null,
 		].filter(Boolean).join(' · ');
 
 		const billed = data.totals.input + data.totals.output + data.totals.cacheRead
@@ -2988,6 +3079,7 @@ function register(context) {
 	gatherOnce(context);
 	const index = new TranscriptIndex();
 	transcriptIndex = index;
+	loadSideColumn(context.workspaceState);
 	claudeState.configure(
 		context.storageUri ? path.dirname(context.storageUri.fsPath) : null,
 		context.globalStorageUri ? path.dirname(context.globalStorageUri.fsPath) : null);
@@ -3200,7 +3292,13 @@ function register(context) {
 			// A row with a tab (its click is focusChat): move that tab.
 			const tabAt = item.command && item.command.command === 'openEditorsTools.focusChat' ? item.command.arguments : null;
 			if (tabAt) {
-				await moveTabToClaudeColumn(...tabAt);
+				await moveTabToClaudeColumn(...tabAt, target.kind === 'claude' ? target.sessionId : null);
+				provider.refresh();
+				return;
+			}
+			if (target.kind === 'claude' && sessionTab(target.sessionId)) {
+				await moveTabToClaudeColumn(null, null, target.sessionId);
+				provider.refresh();
 				return;
 			}
 			if (target.kind === 'codex') {
@@ -3247,12 +3345,70 @@ function register(context) {
 				if (requireCodex()) await openCodexInSidebar(target.conversationId);
 				return;
 			}
+			const sid = target.sessionId;
+			if (middleMoves.has(sid)) return;
+			middleMoves.add(sid);
 			try {
-				await openClaudeInSidePanel(target.sessionId, provider.claudeTabBySession && provider.claudeTabBySession.get(target.sessionId));
+				// A tab: move it. The chat keeps running.
+				if (sessionTab(sid)) {
+					await moveTabToSideColumn(sid);
+					return;
+				}
+				// A tab the last render saw for this chat, but one a title cannot
+				// tell apart now (moved, sharing its title): Claude Code focuses
+				// the session's own panel on an open, so the active tab is it.
+				if ((provider.claudeTabBySession && provider.claudeTabBySession.has(sid)) || tabShowsSession(sid)) {
+					const entry = transcriptIndex && transcriptIndex.entryFor(sid);
+					const carries = (t) => !!(t && entry && entryCarries(entry, titleKey(t.tab.label)));
+					let before = activeClaudeTab();
+					// The active tab may be the chat already: step off it, so a
+					// focus Claude Code makes on the open is visible.
+					if (carries(before)) {
+						const all = vscode.window.tabGroups.all;
+						if (all[before.groupIndex].tabs.length > 1) await vscode.commands.executeCommand('workbench.action.openEditorAtIndex', before.tabIndex === 0 ? 1 : 0);
+						else { const other = all.findIndex((g, i) => i !== before.groupIndex); if (other !== -1) await focusGroup(other); }
+						before = activeClaudeTab();
+					}
+					await vscode.commands.executeCommand('claude-vscode.editor.open', sid);
+					const after = activeClaudeTab();
+					// Only a tab the open focused, carrying the chat's title. When
+					// Claude Code revealed its own side panel instead, the active
+					// tab did not change and is some other chat.
+					const active = after && (!before || after.tab !== before.tab) && carries(after) ? after : null;
+					if (!active) {
+						vscode.window.showInformationMessage('Agent View could not tell which tab shows this chat. Click the chat\'s tab, then try again.');
+						return;
+					}
+					lastTabOwners.set(active.tab, sid);
+					await moveTabToSideColumn(sid);
+					return;
+				}
+				// No tab. A chat in Claude Code's own side panel needs freeing
+				// first; a closed chat opens as a tab. Either way the tab then
+				// moves into the side column.
+				const { owner } = await claudeProcessOwner(sid);
+				if (owner === 'unknown') {
+					vscode.window.showInformationMessage('Agent View could not inspect the process that runs this chat, so it left it running. Try Open in Side Panel again in a moment.');
+					return;
+				}
+				let opened;
+				if (owner === 'own') opened = (await moveOutOfSidePanel(sid)) ? 'tab' : 'no-tab';
+				else {
+					// A side-panel move in flight has the setting flipped.
+					await sidePanelMoves;
+					opened = await openClaudeInMiddleTab(sid, { keepInSide: true });
+				}
+				if (opened === 'tab') {
+					await moveTabToSideColumn(sid);
+				} else if (opened === 'no-tab' && owner === 'foreign') {
+					vscode.window.showInformationMessage('Claude Code did not open a tab for this chat. It runs outside this window (another window or a terminal); close it there, then try again.');
+				}
 			} catch (err) {
 				vscode.window.showErrorMessage(`Could not open the chat in the side panel — ${err.message}`);
+			} finally {
+				middleMoves.delete(sid);
+				provider.refresh();
 			}
-			provider.refresh();
 		}),
 		// Registered here rather than in extension.js as a plain forward:
 		// claude-vscode.editor.open opens in the ACTIVE group, which is how new
@@ -3335,8 +3491,6 @@ function register(context) {
 			if (picked) await vscode.commands.executeCommand('openEditorsTools.reopenClaudeSession', picked.sessionId);
 		}),
 		vscode.commands.registerCommand('openEditorsTools.reopenClaudeSession', async (sessionId) => {
-			// A click on a chat the side panel holds shows it there again.
-			if (sidePanelChats.includes(sessionId) && liveSessionRecord(sessionId)) noteSidePanelChat(sessionId);
 			try {
 				await vscode.commands.executeCommand('claude-vscode.editor.open', sessionId);
 			} catch (err) {
@@ -3450,33 +3604,42 @@ function register(context) {
 			// Panel to the left with Agent View showing, Explorer sidebar up.
 			await step('arrangeLeft', () => arrangeLeft());
 			await step('explorer', () => vscode.commands.executeCommand('workbench.view.explorer'));
-			// Exactly two side-by-side editor groups. setEditorLayout folds
-			// surplus groups' editors into the survivors; nothing is closed.
+			// Two side-by-side editor groups, three when the side column holds
+			// Claude chats. setEditorLayout folds surplus groups' editors into
+			// the survivors; nothing is closed.
+			const withSide = claudeTabs().some((t) => isSideTab(t));
+			const withCodex = codexTabs().some((t) => t.conversationId);
+			const sidePos = withSide ? (withCodex ? 3 : 2) : 0;
+			placementsInFlight++;
+			try {
 			await step('setEditorLayout', () => vscode.commands.executeCommand('vscode.setEditorLayout', {
 				orientation: 0,
-				groups: [{}, {}],
+				groups: withSide ? (withCodex ? [{ size: 0.45 }, { size: 0.25 }, { size: 0.3 }] : [{ size: 0.7 }, { size: 0.3 }]) : [{}, {}],
 			}));
-			// Claude tabs into group 0, Codex conversation tabs into group 1.
-			// One stray at a time, re-reading tabGroups after every move —
-			// each move renumbers the indices the next one needs. The guard
-			// caps a host that refuses to move a tab.
+			// Claude tabs into column 1, Codex conversation tabs into column 2,
+			// side-column chats into column 3. One stray at a time, re-reading
+			// tabGroups after every move — each move renumbers the groups the
+			// next one needs. The guard caps a host that refuses to move a tab.
 			await step('moveTabs', async () => {
+				const col = (t) => columnPosition(t.groupIndex);
+				const strays = () => claudeTabs().filter((t) => col(t) !== (isSideTab(t) ? sidePos : 1))
+					.concat(codexTabs().filter((t) => t.conversationId && col(t) !== 2));
 				for (let guard = 0; guard < 100; guard++) {
-					const strayClaude = claudeTabs().find((t) => t.groupIndex !== 0);
-					const strayCodex = codexTabs().filter((t) => t.conversationId).find((t) => t.groupIndex !== 1);
-					const stray = strayClaude || strayCodex;
-					if (!stray) break;
-					const target = strayClaude ? 0 : 1;
+					const list = strays();
+					if (!list.length) break;
+					const stray = list[0];
+					const isCodex = stray.conversationId !== undefined;
+					const want = isCodex ? 2 : (isSideTab(stray) ? sidePos : 1);
 					await activateTab(stray.groupIndex, stray.tabIndex);
-					await vscode.commands.executeCommand('moveActiveEditor', {
-						to: stray.groupIndex > target ? 'left' : 'right',
-						by: 'group',
-						value: Math.abs(stray.groupIndex - target),
-					});
+					await vscode.commands.executeCommand('moveActiveEditor', { to: 'position', by: 'group', value: want });
+					// A move that changed nothing (a column that does not exist)
+					// would loop forever.
+					if (strays().length >= list.length) break;
 				}
 			});
-			// Land in the Claude column.
-			await step('focus', () => focusGroup(0));
+			} finally { placementsInFlight--; }
+			// Land in the Claude column, the left-most one.
+			await step('focus', () => focusColumn(1));
 		}),
 		vscode.commands.registerCommand('openEditorsTools.refreshChats', () => {
 			usage.refreshAll();
@@ -3504,7 +3667,7 @@ module.exports = {
 	_internal: {
 		readTranscript, currentModelOf, claudeDefaultModel, pickerModelIds, codexInWindow, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
-		liveSessionRecord, endClaudeProcess, claudeProcessOwner, processTools, sidePanelChats, noteSidePanelChat, sidePanelCurrent, claudeState, ClaudeCodeState, titleMatches,
+		liveSessionRecord, endClaudeProcess, claudeProcessOwner, processTools, sideColumnSessions, sideColumnIndex, claudeColumn, loadSideColumn, codexViewColumn, newCodexInTab, claudeState, ClaudeCodeState, titleMatches,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,
 		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,

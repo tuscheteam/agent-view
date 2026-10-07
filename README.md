@@ -16,7 +16,7 @@ your account's rate-limit windows drawn as bars above them.
 | orange `?` badge | The agent asked a question and is blocked on your answer |
 | green `●` badge | The agent replied and you have not read it yet. Clears when you look at the tab, or when you reply |
 | `⠹` child rows | Subagents working in the last 2 minutes, named by their spawn description, with model, total tokens, age and cost. Codex subagents appear the same way, named by the nickname Codex gave them |
-| `🕘` rows | Chats whose tab was closed; click to reopen the session. A chat still running without a tab here reads "open elsewhere", or "in side panel" when Claude Code's side panel shows it |
+| `🕘` rows | Chats whose tab was closed; click to reopen the session. A chat still running without a tab here reads "open elsewhere", or "in Claude's side panel" when Claude Code's own side panel shows it. Tabs in the side column read "side panel" |
 | "N tabs without a transcript" | Open Claude tabs with nothing to list: a new chat with no message sent yet, or a chat whose transcript is no longer on this machine (Claude Code deletes chats idle longer than `cleanupPeriodDays`, 30 days unless set). Click to show or hide them |
 
 Hover any row for the full breakdown (model, turns, cache reads/writes, reset times).
@@ -56,34 +56,23 @@ open — including a Codex view dragged into the editor area — or when no Code
 editor tab exists yet, and opens an editor tab otherwise.
 
 Right-click any Claude or Codex chat for **Open in Middle** and **Open in Side
-Panel**. Open in Middle puts the chat in a tab in the Claude column. Open in
-Side Panel moves it to the secondary side bar: a Codex chat loads into the Codex
-sidebar, and a Claude chat goes to Claude Code's own sidebar view. A Claude chat
-that has a tab loses that tab on the move, and a chat in the middle of a turn
-asks first, because closing the tab stops the turn.
+Panel**. Open in Middle puts the chat in a tab in the Claude column. For a Codex
+chat, Open in Side Panel loads it into Codex's own sidebar. For a Claude chat it
+moves the tab into the side column: an editor column at the right edge, made on
+first use at a side panel's width (30 %) and remembered per workspace. Every Claude
+move is a tab move, so a chat in the middle of a turn keeps working, and its
+background shells and monitors keep running. Open in Middle moves it back.
+Arrange Layout keeps the side column at the right edge. A tab dragged out of the
+side column by hand leaves it. Side-column rows read "side panel".
 
-Claude Code shows a chat in its side panel for as long as that chat's process
-runs, and answers every later open of the chat (a click in the list, its history
-picker, Open in Middle) by showing it in the side panel again. So the side panel
-holds one chat at a time, and a chat it showed earlier stays attached until its
-process ends. Agent View ends that process for you: when another chat takes the
-side panel, each chat it displaced that sits between turns is closed, and its
-row moves to the closed list. A displaced chat in the middle of a turn, or with a
-background shell, agent or monitor still running, keeps running; Open in Middle
-asks before it ends all of that. Agent View ends a process only when it is
-certain the process is Claude's own and the only one for that chat. Turn the
-release off with `openEditorsTools.chats.releaseSidePanelChats`.
-
-Open in Middle works for any chat Claude Code's side panel holds, however it got
-there (Open in Side Panel, Claude Code's own history, a click). Agent View checks
-that the chat's process was started by this window's Claude Code (a direct child of
-the extension host, named claude, started when Claude Code's record says), ends that
-process (the transcript stays), and opens the chat as a tab. When the side panel shows
-that very chat, it first switches the side panel to a fresh chat. If Claude Code still
-answers with the side panel, Agent View frees it and tries once more. A chat at work
-asks first. A chat whose process runs in another window or a terminal is never ended.
-Rows of chats in the side panel read "in side panel"; a chat that runs without a tab
-for another reason reads "open elsewhere".
+Claude Code's own side panel is not used for this. Claude Code cannot hand a running
+chat between its side panel and a tab: opening a tab on a chat its side panel holds
+only reveals the side panel again. A chat that got into Claude Code's side panel
+through Claude Code itself reads "in Claude's side panel". Open in Middle or Open in
+Side Panel on it ends that chat's process, which this window's Claude Code must have
+started (checked by parent process, name and start time), and opens it as a tab.
+The transcript stays. A chat at work asks first. A chat whose process runs in
+another window or a terminal is never ended.
 
 ## Buttons
 
@@ -376,7 +365,6 @@ running there.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `openEditorsTools.chats.releaseSidePanelChats` | `true` | End the process of each chat a new side-panel chat displaced, while it sits between turns, so it can open in the middle again |
 | `openEditorsTools.codexClosedDays` | `30` | Codex chats quiet for this many days collapse into one "older Codex chats hidden" row (click it to show all). `0` lists every Codex chat |
 | `openEditorsTools.closedChatHours` | `720` | How long closed Claude chats stay listed. 720 hours (30 days) matches how long Claude Code keeps a transcript. `0` hides them |
 | `openEditorsTools.recentFirst` | `false` | Move the editor you just activated to the top of its group |
