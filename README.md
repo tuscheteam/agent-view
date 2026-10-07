@@ -74,11 +74,16 @@ asks before it ends all of that. Agent View ends a process only when it is
 certain the process is Claude's own and the only one for that chat. Turn the
 release off with `openEditorsTools.chats.releaseSidePanelChats`.
 
-The chat the side panel shows now cannot be freed: Open in Middle on it says so.
-Put another chat in the side panel first (right-click → Open in Side Panel), then
-open this one in the middle. Rows of chats Agent View placed in the side panel
-read "in side panel"; a chat that runs without a tab for another reason (another
-window, a terminal, Claude Code's own side panel) reads "open elsewhere".
+Open in Middle works for any chat Claude Code's side panel holds, however it got
+there (Open in Side Panel, Claude Code's own history, a click). Agent View checks
+that the chat's process was started by this window's Claude Code (a direct child of
+the extension host, named claude, started when Claude Code's record says), ends that
+process (the transcript stays), and opens the chat as a tab. When the side panel shows
+that very chat, it first switches the side panel to a fresh chat. If Claude Code still
+answers with the side panel, Agent View frees it and tries once more. A chat at work
+asks first. A chat whose process runs in another window or a terminal is never ended.
+Rows of chats in the side panel read "in side panel"; a chat that runs without a tab
+for another reason reads "open elsewhere".
 
 ## Buttons
 

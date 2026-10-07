@@ -719,26 +719,22 @@ const processTools = {
 	alive(pid) {
 		try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
 	},
-	// The image name of a pid, or '' when there is no such process.
-	async imageName(pid) {
+	// What a pid is, in one call: { image, ppid, start } with start as the
+	// Windows FILETIME the registry stores in procStart ('' off Windows), or
+	// null when the process cannot be inspected (gone, or the query failed).
+	async facts(pid) {
 		try {
 			if (process.platform === 'win32') {
-				const { stdout } = await execFileAsync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { timeout: 5000, windowsHide: true });
-				const m = /^"([^"]+)"/.exec(stdout.trim());
-				return m ? m[1] : '';
+				const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+					`$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}'; if ($p) { '{0}|{1}|{2}' -f $p.Name, $p.ParentProcessId, $p.CreationDate.ToFileTimeUtc() }`],
+					{ timeout: 10000, windowsHide: true });
+				const m = /^(.*)\|(\d+)\|(\d+)$/.exec(stdout.trim());
+				return m ? { image: m[1], ppid: Number(m[2]), start: m[3] } : null;
 			}
-			return (await execFileAsync('ps', ['-p', String(pid), '-o', 'comm='], { timeout: 5000 })).stdout.trim();
-		} catch (_) { return ''; }
-	},
-	// When the process started, as the Windows FILETIME the registry stores in
-	// `procStart`; '' where that cannot be read.
-	async startTime(pid) {
-		if (process.platform !== 'win32') return '';
-		try {
-			const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
-				`[System.Diagnostics.Process]::GetProcessById(${Number(pid)}).StartTime.ToFileTimeUtc()`], { timeout: 8000, windowsHide: true });
-			return /^\d+$/.test(stdout.trim()) ? stdout.trim() : '';
-		} catch (_) { return ''; }
+			const out = (await execFileAsync('ps', ['-o', 'ppid=,comm=', '-p', String(pid)], { timeout: 5000 })).stdout.trim();
+			const m = /^(\d+)\s+(.+)$/.exec(out);
+			return m ? { image: m[2], ppid: Number(m[1]), start: '' } : null;
+		} catch (_) { return null; }
 	},
 	// The whole tree on Windows: a hard kill of the parent alone leaves its MCP
 	// servers running.
@@ -751,11 +747,29 @@ const processTools = {
 	},
 };
 
-// 'ended' when the session's process was stopped, 'gone' when none ran, and
-// 'refused' when it cannot be told safely which process holds the session: a
-// pid that is not Claude (a stale record whose pid another program reuses), a
-// process that started at another time than the record says, a process that
-// survives the kill, or several live records for one session.
+// Whose process runs a session. 'own' when this window's Claude Code started
+// it: one live record, a process named claude, started when the record says,
+// and a direct child of this extension host (Claude Code spawns its CLI from
+// the extension host; a terminal, another window or another tool gives
+// another parent). 'foreign' when it is someone else's, 'unknown' when the
+// process could not be inspected, 'none' when nothing runs.
+async function claudeProcessOwner(sessionId, rec = liveSessionRecord(sessionId)) {
+	if (!rec || !rec.pid || !processTools.alive(rec.pid)) return { owner: 'none', rec };
+	if (rec.count > 1) return { owner: 'foreign', rec };
+	const f = await processTools.facts(rec.pid);
+	if (!f) return { owner: 'unknown', rec };
+	const image = path.basename(String(f.image)).replace(/\.exe$/i, '').toLowerCase();
+	if (image !== 'claude') return { owner: 'foreign', rec };
+	if (rec.procStart && f.start && Math.abs(Number(f.start) - Number(rec.procStart)) > 5e7) return { owner: 'foreign', rec };
+	if (f.ppid !== process.pid) return { owner: 'foreign', rec };
+	return { owner: 'own', rec };
+}
+
+// 'ended' when the session's process was stopped, 'gone' when none ran,
+// 'unknown' when the process could not be inspected, and 'refused' when it is
+// not this window's Claude Code process (a stale record whose pid another
+// program reuses, another start time, another parent, several live records)
+// or survives the kill.
 async function endClaudeProcess(sessionId) {
 	const rec = liveSessionRecord(sessionId, true);
 	if (!rec) return 'gone';
@@ -768,14 +782,10 @@ async function endClaudeProcess(sessionId) {
 			}
 		} catch (_) { /* nothing to remove */ }
 	};
-	if (rec.count > 1) return 'refused';
 	if (!rec.pid || !processTools.alive(rec.pid)) { dropRecord(); return 'gone'; }
-	const image = path.basename(String(await processTools.imageName(rec.pid))).replace(/\.exe$/i, '').toLowerCase();
-	if (image !== 'claude') return 'refused';
-	if (rec.procStart) {
-		const started = await processTools.startTime(rec.pid);
-		if (started && Math.abs(Number(started) - Number(rec.procStart)) > 5e7) return 'refused';
-	}
+	const { owner } = await claudeProcessOwner(sessionId, rec);
+	if (owner === 'unknown') return 'unknown';
+	if (owner !== 'own') return 'refused';
 	await processTools.kill(rec.pid);
 	for (let i = 0; i < 20 && processTools.alive(rec.pid); i++) await new Promise((r) => setTimeout(r, 150));
 	if (processTools.alive(rec.pid)) return 'refused';
@@ -1520,23 +1530,31 @@ function openClaudeInSidePanel(sessionId, hosted) {
 }
 
 // The Claude sessions Agent View put in Claude Code's side panel, oldest
-// first. The side panel shows the last one. Every earlier one keeps a live
-// process there, and Claude Code answers each later open of such a session
-// (a click in the list, the history picker, Open in Middle) by showing it in
-// the side panel again. Ending that process is the only release Claude Code
-// leaves, so a displaced chat that sits between turns gives its process up.
+// first. Every one keeps a live process there, and Claude Code answers each
+// later open of such a session (a click in the list, the history picker, Open
+// in Middle) by showing it in the side panel again. Ending that process is
+// the only release Claude Code leaves, so a displaced chat that sits between
+// turns gives its process up.
 const sidePanelChats = [];
+// The one the side panel shows, when Agent View knows it: set when Agent View
+// places or re-shows a chat there, cleared when the side panel switches to a
+// fresh chat or the shown chat leaves. Not the list's last entry: after a
+// fresh chat, the last entry is an earlier displaced chat, and treating it as
+// shown would replace whatever the user now works on in the side panel.
+let sidePanelShown = null;
 let placementLog = () => {};
 let transcriptIndex = null;
 function forgetSidePanelChat(sessionId) {
 	const i = sidePanelChats.indexOf(sessionId);
 	if (i !== -1) sidePanelChats.splice(i, 1);
+	if (sidePanelShown === sessionId) sidePanelShown = null;
 }
 function noteSidePanelChat(sessionId) {
 	forgetSidePanelChat(sessionId);
 	sidePanelChats.push(sessionId);
+	sidePanelShown = sessionId;
 }
-function sidePanelCurrent() { return sidePanelChats.length ? sidePanelChats[sidePanelChats.length - 1] : null; }
+function sidePanelCurrent() { return sidePanelShown; }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // A chat that sits between turns can give its process up; one that works on a
@@ -1561,7 +1579,7 @@ async function releaseSidePanelChat(sessionId, askIfBusy) {
 	}
 	const result = await endClaudeProcess(sessionId);
 	placementLog(`side panel: release ${sessionId} -> ${result}`);
-	if (result === 'refused') {
+	if (result === 'refused' || result === 'unknown') {
 		if (askIfBusy) vscode.window.showInformationMessage('Agent View could not tell for certain which process runs this chat, so it left it running. Close the chat in the side panel, or reload the window, to free it.');
 		return false;
 	}
@@ -1649,6 +1667,134 @@ async function moveClaudeToSidePanel(sessionId, hosted) {
 	} finally {
 		if (flip) await cfg().update('preferredLocation', prev, vscode.ConfigurationTarget.Global);
 	}
+}
+
+// Claude Code's side panel switches to a fresh, empty chat: the one way to
+// make it stop showing a session (activating it with no session id starts a
+// new one, read in 2.1.289). Same one-call setting flip as
+// moveClaudeToSidePanel. False when a workspace setting pins chats out of the
+// side panel, or Claude Code refused.
+async function showFreshChatInSidePanel() {
+	const cfg = () => vscode.workspace.getConfiguration('claudeCode');
+	const inspected = cfg().inspect('preferredLocation') || {};
+	for (const v of [inspected.workspaceValue, inspected.workspaceFolderValue]) {
+		if (v !== undefined && v !== 'sidebar') return false;
+	}
+	const prev = inspected.globalValue;
+	const flip = cfg().get('preferredLocation') !== 'sidebar';
+	if (flip) await cfg().update('preferredLocation', 'sidebar', vscode.ConfigurationTarget.Global);
+	try {
+		await vscode.commands.executeCommand('claude-vscode.editor.open', undefined, undefined, undefined, undefined, undefined,
+			{ programmatic: 'honor-preferred-location' });
+		sidePanelShown = null;
+		if (claudeState.sidePanelSession) claudeState.sidePanelSession = null;
+		return true;
+	} catch (err) {
+		placementLog(`side panel: fresh chat failed — ${err.message}`);
+		return false;
+	} finally {
+		if (flip) await cfg().update('preferredLocation', prev, vscode.ConfigurationTarget.Global);
+	}
+}
+
+// A tab in this window shows the session: its label carries the session's
+// title. Read live from the tab strip, not from the last render.
+let lastTabOwners = new Map();
+function tabShowsSession(sessionId) {
+	const entry = transcriptIndex && transcriptIndex.entryFor(sessionId);
+	if (!entry || !entry.title) return false;
+	return claudeTabs().some((t) => {
+		const owner = lastTabOwners.get(t.tab);
+		return (owner === undefined || owner === sessionId) && entryCarries(entry, titleKey(t.tab.label));
+	});
+}
+
+// A Claude session opened as a tab in the Claude column. 'tab' when a tab
+// came (more Claude tabs than before, or one that carries the session's
+// title), 'no-tab' when Claude Code put it elsewhere (its side panel),
+// 'error' when the open threw. A user who picked "sidebar" for new chats
+// keeps it: after a plain open Claude Code records "panel", unawaited.
+async function openClaudeInMiddleTab(sessionId) {
+	const column = claudeColumn();
+	if (column !== null) await focusGroup(column);
+	const tabsBefore = claudeTabs().length;
+	const location = () => (vscode.workspace.getConfiguration('claudeCode').inspect('preferredLocation') || {}).globalValue;
+	const prevLocation = location();
+	const settle = async (done, rounds) => { for (let i = 0; i < rounds && !done(); i++) await sleep(250); };
+	const tabCame = () => claudeTabs().length > tabsBefore || tabShowsSession(sessionId);
+	try {
+		await vscode.commands.executeCommand('claude-vscode.editor.open', sessionId);
+	} catch (err) {
+		vscode.window.showErrorMessage(`Could not open the chat in the middle — ${err.message}`);
+		return 'error';
+	}
+	if (prevLocation === 'sidebar') {
+		await settle(() => location() !== 'sidebar', 6);
+		if (location() !== 'sidebar') await vscode.workspace.getConfiguration('claudeCode').update('preferredLocation', 'sidebar', vscode.ConfigurationTarget.Global);
+	}
+	// Claude Code creates the tab inside the open itself; three seconds also
+	// cover a slow window.
+	await settle(tabCame, 12);
+	return tabCame() ? 'tab' : 'no-tab';
+}
+
+// Open in Middle for a chat Claude Code's side panel holds. Claude Code
+// answers every open of such a chat by showing it in the side panel, for as
+// long as the side panel shows it or keeps a process on it. So: end the
+// chat's process (its transcript stays), open it as a tab, and check that a
+// tab came. When the side panel showed the chat, Claude Code revealed and
+// resumed it there instead; the second round switches the side panel to a
+// fresh chat (now certain to replace this one) and tries again. Only a chat
+// Agent View itself last placed in the side panel gets the fresh chat in the
+// first round: Claude Code's saved state can be a minute old, and a fresh
+// chat in place of whatever the side panel shows now would discard its
+// draft. A chat at work, or one that still runs background work, asks first,
+// and is checked again right before its process ends.
+const middleMoves = new Set();
+function moveOutOfSidePanel(sessionId) {
+	const run = sidePanelMoves.then(() => moveOutOfSidePanelNow(sessionId));
+	sidePanelMoves = run.catch(() => {});
+	return run;
+}
+async function moveOutOfSidePanelNow(sessionId) {
+	let consented = false;
+	const askIfBusy = async () => {
+		const rec = liveSessionRecord(sessionId);
+		if (consented || !rec || !chatIsBusy(sessionId, rec)) return true;
+		const pick = await vscode.window.showWarningMessage(
+			'This chat is working, or still runs background work. Moving it out of the side panel stops all of it.',
+			{ modal: true }, 'Move anyway');
+		consented = pick === 'Move anyway';
+		return consented;
+	};
+	const shownByUs = sidePanelCurrent() === sessionId;
+	for (let round = 0; round < 2; round++) {
+		// Round 2 ends the process Claude Code resumed while revealing the
+		// chat; a turn typed into it since is asked about anew.
+		if (round > 0) consented = false;
+		if (!(await askIfBusy())) return false;
+		if (shownByUs || round > 0) {
+			if (!(await showFreshChatInSidePanel())) break;
+			await sleep(700);
+			if (!(await askIfBusy())) return false;
+		}
+		const result = await endClaudeProcess(sessionId);
+		placementLog(`middle: end side-panel process of ${sessionId} -> ${result} (round ${round + 1})`);
+		if (result === 'refused' || result === 'unknown') {
+			vscode.window.showInformationMessage(result === 'unknown'
+				? 'Agent View could not inspect the process that runs this chat, so it left it running. Try Open in Middle again in a moment.'
+				: 'Agent View could not tell for certain which process runs this chat, so it left it running. Close the chat in the side panel, or reload the window, to free it.');
+			return false;
+		}
+		forgetSidePanelChat(sessionId);
+		if (claudeState.sidePanelSession === sessionId) claudeState.sidePanelSession = null;
+		if (result === 'ended') await sleep(600);
+		const opened = await openClaudeInMiddleTab(sessionId);
+		if (opened === 'tab') return true;
+		if (opened === 'error') return false;
+	}
+	vscode.window.showInformationMessage('Claude Code kept this chat in its side panel. Switch the side panel to another chat, then use Open in Middle again.');
+	return false;
 }
 
 // A chat tab that is already open moves into the Claude column, so no second
@@ -2384,6 +2530,7 @@ class ChatsProvider {
 		if (foldItem && !this.showTranscriptless) for (const r of transcriptless) this.itemByTab.set(r.tab, foldItem.item);
 		// For the right-click placement commands: which tab holds a session,
 		// and whether that chat is mid-turn.
+		lastTabOwners = new Map(rows.filter((r) => r.kind === 'claude' && r.data).map((r) => [r.tab, r.data.sessionId]));
 		this.claudeTabBySession = new Map(rows.filter((r) => r.kind === 'claude' && r.data)
 			.map((r) => [r.data.sessionId, { tab: r.tab, running: r.state === 'running' || r.state === 'question' || !!(r.tab && r.tab.isDirty) }]));
 		this.liveTabless = new Set(rows.filter((r) => r.kind === 'claude-closed' && r.live).map((r) => r.data.sessionId));
@@ -3060,47 +3207,36 @@ function register(context) {
 				if (requireCodex()) await openCodexInMiddle(target.conversationId);
 				return;
 			}
-			// No tab (closed, or in the side panel): open one in the Claude
-			// column; claude-vscode.editor.open uses the active group.
-			// A side-panel move in flight has the setting flipped; reading it
-			// now would make the flip look like the user's preference.
+			// No tab here. A side-panel move in flight has the setting flipped;
+			// wait for it, or the flip reads as the user's preference.
 			await sidePanelMoves;
-			// A chat Agent View put in the side panel: Claude Code shows it
-			// there whenever it is opened, until its process ends. The chat
-			// the side panel shows now cannot be freed; an earlier one can.
-			if (sidePanelChats.includes(target.sessionId)) {
-				if (target.sessionId === sidePanelCurrent() && liveSessionRecord(target.sessionId)) {
-					vscode.window.showInformationMessage('Claude Code\'s side panel shows this chat and keeps showing it until another chat takes its place. Right-click another chat → Open in Side Panel, then open this one in the middle.');
+			const sid = target.sessionId;
+			// Running, with no tab in this window, from a process this window's
+			// Claude Code started: its side panel holds the chat, however the
+			// chat got there (Open in Side Panel, Claude Code's history, a list
+			// click). Claude Code keeps it there until freed.
+			// One move per chat at a time: a second click while one runs would
+			// end the process the first one just opened in a tab.
+			if (middleMoves.has(sid)) return;
+			middleMoves.add(sid);
+			try {
+				const hasTab = (provider.claudeTabBySession && provider.claudeTabBySession.has(sid)) || tabShowsSession(sid);
+				const { owner } = hasTab ? { owner: 'tab' } : await claudeProcessOwner(sid);
+				if (owner === 'own') {
+					await moveOutOfSidePanel(sid);
 					return;
 				}
-				if (target.sessionId !== sidePanelCurrent() && !(await releaseSidePanelChat(target.sessionId, true))) return;
-			}
-			const column = claudeColumn();
-			if (column !== null) await focusGroup(column);
-			const tabsBefore = claudeTabs().length;
-			const location = () => (vscode.workspace.getConfiguration('claudeCode').inspect('preferredLocation') || {}).globalValue;
-			const prevLocation = location();
-			const settle = async (done) => { for (let i = 0; i < 6 && !done(); i++) await new Promise((r) => setTimeout(r, 250)); };
-			try {
-				await vscode.commands.executeCommand('claude-vscode.editor.open', target.sessionId);
-			} catch (err) {
-				vscode.window.showErrorMessage(`Could not open the chat in the middle — ${err.message}`);
-				return;
-			}
-			// After a plain open Claude Code records "panel" as the preferred
-			// location, without awaiting the write. A user who picked "sidebar"
-			// for new chats keeps it.
-			if (prevLocation === 'sidebar') {
-				await settle(() => location() !== 'sidebar');
-				if (location() !== 'sidebar') await vscode.workspace.getConfiguration('claudeCode').update('preferredLocation', 'sidebar', vscode.ConfigurationTarget.Global);
-			}
-			// Claude Code's createPanel reveals its side panel instead of opening
-			// a tab when the side panel holds the session (read in 2.1.289), and
-			// no command makes the side panel let go. Say so when no tab came.
-			if (!(provider.liveTabless && provider.liveTabless.has(target.sessionId))) return;
-			await settle(() => claudeTabs().length > tabsBefore);
-			if (claudeTabs().length <= tabsBefore) {
-				vscode.window.showInformationMessage('Claude Code kept this chat in its side panel. Claude Code opens a chat its side panel holds only there and has no command to move it out.');
+				if (owner === 'unknown') {
+					vscode.window.showInformationMessage('Agent View could not inspect the process that runs this chat, so it left it running. Try Open in Middle again in a moment.');
+					return;
+				}
+				const opened = await openClaudeInMiddleTab(sid);
+				if (opened === 'no-tab' && owner === 'foreign') {
+					vscode.window.showInformationMessage('Claude Code did not open a tab for this chat. It runs outside this window (another window or a terminal); close it there, then use Open in Middle again.');
+				}
+			} finally {
+				middleMoves.delete(sid);
+				provider.refresh();
 			}
 		}),
 		vscode.commands.registerCommand('openEditorsTools.openChatInSidePanel', async (item) => {
@@ -3368,7 +3504,7 @@ module.exports = {
 	_internal: {
 		readTranscript, currentModelOf, claudeDefaultModel, pickerModelIds, codexInWindow, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
-		liveSessionRecord, endClaudeProcess, processTools, sidePanelChats, claudeState, ClaudeCodeState, titleMatches,
+		liveSessionRecord, endClaudeProcess, claudeProcessOwner, processTools, sidePanelChats, noteSidePanelChat, sidePanelCurrent, claudeState, ClaudeCodeState, titleMatches,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,
 		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,
