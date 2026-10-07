@@ -16,7 +16,7 @@ your account's rate-limit windows drawn as bars above them.
 | orange `?` badge | The agent asked a question and is blocked on your answer |
 | green `●` badge | The agent replied and you have not read it yet. Clears when you look at the tab, or when you reply |
 | `⠹` child rows | Subagents working in the last 2 minutes, named by their spawn description, with model, total tokens, age and cost. Codex subagents appear the same way, named by the nickname Codex gave them |
-| `🕘` rows | Chats whose tab was closed; click to reopen the session |
+| `🕘` rows | Chats whose tab was closed; click to reopen the session. A chat still running without a tab here reads "open elsewhere" |
 
 Hover any row for the full breakdown (model, turns, cache reads/writes, reset times).
 
@@ -40,9 +40,19 @@ once by itself after the update that added the Leaderboard.
 loads the thread into the Codex sidebar panel, `editor` opens it as a tab in
 the Codex column, and `auto` (the default) uses the sidebar panel when one is
 open — including a Codex view dragged into the editor area — or when no Codex
-editor tab exists yet, and opens an editor tab otherwise. Right-click any Codex
-row for **Open in Codex Sidebar** and **Open in Editor Tab** to pick the other
-surface without changing the setting.
+editor tab exists yet, and opens an editor tab otherwise.
+
+Right-click any Claude or Codex chat for **Open in Middle** and **Open in Side
+Panel**. Open in Middle puts the chat in a tab in the Claude column. Open in
+Side Panel moves it to the secondary side bar: a Codex chat loads into the Codex
+sidebar, and a Claude chat goes to Claude Code's own sidebar view. A Claude chat
+that has a tab loses that tab on the move, and a chat in the middle of a turn
+asks first, because closing the tab stops the turn. A Claude chat that runs
+without a tab in this window (the side panel, another window or a terminal)
+shows "open elsewhere" and sorts with the open chats. Claude Code keeps a chat
+its own side panel holds in that side panel: Open in Middle on such a chat
+reveals the side panel and says so, because Claude Code has no command to move
+a chat out of it.
 
 ## Buttons
 

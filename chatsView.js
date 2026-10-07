@@ -1231,6 +1231,101 @@ async function openCodexInEditor(conversationId) {
 	await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE, viewColumn);
 }
 
+// ── Right-click placement ──────────────────────────────────────────────────
+// Every chat row offers Open in Middle (a tab in the Claude column) and Open
+// in Side Panel (the secondary side bar, which hosts both Claude Code's and
+// Codex's sidebar views).
+
+// A Codex thread as a tab in the Claude column, the middle of the
+// three-column layout. openCodexInEditor targets the Codex column.
+async function openCodexInMiddle(conversationId) {
+	const claudeCol = claudeColumn();
+	const viewColumn = claudeCol !== null ? vscode.window.tabGroups.all[claudeCol].viewColumn : undefined;
+	await vscode.commands.executeCommand('vscode.openWith', codexUri(conversationId), CODEX_VIEW_TYPE, viewColumn);
+}
+
+// A Claude session in Claude Code's own side-bar view. Claude Code routes a
+// session there only when the open is programmatic with
+// 'honor-preferred-location', claudeCode.preferredLocation is "sidebar", and
+// no tab holds the session (its target decider, read in 2.1.289). The setting
+// is flipped for that one call and put back, so the user's choice for new
+// chats stays. The flip comes before the tab closes: a settings write that
+// fails then leaves the chat where it was. A chat mid-turn asks before its
+// turn is cut off. Moves run one at a time; two overlapping moves would
+// restore the setting under each other. Returns true when the open was sent.
+let sidePanelMoves = Promise.resolve();
+function openClaudeInSidePanel(sessionId, hosted) {
+	const run = sidePanelMoves.then(() => moveClaudeToSidePanel(sessionId, hosted));
+	sidePanelMoves = run.catch(() => {});
+	return run;
+}
+async function moveClaudeToSidePanel(sessionId, hosted) {
+	const cfg = () => vscode.workspace.getConfiguration('claudeCode');
+	const inspected = cfg().inspect('preferredLocation') || {};
+	// A workspace value outranks the global flip: refuse before closing a tab.
+	for (const v of [inspected.workspaceValue, inspected.workspaceFolderValue]) {
+		if (v !== undefined && v !== 'sidebar') {
+			vscode.window.showWarningMessage('A workspace setting claudeCode.preferredLocation keeps Claude Code chats out of the side panel. Remove it to use Open in Side Panel.');
+			return false;
+		}
+	}
+	if (hosted && hosted.running) {
+		const pick = await vscode.window.showWarningMessage(
+			'This chat is working on a turn. Moving it to the side panel closes its tab and stops that turn.',
+			{ modal: true }, 'Move anyway');
+		if (pick !== 'Move anyway') return false;
+	}
+	const prev = inspected.globalValue;
+	const flip = cfg().get('preferredLocation') !== 'sidebar';
+	if (flip) await cfg().update('preferredLocation', 'sidebar', vscode.ConfigurationTarget.Global);
+	try {
+		if (hosted) {
+			await vscode.window.tabGroups.close(hosted.tab, true);
+			// Claude Code drops the session from its panel registry when the
+			// webview is disposed; a tab still registered routes back to "panel".
+			await new Promise((r) => setTimeout(r, 200));
+		}
+		try {
+			await vscode.commands.executeCommand('claude-vscode.editor.open', sessionId, undefined, undefined, undefined, undefined,
+				{ programmatic: 'honor-preferred-location' });
+		} catch (err) {
+			// The tab is gone: give the chat a tab back before reporting.
+			if (hosted) await Promise.resolve(vscode.commands.executeCommand('claude-vscode.editor.open', sessionId)).catch(() => {});
+			throw err;
+		}
+		return true;
+	} finally {
+		if (flip) await cfg().update('preferredLocation', prev, vscode.ConfigurationTarget.Global);
+	}
+}
+
+// A chat tab that is already open moves into the Claude column, so no second
+// editor opens on the same thread. Same move as newCodexInTab.
+async function moveTabToClaudeColumn(groupIndex, tabIndex) {
+	await vscode.commands.executeCommand('openEditorsTools.focusChat', groupIndex, tabIndex);
+	const target = claudeColumn();
+	if (target === null || target === groupIndex) return;
+	await vscode.commands.executeCommand('moveActiveEditor', {
+		to: groupIndex > target ? 'left' : 'right',
+		by: 'group',
+		value: Math.abs(groupIndex - target),
+	});
+}
+
+// What a right-clicked row points at, or null for rows that are not chats.
+const CLAUDE_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function placementTarget(item) {
+	if (!item) return null;
+	if (item.contextValue === 'claudeChat' || item.contextValue === 'closedClaudeChat') {
+		const id = String(item.id || '').replace(/^(?:chat|closed):/, '');
+		return CLAUDE_SESSION_ID.test(id) ? { kind: 'claude', sessionId: id } : null;
+	}
+	if ((item.contextValue === 'codexChat' || item.contextValue === 'closedCodexChat') && item.conversationId) {
+		return { kind: 'codex', conversationId: item.conversationId };
+	}
+	return null;
+}
+
 // "New Codex Agent" honouring the same target choice: in the sidebar a fresh
 // chat is chatgpt.newChat once the view is revealed; in an editor tab it is the
 // panel path newCodexInTab already drives.
@@ -1811,7 +1906,9 @@ class ChatsProvider {
 				// Seeded but never marked unread: you closed the tab, so a dot on
 				// a closed row would be noise rather than news.
 				this.seen.seed(entry);
-				rows.push({ kind: 'claude-closed', data: entry });
+				// A live process with no tab here: the chat sits in the side
+				// panel, another window or a terminal. Not closed.
+				rows.push({ kind: 'claude-closed', data: entry, live: live.has(entry.sessionId) });
 			}
 			const openCodexIds = new Set(rows.filter((r) => r.kind === 'codex').map((r) => r.conversationId));
 			const liveSince = Date.now() - CODEX_LIVE_MS;
@@ -1846,7 +1943,7 @@ class ChatsProvider {
 		// older Claude tabs instead of dead last. Codex rows therefore never take
 		// the closed penalty; they sort purely on the newest of their three
 		// activity signals.
-		const openRank = (row) => (row.kind === 'claude-closed' ? 1 : 0);
+		const openRank = (row) => (row.kind === 'claude-closed' && !row.live ? 1 : 0);
 		rows.sort((a, b) =>
 			openRank(a) - openRank(b)
 			|| (b.data ? b.data.lastActivity : 0) - (a.data ? a.data.lastActivity : 0));
@@ -1855,7 +1952,7 @@ class ChatsProvider {
 		const items = rows.map((row) => {
 			const item = row.kind === 'codex' ? this._codexItem(row)
 				: row.kind === 'codex-live' ? this._codexLiveItem(row)
-				: row.kind === 'claude-closed' ? this._closedClaudeItem(row.data)
+				: row.kind === 'claude-closed' ? this._closedClaudeItem(row.data, row.live)
 				: row.kind === 'codex-hidden' ? this._hiddenCodexItem(row)
 					: row.kind === 'codex-closed' ? this._closedCodexItem(row)
 				: this._item(row);
@@ -1864,6 +1961,11 @@ class ChatsProvider {
 		});
 		this.items = items.map((x) => x.item);
 		this.itemByTab = new Map(items.filter((x) => x.tab).map((x) => [x.tab, x.item]));
+		// For the right-click placement commands: which tab holds a session,
+		// and whether that chat is mid-turn.
+		this.claudeTabBySession = new Map(rows.filter((r) => r.kind === 'claude' && r.data)
+			.map((r) => [r.data.sessionId, { tab: r.tab, running: r.state === 'running' || r.state === 'question' || !!(r.tab && r.tab.isDirty) }]));
+		this.liveTabless = new Set(rows.filter((r) => r.kind === 'claude-closed' && r.live).map((r) => r.data.sessionId));
 		this._logUnrecognisedTabs();
 		this._onDidRender.fire();
 		this._rootPending = false;
@@ -1893,15 +1995,18 @@ class ChatsProvider {
 		if (key && this.log) this.log(`unrecognised tabs: ${key}`);
 	}
 
-	_closedClaudeItem(data) {
+	_closedClaudeItem(data, live = false) {
 		const item = new vscode.TreeItem(data.title, vscode.TreeItemCollapsibleState.None);
 		item.id = `closed:${data.sessionId}`;
 		// Codicon, not the logo — closed rows should read as a different class
-		// of thing at a glance.
-		item.iconPath = new vscode.ThemeIcon('history');
+		// of thing at a glance. A chat whose process runs without a tab here
+		// keeps the logo: it is open, in the side panel or somewhere else.
+		item.iconPath = live ? this.icon : new vscode.ThemeIcon('history');
 		item.contextValue = 'closedClaudeChat';
-		item.description = [formatAge(data.lastActivity), 'closed', formatCost(data.cost)].join(' · ');
-		item.tooltip = `${data.title} — closed. Click to reopen this session in a tab.`;
+		item.description = [formatAge(data.lastActivity), live ? 'open elsewhere' : 'closed', formatCost(data.cost)].join(' · ');
+		item.tooltip = live
+			? `${data.title} — running without a tab in this window (the side panel, another window or a terminal). Click to open it here in a tab; a chat in Claude Code's side panel opens there.`
+			: `${data.title} — closed. Click to reopen this session in a tab.`;
 		item.command = {
 			command: 'openEditorsTools.reopenClaudeSession',
 			title: 'Reopen session',
@@ -2010,7 +2115,8 @@ class ChatsProvider {
 		item.id = `codex:${conversationId || `new:${groupIndex}:${tabIndex}`}`;
 		item.conversationId = conversationId;
 		item.iconPath = this.codexIcon;
-		item.contextValue = 'codexChat';
+		// A new tab has no thread id yet: the right-click menu skips it.
+		item.contextValue = conversationId ? 'codexChat' : 'codexChatPending';
 		item.command = {
 			command: 'openEditorsTools.focusChat',
 			title: 'Focus chat',
@@ -2182,6 +2288,8 @@ class ChatsProvider {
 		};
 
 		if (!data) {
+			// No session id to place yet: the right-click menu skips this row.
+			item.contextValue = 'claudeChatPending';
 			item.description = tab.isDirty ? 'working…' : 'no transcript yet';
 			item.tooltip = 'No session transcript matched this tab title yet.';
 			return item;
@@ -2478,6 +2586,67 @@ function register(context) {
 			if (!requireCodex()) return;
 			const id = item && item.conversationId;
 			if (id) await openCodexInEditor(id);
+		}),
+		// Right-click on any chat row: the same two places for Claude and Codex.
+		vscode.commands.registerCommand('openEditorsTools.openChatInMiddle', async (item) => {
+			const target = placementTarget(item);
+			if (!target) return;
+			// A row with a tab (its click is focusChat): move that tab.
+			const tabAt = item.command && item.command.command === 'openEditorsTools.focusChat' ? item.command.arguments : null;
+			if (tabAt) {
+				await moveTabToClaudeColumn(...tabAt);
+				return;
+			}
+			if (target.kind === 'codex') {
+				if (requireCodex()) await openCodexInMiddle(target.conversationId);
+				return;
+			}
+			// No tab (closed, or in the side panel): open one in the Claude
+			// column; claude-vscode.editor.open uses the active group.
+			// A side-panel move in flight has the setting flipped; reading it
+			// now would make the flip look like the user's preference.
+			await sidePanelMoves;
+			const column = claudeColumn();
+			if (column !== null) await focusGroup(column);
+			const tabsBefore = claudeTabs().length;
+			const location = () => (vscode.workspace.getConfiguration('claudeCode').inspect('preferredLocation') || {}).globalValue;
+			const prevLocation = location();
+			const settle = async (done) => { for (let i = 0; i < 6 && !done(); i++) await new Promise((r) => setTimeout(r, 250)); };
+			try {
+				await vscode.commands.executeCommand('claude-vscode.editor.open', target.sessionId);
+			} catch (err) {
+				vscode.window.showErrorMessage(`Could not open the chat in the middle — ${err.message}`);
+				return;
+			}
+			// After a plain open Claude Code records "panel" as the preferred
+			// location, without awaiting the write. A user who picked "sidebar"
+			// for new chats keeps it.
+			if (prevLocation === 'sidebar') {
+				await settle(() => location() !== 'sidebar');
+				if (location() !== 'sidebar') await vscode.workspace.getConfiguration('claudeCode').update('preferredLocation', 'sidebar', vscode.ConfigurationTarget.Global);
+			}
+			// Claude Code's createPanel reveals its side panel instead of opening
+			// a tab when the side panel holds the session (read in 2.1.289), and
+			// no command makes the side panel let go. Say so when no tab came.
+			if (!(provider.liveTabless && provider.liveTabless.has(target.sessionId))) return;
+			await settle(() => claudeTabs().length > tabsBefore);
+			if (claudeTabs().length <= tabsBefore) {
+				vscode.window.showInformationMessage('Claude Code kept this chat in its side panel. Claude Code opens a chat its side panel holds only there and has no command to move it out.');
+			}
+		}),
+		vscode.commands.registerCommand('openEditorsTools.openChatInSidePanel', async (item) => {
+			const target = placementTarget(item);
+			if (!target) return;
+			if (target.kind === 'codex') {
+				if (requireCodex()) await openCodexInSidebar(target.conversationId);
+				return;
+			}
+			try {
+				await openClaudeInSidePanel(target.sessionId, provider.claudeTabBySession && provider.claudeTabBySession.get(target.sessionId));
+			} catch (err) {
+				vscode.window.showErrorMessage(`Could not open the chat in the side panel — ${err.message}`);
+			}
+			provider.refresh();
 		}),
 		// Registered here rather than in extension.js as a plain forward:
 		// claude-vscode.editor.open opens in the ACTIVE group, which is how new

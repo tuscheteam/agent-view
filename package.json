@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.15.3",
+  "version": "0.15.4",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -361,6 +361,16 @@
         "command": "openEditorsTools.checkClaudePatch",
         "title": "Claude Code: Check DeepSeek Subagent Patch",
         "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.openChatInMiddle",
+        "title": "Open in Middle",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.openChatInSidePanel",
+        "title": "Open in Side Panel",
+        "category": "Agent View"
       }
     ],
     "viewsContainers": {
@@ -434,18 +444,26 @@
         },
         {
           "command": "openEditorsTools.dumpTabs"
+        },
+        {
+          "command": "openEditorsTools.openChatInMiddle",
+          "when": "false"
+        },
+        {
+          "command": "openEditorsTools.openChatInSidePanel",
+          "when": "false"
         }
       ],
       "view/item/context": [
         {
-          "command": "openEditorsTools.openCodexInSidebar",
-          "when": "view == openEditorsTools.chats && (viewItem == codexChat || viewItem == closedCodexChat)",
-          "group": "codex@1"
+          "command": "openEditorsTools.openChatInMiddle",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|closedClaudeChat|codexChat|closedCodexChat)$/",
+          "group": "open@1"
         },
         {
-          "command": "openEditorsTools.openCodexInEditor",
-          "when": "view == openEditorsTools.chats && (viewItem == codexChat || viewItem == closedCodexChat)",
-          "group": "codex@2"
+          "command": "openEditorsTools.openChatInSidePanel",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|closedClaudeChat|codexChat|closedCodexChat)$/",
+          "group": "open@2"
         }
       ],
       "view/title": [
