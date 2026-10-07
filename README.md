@@ -16,9 +16,22 @@ your account's rate-limit windows drawn as bars above them.
 | orange `?` badge | The agent asked a question and is blocked on your answer |
 | green `●` badge | The agent replied and you have not read it yet. Clears when you look at the tab, or when you reply |
 | `⠹` child rows | Subagents working in the last 2 minutes, named by their spawn description, with model, total tokens, age and cost. Codex subagents appear the same way, named by the nickname Codex gave them |
-| `🕘` rows | Chats whose tab was closed; click to reopen the session. A chat still running without a tab here reads "open elsewhere" |
+| `🕘` rows | Chats whose tab was closed; click to reopen the session. A chat still running without a tab here reads "open elsewhere", or "in side panel" when Claude Code's side panel shows it |
+| "N tabs without a transcript" | Open Claude tabs with nothing to list: a new chat with no message sent yet, or a chat whose transcript is no longer on this machine (Claude Code deletes chats idle longer than `cleanupPeriodDays`, 30 days unless set). Click to show or hide them |
 
 Hover any row for the full breakdown (model, turns, cache reads/writes, reset times).
+
+The list is one history of both tools, newest first: open and closed Claude chats and
+Codex chats, ordered by their last activity the way Claude Code's and Codex's own
+histories order them. Claude chats come from Claude Code's transcripts, and a tab is
+matched to its chat through the session Claude Code saved for that tab (read from VS
+Code's state database, so a window reload sees exactly what the last session left).
+A tab whose title matches no transcript never borrows another chat's row; only a tab
+that still reads "Claude Code" may take a brand-new chat's untitled transcript. A
+label Claude Code shortened ("Service worker registrat…") matches by prefix, as in
+Claude Code itself. A chat at work sorts as current even while its transcript sits
+still through a long tool call. Chats that Claude Code's history archives are left
+out unless they run right now.
 
 ## Layout
 
@@ -360,7 +373,7 @@ running there.
 | --- | --- | --- |
 | `openEditorsTools.chats.releaseSidePanelChats` | `true` | End the process of each chat a new side-panel chat displaced, while it sits between turns, so it can open in the middle again |
 | `openEditorsTools.codexClosedDays` | `30` | Codex chats quiet for this many days collapse into one "older Codex chats hidden" row (click it to show all). `0` lists every Codex chat |
-| `openEditorsTools.closedChatHours` | `48` | How long closed chats stay listed. `0` hides them |
+| `openEditorsTools.closedChatHours` | `720` | How long closed Claude chats stay listed. 720 hours (30 days) matches how long Claude Code keeps a transcript. `0` hides them |
 | `openEditorsTools.recentFirst` | `false` | Move the editor you just activated to the top of its group |
 | `openEditorsTools.codexOpenTarget` | `auto` | Where a Codex row opens: `sidebar` panel, `editor` tab, or `auto` |
 | `openEditorsTools.chats.showBackgroundTasks` | `true` | Spinner rows for background shells, agents, workflows and monitors a chat waits on |

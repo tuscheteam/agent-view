@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.15.5",
+  "version": "0.15.6",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -32,8 +32,8 @@
         },
         "openEditorsTools.closedChatHours": {
           "type": "number",
-          "default": 48,
-          "description": "Also list chats whose tab was closed, if their session was active within this many hours. Click a row to reopen it. 0 hides closed chats."
+          "default": 720,
+          "description": "Also list Claude chats whose tab was closed, if their session was active within this many hours. The default of 720 (30 days) matches how long Claude Code keeps a transcript, so the list holds the same chats as Claude Code's own history. Click a row to reopen it. 0 hides closed chats."
         },
         "openEditorsTools.codexOpenTarget": {
           "type": "string",
@@ -360,6 +360,11 @@
       {
         "command": "openEditorsTools.showAllCodexChats",
         "title": "Show All Codex Chats",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.toggleTranscriptlessTabs",
+        "title": "Show or Hide Tabs Without a Transcript",
         "category": "Agent View"
       },
       {

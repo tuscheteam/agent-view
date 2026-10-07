@@ -856,6 +856,24 @@ function stateOf(entry, live, seen) {
 	return 'running';
 }
 
+// A tab label and a transcript title compare the way Claude Code compares
+// them: whitespace collapsed, case ignored, and a label it shortened (24
+// characters plus "…", its panel-title limit) matching any title it begins.
+function titleKey(text) { return String(text || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
+function titleMatches(key, title) {
+	const t = titleKey(title);
+	if (!key || !t) return false;
+	if (key.endsWith('…')) {
+		const prefix = key.slice(0, -1).trim();
+		return prefix !== '' && t !== prefix && t.startsWith(prefix);
+	}
+	return key === t;
+}
+function entryCarries(entry, key) {
+	if (!entry) return false;
+	return [...(entry.titles || (entry.title ? [entry.title] : []))].some((t) => titleMatches(key, t));
+}
+
 // Cached by mtime+size so a refresh only re-reads transcripts that actually
 // changed; without it every tab switch would re-parse the whole store.
 class TranscriptIndex {
@@ -879,6 +897,11 @@ class TranscriptIndex {
 		try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')); } catch (_) { return; }
 
 		const titles = new Map();
+		// A transcript deleted on disk (Claude Code's cleanup, a manual delete)
+		// leaves the index too; a cached entry outliving its file stayed
+		// matchable and took a tab's row.
+		const present = new Set(files.map((name) => path.join(dir, name)));
+		for (const file of [...this.byFile.keys()]) if (path.dirname(file) === dir && !present.has(file)) this.byFile.delete(file);
 		for (const name of files) {
 			const file = path.join(dir, name);
 			let stat;
@@ -909,7 +932,7 @@ class TranscriptIndex {
 			// label is an earlier name still finds its transcript. Newest entry
 			// wins when sessions share a title.
 			for (const t of entry.titles || (entry.title ? [entry.title] : [])) {
-				const key = t.trim().toLowerCase();
+				const key = titleKey(t);
 				const existing = titles.get(key);
 				if (!existing || entry.lastActivity > existing.lastActivity) titles.set(key, entry);
 			}
@@ -917,8 +940,20 @@ class TranscriptIndex {
 		this.byTitle = titles;
 	}
 
-	lookup(label) {
-		return label ? this.byTitle.get(label.trim().toLowerCase()) : undefined;
+	// The newest transcript that carries this tab label, optionally skipping
+	// sessions already shown by another row.
+	lookup(label, claimed = null) {
+		const key = titleKey(label);
+		if (!key) return undefined;
+		const exact = this.byTitle.get(key);
+		if (exact && !(claimed && claimed.has(exact.sessionId))) return exact;
+		let best = null;
+		for (const entry of this.byFile.values()) {
+			if (claimed && claimed.has(entry.sessionId)) continue;
+			if (!entryCarries(entry, key)) continue;
+			if (!best || entry.lastActivity > best.lastActivity) best = entry;
+		}
+		return best || (claimed ? undefined : exact);
 	}
 
 	entryFor(sessionId) {
@@ -982,6 +1017,115 @@ const CODEX_AUTHORITY = 'route';
 // in which case we fall back to the plain-JSONL index below.
 let DatabaseSync = null;
 try { ({ DatabaseSync } = require('node:sqlite')); } catch (_) { /* fallback path */ }
+
+// ── Claude Code's saved state ─────────────────────────────────────────────
+// Claude Code keeps three facts in VS Code's state databases that a title
+// match can only guess at:
+//   - which session each tab holds (workspace key "Anthropic.claude-code",
+//     panelTabSessions: [{ sessionId, title }]),
+//   - which session its side panel shows (the side-panel webview's saved
+//     state, { sessionID }),
+//   - which sessions its own history hides (global key, hiddenSessionIds: its
+//     archive).
+// VS Code flushes these files on its own schedule, so a live change shows up
+// within a minute or so. A window reload reads exactly what the last session
+// left, which is the moment the title match failed most: restored tabs whose
+// transcript Claude Code had deleted took the rows of unrelated live chats.
+const CLAUDE_STATE_KEY = 'Anthropic.claude-code';
+const SIDE_PANEL_KEYS = ['memento/webviewView.claudeVSCodeSidebarSecondary', 'memento/webviewView.claudeVSCodeSidebar'];
+class ClaudeCodeState {
+	constructor() {
+		this.workspaceFile = null;
+		this.globalFile = null;
+		this.workspaceMtime = -1;
+		this.globalMtime = -1;
+		this.tabSessions = [];
+		this.sidePanelSession = null;
+		this.archived = new Set();
+	}
+
+	// The two directories hold VS Code's state.vscdb files: the workspace one
+	// is the parent of this extension's storageUri, the global one the parent
+	// of its globalStorageUri.
+	configure(workspaceStorageDir, globalStorageDir) {
+		this.workspaceFile = workspaceStorageDir ? path.join(workspaceStorageDir, 'state.vscdb') : null;
+		this.globalFile = globalStorageDir ? path.join(globalStorageDir, 'state.vscdb') : null;
+		this.workspaceMtime = -1;
+		this.globalMtime = -1;
+	}
+
+	static read(file, keys) {
+		const out = new Map();
+		if (!DatabaseSync || !file) return out;
+		let db;
+		try {
+			db = new DatabaseSync(file, { readOnly: true });
+			const stmt = db.prepare('SELECT value FROM ItemTable WHERE key = ?');
+			for (const key of keys) {
+				const row = stmt.get(key);
+				if (row && row.value !== undefined && row.value !== null) out.set(key, String(row.value));
+			}
+		} catch (_) { /* locked mid-write or not there: keep the last good read */ return null; } finally {
+			try { if (db) db.close(); } catch (_) { /* already closed */ }
+		}
+		return out;
+	}
+
+	refresh() {
+		const one = (file) => { try { return fs.statSync(file).mtimeMs; } catch (_) { return -1; } };
+		const mtime = (file) => (file ? Math.max(one(file), one(`${file}-wal`)) : -1);
+		const wsMtime = mtime(this.workspaceFile);
+		if (wsMtime !== this.workspaceMtime) {
+			const got = ClaudeCodeState.read(this.workspaceFile, [CLAUDE_STATE_KEY, ...SIDE_PANEL_KEYS]);
+			if (got) {
+				this.workspaceMtime = wsMtime;
+				let tabs = [];
+				try {
+					const v = JSON.parse(got.get(CLAUDE_STATE_KEY) || '{}');
+					if (Array.isArray(v.panelTabSessions)) {
+						tabs = v.panelTabSessions.filter((t) => t && typeof t.sessionId === 'string')
+							.map((t) => ({ sessionId: t.sessionId, title: String(t.title || '').trim().toLowerCase() }));
+					}
+				} catch (_) { /* unreadable value: no tab facts */ }
+				this.tabSessions = tabs;
+				let side = null;
+				let sideAt = -1;
+				for (const key of SIDE_PANEL_KEYS) {
+					try {
+						const outer = JSON.parse(got.get(key) || '{}');
+						const inner = typeof outer.webviewState === 'string' ? JSON.parse(outer.webviewState) : outer.webviewState;
+						if (inner && typeof inner.sessionID === 'string') {
+							const at = Number(inner.sessionUpdatedAt) || 0;
+							if (at > sideAt) { side = inner.sessionID; sideAt = at; }
+						}
+					} catch (_) { /* no side-panel state */ }
+				}
+				this.sidePanelSession = side;
+			}
+		}
+		const glMtime = mtime(this.globalFile);
+		if (glMtime !== this.globalMtime) {
+			const got = ClaudeCodeState.read(this.globalFile, [CLAUDE_STATE_KEY]);
+			if (got) {
+				this.globalMtime = glMtime;
+				let hidden = [];
+				try {
+					const v = JSON.parse(got.get(CLAUDE_STATE_KEY) || '{}');
+					if (Array.isArray(v.hiddenSessionIds)) hidden = v.hiddenSessionIds.filter((x) => typeof x === 'string');
+				} catch (_) { /* unreadable value: nothing archived */ }
+				this.archived = new Set(hidden);
+			}
+		}
+	}
+
+	// The sessions Claude Code saved for its tabs, as a fresh list per render:
+	// each tab takes one. Titles repeat ("Claude Code"), and either side may be
+	// the shortened form, so entries match by the title rule, not by key.
+	tabSessionPool() {
+		return this.tabSessions.map((t) => ({ sessionId: t.sessionId, title: titleKey(t.title) }));
+	}
+}
+const claudeState = new ClaudeCodeState();
 
 function codexDir() {
 	// CODEX_HOME is Codex's own override for ~/.codex; honouring it also lets
@@ -1976,26 +2120,70 @@ class ChatsProvider {
 		const defaultModel = claudeDefaultModel(folder && folder.uri.fsPath);
 
 		const projectDir = folder && projectDirFor(folder.uri.fsPath);
-		// Titled rows claim their transcript first, so an untitled tab cannot
-		// steal one that already belongs to a named chat.
-		const claimed = new Set();
-		for (const t of claudeTabs()) {
-			const hit = this.index.lookup(t.tab.label);
-			if (hit) claimed.add(hit.sessionId);
-		}
+		claudeState.refresh();
 		const untitledCutoff = Date.now() - 3600000;
-		// Chats in the side panel have no tab, whatever their transcript says.
+		// Chats in the side panel have no tab, whatever their transcript says:
+		// the ones Agent View put there, and the one Claude Code's saved state
+		// says its side panel shows.
+		const statedSide = claudeState.sidePanelSession && live.has(claudeState.sidePanelSession) ? claudeState.sidePanelSession : null;
 		const sideHeld = new Set(sidePanelChats);
+		if (statedSide) sideHeld.add(statedSide);
 		const DEFAULT_TAB_LABEL = /^claude code$/i;
+
+		// Which transcript each tab shows. Claude Code's saved session for the
+		// tab's title comes first when that transcript carries the title (two
+		// tabs can share one); then the newest transcript with the title; then
+		// the saved session alone, whose transcript may be gone. Only a tab that
+		// still carries the default label may take an untitled transcript: a
+		// brand-new chat writes one before it gets a title. Letting any unmatched
+		// tab take a live transcript gave a tab whose own transcript Claude Code
+		// had deleted the row of an unrelated live chat, which then vanished.
+		const claimed = new Set();
+		const pool = claudeState.tabSessionPool();
+		const samTitle = (key, saved) => saved === key || titleMatches(key, saved) || titleMatches(saved, key);
+		const takeSaved = (key, test) => {
+			const i = pool.findIndex((e) => samTitle(key, e.title) && !claimed.has(e.sessionId) && (!test || test(e.sessionId)));
+			return i === -1 ? null : pool.splice(i, 1)[0].sessionId;
+		};
+		const dropSaved = (sid) => {
+			const i = pool.findIndex((e) => e.sessionId === sid);
+			if (i !== -1) pool.splice(i, 1);
+		};
+		const resolved = claudeTabs().map((t) => {
+			const key = titleKey(t.tab.label);
+			const isDefault = DEFAULT_TAB_LABEL.test(key);
+			const carried = takeSaved(key, (sid) => entryCarries(this.index.entryFor(sid), key));
+			if (carried) {
+				claimed.add(carried);
+				return { t, key, isDefault, data: this.index.entryFor(carried), saved: carried };
+			}
+			const hit = isDefault ? undefined : this.index.lookup(key, claimed);
+			if (hit) {
+				claimed.add(hit.sessionId);
+				dropSaved(hit.sessionId);
+				return { t, key, isDefault, data: hit, saved: hit.sessionId };
+			}
+			// A tab still on the default label holds a chat without a title; a
+			// saved entry whose transcript has one is a stale record of another
+			// tab that got its title since.
+			const saved = takeSaved(key, isDefault ? (sid) => { const e = this.index.entryFor(sid); return !e || !e.title; } : null);
+			if (saved) claimed.add(saved);
+			return { t, key, isDefault, data: saved ? this.index.entryFor(saved) || null : null, saved };
+		});
+		for (const r of resolved) {
+			if (r.data || !r.isDefault) continue;
+			r.data = this.index.unclaimedSince(untitledCutoff, claimed, live, { untitledOnly: true, exclude: sideHeld });
+		}
 
 		// The one chat you are actually looking at right now, if any.
 		const activeGroup = vscode.window.tabGroups.all.find((g) => g.isActive);
 		const activeTab = vscode.window.state.focused && activeGroup ? activeGroup.activeTab : null;
 
-		const rows = claudeTabs().map((t) => {
-			const data = this.index.lookup(t.tab.label)
-				|| this.index.unclaimedSince(untitledCutoff, claimed, live,
-					{ untitledOnly: DEFAULT_TAB_LABEL.test(String(t.tab.label || '').trim()), exclude: sideHeld });
+		const rows = resolved.map(({ t, isDefault, data }) => {
+			// A tab with no transcript: an empty new chat (it still carries the
+			// default label, which a first message replaces), or a titled chat
+			// whose transcript is no longer on this machine.
+			const noTranscript = data ? null : (isDefault ? 'empty' : 'gone');
 			this.seen.seed(data);
 			if (data && t.tab === activeTab) this.seen.mark(data.sessionId);
 			const state = stateOf(data, data && live.has(data.sessionId), this.seen);
@@ -2013,7 +2201,7 @@ class ChatsProvider {
 					.filter((task) => !subagents.running.some((s) => (task.kind === 'agent' && s.id === task.id)
 						|| (task.kind === 'workflow' && task.runId && s.runId === task.runId)))
 				: [];
-			return { ...t, kind: 'claude', data, state, subagents, subs: subagents.running, tasks,
+			return { ...t, kind: 'claude', data, state, subagents, subs: subagents.running, tasks, noTranscript,
 				current: currentModelOf(data, data && live.has(data.sessionId) ? live.get(data.sessionId) : null, defaultModel) };
 		});
 		// Cross-provider: a Codex exec thread that wrote within the last
@@ -2101,12 +2289,15 @@ class ChatsProvider {
 		// one on screen, is no longer held by the side panel.
 		for (const r of rows) if (r.kind === 'claude' && r.data) forgetSidePanelChat(r.data.sessionId);
 		for (const id of [...sidePanelChats]) if (id !== sidePanelCurrent() && !live.has(id)) forgetSidePanelChat(id);
+		// The session Claude Code's saved state names for its side panel labels
+		// a row and keeps tabs off it. It never joins sidePanelChats: that list
+		// decides which processes end, and a saved state can be old (the same
+		// session resumed in a terminal is live too).
 
-		const hours = vscode.workspace.getConfiguration('openEditorsTools').get('closedChatHours', 48);
+		const hours = vscode.workspace.getConfiguration('openEditorsTools').get('closedChatHours', 720);
 		if (hours > 0) {
 			const cutoff = Date.now() - hours * 3600000;
-			const openTitles = new Set(rows.filter((r) => r.kind === 'claude').map((r) => r.tab.label.trim().toLowerCase()));
-			const newestByTitle = new Map();
+			const closedEntries = [];
 			for (const entry of this.index.byFile.values()) {
 				if (!entry.title || entry.lastActivity < cutoff) continue;
 				// A transcript claimed by an open tab is not a closed chat, even
@@ -2114,12 +2305,12 @@ class ChatsProvider {
 				// case produced a phantom closed row of the chat's old name.
 				if (claimed.has(entry.sessionId)) continue;
 				if (matchedClaudeSessions.has(entry.sessionId)) continue;
-				const key = entry.title.trim().toLowerCase();
-				if (openTitles.has(key)) continue;
-				const seen = newestByTitle.get(key);
-				if (!seen || entry.lastActivity > seen.lastActivity) newestByTitle.set(key, entry);
+				// Claude Code's history leaves archived chats out; so does this list,
+				// unless the chat runs right now.
+				if (claudeState.archived.has(entry.sessionId) && !live.has(entry.sessionId)) continue;
+				closedEntries.push(entry);
 			}
-			for (const entry of newestByTitle.values()) {
+			for (const entry of closedEntries) {
 				// Seeded but never marked unread: you closed the tab, so a dot on
 				// a closed row would be noise rather than news.
 				this.seen.seed(entry);
@@ -2151,20 +2342,29 @@ class ChatsProvider {
 			if (codexHidden) rows.push({ kind: 'codex-hidden', count: codexHidden, days: codexDays });
 		}
 
-		// Most recent activity first. Tabs we cannot match (a brand new chat with
-		// no transcript yet) sort last rather than jumping to the top.
-		// Only a Claude chat with no tab is provably closed, and those sink to a
-		// bottom block. A Codex chat cannot be classified: it can run in Codex's
-		// sidebar with no editor tab and idle for hours between local writes, so
-		// "no tab, 13h old" says nothing about whether it is closed. Sorting it
-		// with the open rows by recency put a same-morning Codex chat above 18
-		// older Claude tabs instead of dead last. Codex rows therefore never take
-		// the closed penalty; they sort purely on the newest of their three
-		// activity signals.
-		const openRank = (row) => (row.kind === 'claude-closed' && !row.live ? 1 : 0);
-		rows.sort((a, b) =>
-			openRank(a) - openRank(b)
-			|| (b.data ? b.data.lastActivity : 0) - (a.data ? a.data.lastActivity : 0));
+		// Tabs without a transcript have nothing to show in a history: an empty
+		// new chat, or a chat whose transcript is no longer on this machine.
+		// They fold into one row at the bottom, which shows them on a click.
+		const transcriptless = rows.filter((r) => r.kind === 'claude' && r.noTranscript);
+		if (transcriptless.length && !this.showTranscriptless) {
+			for (const r of transcriptless) rows.splice(rows.indexOf(r), 1);
+		}
+		if (transcriptless.length) {
+			rows.push({ kind: 'claude-hidden', tabs: transcriptless.map((r) => ({ label: r.tab.label, why: r.noTranscript })), shown: !!this.showTranscriptless });
+		}
+
+		// One history, newest first: Claude and Codex chats, open or closed,
+		// ordered by their last activity the way each tool's own history orders
+		// them. A closed chat from 40 minutes ago sits above a tab idle since
+		// yesterday. Rows with nothing to date (transcriptless tabs, the fold
+		// rows) sort last.
+		const nowMs = Date.now();
+		const activity = (row) => {
+			if (!row.data) return 0;
+			if (row.state === 'running' || row.state === 'question' || (row.subs && row.subs.length) || (row.tasks && row.tasks.length)) return nowMs;
+			return row.data.lastActivity || 0;
+		};
+		rows.sort((a, b) => activity(b) - activity(a));
 
 		// Usage lives in its own webview above this tree — see usageView.js.
 		const items = rows.map((row) => {
@@ -2172,6 +2372,7 @@ class ChatsProvider {
 				: row.kind === 'codex-live' ? this._codexLiveItem(row)
 				: row.kind === 'claude-closed' ? this._closedClaudeItem(row.data, row.live, row.side)
 				: row.kind === 'codex-hidden' ? this._hiddenCodexItem(row)
+				: row.kind === 'claude-hidden' ? this._hiddenClaudeItem(row)
 					: row.kind === 'codex-closed' ? this._closedCodexItem(row)
 				: this._item(row);
 			item.expandable = Boolean(item.subagentItems && item.subagentItems.length);
@@ -2179,6 +2380,8 @@ class ChatsProvider {
 		});
 		this.items = items.map((x) => x.item);
 		this.itemByTab = new Map(items.filter((x) => x.tab).map((x) => [x.tab, x.item]));
+		const foldItem = items.find((x) => x.item.id === 'claude-hidden');
+		if (foldItem && !this.showTranscriptless) for (const r of transcriptless) this.itemByTab.set(r.tab, foldItem.item);
 		// For the right-click placement commands: which tab holds a session,
 		// and whether that chat is mid-turn.
 		this.claudeTabBySession = new Map(rows.filter((r) => r.kind === 'claude' && r.data)
@@ -2291,6 +2494,26 @@ class ChatsProvider {
 
 	// Not a chat: what the Codex window hid, with the setting behind it and the
 	// one click that shows everything. Silence was the bug this prevents.
+	_hiddenClaudeItem(row) {
+		const n = row.tabs.length;
+		const empty = row.tabs.filter((t) => t.why === 'empty').length;
+		const gone = n - empty;
+		const item = new vscode.TreeItem(row.shown ? `Hide ${n} tab${n === 1 ? '' : 's'} without a transcript` : `${n} tab${n === 1 ? '' : 's'} without a transcript`,
+			vscode.TreeItemCollapsibleState.None);
+		item.id = 'claude-hidden';
+		item.iconPath = new vscode.ThemeIcon('history');
+		item.contextValue = 'claudeHidden';
+		item.description = [empty && `${empty} empty`, gone && `${gone} no transcript on disk`].filter(Boolean).join(' · ');
+		const md = new vscode.MarkdownString();
+		md.appendMarkdown(`Open Claude tabs that have no session transcript, so they have no place in the history:\n\n`);
+		for (const t of row.tabs.slice(0, 12)) md.appendMarkdown(`- ${t.label} — ${t.why === 'empty' ? 'no message sent yet' : 'no transcript on this machine'}\n`);
+		if (gone) md.appendMarkdown(`\nA transcript usually goes missing through Claude Code's own cleanup, which deletes chats idle for longer than \`cleanupPeriodDays\` (30 days unless set).`);
+		md.appendMarkdown(`\n\nClick to ${row.shown ? 'hide' : 'show'} them.`);
+		item.tooltip = md;
+		item.command = { command: 'openEditorsTools.toggleTranscriptlessTabs', title: row.shown ? 'Hide tabs without a transcript' : 'Show tabs without a transcript' };
+		return item;
+	}
+
 	_hiddenCodexItem(row) {
 		const item = new vscode.TreeItem(`${row.count} older Codex chat${row.count === 1 ? '' : 's'} hidden`, vscode.TreeItemCollapsibleState.None);
 		item.id = 'codex-hidden';
@@ -2511,8 +2734,13 @@ class ChatsProvider {
 		if (!data) {
 			// No session id to place yet: the right-click menu skips this row.
 			item.contextValue = 'claudeChatPending';
-			item.description = tab.isDirty ? 'working…' : 'no transcript yet';
-			item.tooltip = 'No session transcript matched this tab title yet.';
+			if (row.noTranscript === 'gone') {
+				item.description = 'no transcript on disk';
+				item.tooltip = 'This tab\'s session has no transcript on this machine, usually because Claude Code\'s cleanup deleted it after `cleanupPeriodDays` of inactivity. The tab cannot resume it.';
+			} else {
+				item.description = tab.isDirty ? 'working…' : 'no message yet';
+				item.tooltip = 'A new chat: it gets a transcript with its first message.';
+			}
 			return item;
 		}
 
@@ -2613,6 +2841,9 @@ function register(context) {
 	gatherOnce(context);
 	const index = new TranscriptIndex();
 	transcriptIndex = index;
+	claudeState.configure(
+		context.storageUri ? path.dirname(context.storageUri.fsPath) : null,
+		context.globalStorageUri ? path.dirname(context.globalStorageUri.fsPath) : null);
 	// One channel for everything this extension does that can fail quietly:
 	// usage fetches, webview resolution, layout moves. Opened from
 	// "Agent View: Show Log".
@@ -2792,6 +3023,10 @@ function register(context) {
 			await openCodexInEditor(conversationId);
 		}),
 		// The "N older Codex chats hidden" row: lift the window entirely.
+		vscode.commands.registerCommand('openEditorsTools.toggleTranscriptlessTabs', () => {
+			provider.showTranscriptless = !provider.showTranscriptless;
+			provider.refresh();
+		}),
 		vscode.commands.registerCommand('openEditorsTools.showAllCodexChats', async () => {
 			await vscode.workspace.getConfiguration('openEditorsTools').update('codexClosedDays', 0, vscode.ConfigurationTarget.Global);
 			provider.refresh();
@@ -3133,7 +3368,7 @@ module.exports = {
 	_internal: {
 		readTranscript, currentModelOf, claudeDefaultModel, pickerModelIds, codexInWindow, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
-		liveSessionRecord, endClaudeProcess, processTools, sidePanelChats,
+		liveSessionRecord, endClaudeProcess, processTools, sidePanelChats, claudeState, ClaudeCodeState, titleMatches,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,
 		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,
