@@ -5,6 +5,7 @@ const path = require('path');
 const API_BASE = 'https://aistupidlevel.info/api/v1';
 const SECRET_KEY = 'openEditorsTools.aslApiKey';
 const CACHE_KEY = 'openEditorsTools.aslLeaderboardCache';
+const PERIOD_KEY = 'openEditorsTools.aslPeriod';
 const REFRESH_HOURS = [8, 11, 14, 17, 20];
 // The site's CODING tab is its "speed" key, which its own frontend rewrites to
 // sortBy=7axis before every request. sortBy=coding is accepted by the API too
@@ -71,6 +72,12 @@ class LeaderboardCache {
 		// Setting openEditorsTools.subagentRecommendation.enabled, read per write.
 		this.isRecommendationEnabled = typeof options.isRecommendationEnabled === 'function' ? options.isRecommendationEnabled : null;
 		this.cache = context.globalState.get(CACHE_KEY) || emptyCache();
+		// The period the API grants this key, learned from its own answer.
+		seedPeriodForKey(context.globalState.get(PERIOD_KEY));
+		onPeriodDowngrade = () => {
+			this.log('ASL leaderboard: period=latest needs a paid plan; this key uses the 24h board from now on');
+			Promise.resolve(context.globalState.update(PERIOD_KEY, '24h')).catch(() => {});
+		};
 		// A coding column cached under another mode is wrong data with a right
 		// label; an empty column until the next fetch is the honest state.
 		if (this.cache.coding && this.cache.coding.sortBy !== CODING_SORT) {
@@ -192,14 +199,14 @@ class LeaderboardCache {
 
 		try {
 			if (!codingOnly) {
-				const reasoning = await fetchModels(this.fetchImpl, key, 'reasoning');
+				const reasoning = await fetchModels(this.fetchImpl, key, 'reasoning', this.sleep);
 				this.cache = { ...this.cache, reasoning, lastError: null };
 				await this._save();
 				this._notify();
 				if (this.spacingMs > 0) await this.sleep(this.spacingMs);
 			}
 
-			const coding = await fetchModels(this.fetchImpl, key, CODING_SORT);
+			const coding = await fetchModels(this.fetchImpl, key, CODING_SORT, this.sleep);
 			this.cache = {
 				...this.cache,
 				coding,
@@ -232,6 +239,9 @@ class LeaderboardCache {
 		const trimmed = String(key || '').trim();
 		if (!trimmed) return false;
 		await this.context.secrets.store(SECRET_KEY, trimmed);
+		// A new key may carry a paid plan: the live board gets one fresh try.
+		seedPeriodForKey('latest');
+		await Promise.resolve(this.context.globalState.update(PERIOD_KEY, undefined)).catch(() => {});
 		this.cache = { ...this.cache, lastError: null };
 		await this._save();
 		this._notify();
@@ -311,10 +321,18 @@ class LeaderboardCache {
 
 // Since 2026-10 the API sells period=latest as a paid plan
 // (latest_requires_plan); a free key gets the 24h board, which is the same
-// ranking a few hours older. The paid period is tried first and the downgrade
-// remembered for the session, so paid keys keep the fresher data.
+// ranking a few hours older. The downgrade is kept in globalState, so after
+// the first 403 every later call goes straight to the 24h board — the 403
+// itself counts against the API's one-call-a-minute limit, and an immediate
+// retry answered 429. The one retry at downgrade time waits that minute out.
+// Entering a new key resets the period, so a paid key gets the live board.
+const RATE_LIMIT_WAIT_MS = 65000;
 let periodForKey = 'latest';
-async function fetchModels(fetchImpl, key, sortBy) {
+let onPeriodDowngrade = () => {};
+function seedPeriodForKey(period) {
+	periodForKey = period === '24h' ? '24h' : 'latest';
+}
+async function fetchModels(fetchImpl, key, sortBy, sleep = (ms) => new Promise((r) => setTimeout(r, ms))) {
 	let response;
 	let body = null;
 	for (let attempt = 0; attempt < 2; attempt++) {
@@ -334,6 +352,8 @@ async function fetchModels(fetchImpl, key, sortBy) {
 		const code = body && (body.code || body.error || body.message);
 		if (!response.ok && periodForKey === 'latest' && /latest_requires_plan/.test(String(code))) {
 			periodForKey = '24h';
+			onPeriodDowngrade();
+			await sleep(RATE_LIMIT_WAIT_MS);
 			continue;
 		}
 		break;
@@ -512,6 +532,7 @@ function emptyCache() {
 }
 
 module.exports = {
+	seedPeriodForKey,
 	LeaderboardCache,
 	fetchModels,
 	shapeRows,

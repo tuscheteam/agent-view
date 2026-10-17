@@ -86,9 +86,14 @@ The Leaderboard panel shows AI Stupid Level's current OpenAI and Anthropic
 models in two compact columns: reasoning and coding. It uses the free API tier
 conservatively: five local-time refresh slots per day (`08:00`, `11:00`,
 `14:00`, `17:00`, `20:00`), two calls per slot, with the calls spaced apart for
-the 1/minute limit. Run **Agent View: Set AI Stupid Level API Key** once; the
-key is stored in VS Code SecretStorage, not in settings. If VS Code keeps the
-new view hidden after an update, run **Agent View: Show Leaderboard Panel**.
+the 1/minute limit. The API needs a key since October 2026 — a free one from
+[aistupidlevel.info/router/data-keys](https://aistupidlevel.info/router/data-keys).
+Run **Agent View: Set AI Stupid Level API Key** once; the key is stored in VS
+Code SecretStorage, not in settings. A free key gets the 24h board (the live
+board became a paid plan in the same change); the panel asks for the live
+board first and falls back on its own, so a paid key simply gets fresher data.
+If VS Code keeps the new view hidden after an update, run **Agent View: Show
+Leaderboard Panel**.
 
 The rank colour names the provider: white for OpenAI, orange for Anthropic,
 whose `claude-` prefix is dropped in the cell (hover a row for the full name),
