@@ -309,22 +309,35 @@ class LeaderboardCache {
 	}
 }
 
+// Since 2026-10 the API sells period=latest as a paid plan
+// (latest_requires_plan); a free key gets the 24h board, which is the same
+// ranking a few hours older. The paid period is tried first and the downgrade
+// remembered for the session, so paid keys keep the fresher data.
+let periodForKey = 'latest';
 async function fetchModels(fetchImpl, key, sortBy) {
-	const url = `${API_BASE}/models?period=latest&sortBy=${encodeURIComponent(sortBy)}`;
 	let response;
-	try {
-		response = await fetchImpl(url, {
-			headers: {
-				Authorization: `Bearer ${key}`,
-				Accept: 'application/json',
-			},
-		});
-	} catch (err) {
-		throw new Error(`${sortBy} request failed: ${err.message}`);
-	}
-
 	let body = null;
-	try { body = await response.json(); } catch (_) { /* shaped below */ }
+	for (let attempt = 0; attempt < 2; attempt++) {
+		const url = `${API_BASE}/models?period=${periodForKey}&sortBy=${encodeURIComponent(sortBy)}`;
+		try {
+			response = await fetchImpl(url, {
+				headers: {
+					Authorization: `Bearer ${key}`,
+					Accept: 'application/json',
+				},
+			});
+		} catch (err) {
+			throw new Error(`${sortBy} request failed: ${err.message}`);
+		}
+		body = null;
+		try { body = await response.json(); } catch (_) { /* shaped below */ }
+		const code = body && (body.code || body.error || body.message);
+		if (!response.ok && periodForKey === 'latest' && /latest_requires_plan/.test(String(code))) {
+			periodForKey = '24h';
+			continue;
+		}
+		break;
+	}
 	if (!response.ok) {
 		const code = body && (body.code || body.error || body.message);
 		throw new Error(`${sortBy} request returned ${response.status}${code ? ` (${code})` : ''}`);
@@ -335,7 +348,7 @@ async function fetchModels(fetchImpl, key, sortBy) {
 
 	return {
 		sortBy,
-		period: body.period || 'latest',
+		period: body.period || periodForKey,
 		generatedAt: body.generated_at || body.generatedAt || new Date().toISOString(),
 		count: body.count || body.data.length,
 		quota: quotaFromHeaders(response.headers),
