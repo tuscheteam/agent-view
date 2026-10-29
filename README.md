@@ -27,7 +27,9 @@ histories order them. Claude chats come from Claude Code's transcripts, and a ta
 matched to its chat through the session Claude Code saved for that tab (read from VS
 Code's state database, so a window reload sees exactly what the last session left).
 A tab whose title matches no transcript never borrows another chat's row; only a tab
-that still reads "Claude Code" may take a brand-new chat's untitled transcript. A
+that still reads "Claude Code" may take a brand-new chat's untitled transcript, and only
+a transcript Claude Code's VS Code extension wrote: `claude -p` runs that another tool
+starts (a Codex chat running reviews, a script) never land on a tab. A
 label Claude Code shortened ("Service worker registrat…") matches by prefix, as in
 Claude Code itself. A chat at work sorts as current even while its transcript sits
 still through a long tool call. Chats that Claude Code's history archives are left
@@ -242,6 +244,13 @@ A chat you renamed in Codex keeps that name here even after you resume it.
 stored token lasts 8 hours and only Claude Code renews it. The bars come back
 by themselves within a second of your next Claude message.
 
+`as of 12m · rate-limited, next try in 6m` under the Claude bars means Anthropic
+answered the usage check with HTTP 429, and the bars show the last good numbers.
+Anthropic limits this check per account, and every running Claude Code chat calls
+it too. Agent View then waits as long as Anthropic asks (`Retry-After`), otherwise
+2 minutes, doubling up to 30. The Refresh button does not skip that wait. All VS
+Code windows on the machine share one lookup through `~/.agent-view/claude-usage.json`.
+
 ## Install or update
 
 One command per OS. It installs Agent View the first time and replaces an older
@@ -403,7 +412,8 @@ Everything runs locally. Concretely, the extension:
   for the reasoning and coding leaderboard calls — one fetch per time slot across all
   your windows (windows share `~/.agent-view/leaderboard-cache.json`), so the free
   tier's ten daily calls are never exceeded by having two windows open;
-- caches usage for 5 minutes;
+- caches usage for 5 minutes; the Claude lookup is shared by all windows on the machine
+  through `~/.agent-view/claude-usage.json` and backs off after a rate-limit answer;
 - with the model router on: passes Claude requests to `api.anthropic.com` unchanged, sends
   requests for OpenRouter models with your OpenRouter key to `openrouter.ai`, reads
   OpenRouter's public provider lists and model cards, sends short test prompts (arithmetic

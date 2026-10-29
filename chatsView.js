@@ -236,6 +236,11 @@ async function readTranscript(file) {
 	let customTitle = null;
 	let aiTitle = null;
 	let model = null;
+	// Which Claude Code front end last wrote the transcript: "claude-vscode"
+	// for an editor tab, "sdk-cli" for `claude -p` runs that other tools start
+	// (a Codex chat running reviews), "cli" for a terminal. The last one
+	// counts: a terminal chat resumed in a tab continues as claude-vscode.
+	let entrypoint = null;
 	// When the last reply's model landed, and the last model switch Claude
 	// Code confirmed ("Set model to `x`"). currentModelOf() weighs both
 	// against the process start: Claude Code keeps no model per chat, so a
@@ -269,6 +274,7 @@ async function readTranscript(file) {
 		let record;
 		try { record = JSON.parse(line); } catch (_) { continue; }
 
+		if (record.entrypoint) entrypoint = record.entrypoint;
 		if (record.type === 'custom-title' && record.customTitle) { customTitle = record.customTitle; titles.add(record.customTitle); }
 		else if (record.type === 'ai-title' && record.aiTitle) { aiTitle = record.aiTitle; titles.add(record.aiTitle); }
 
@@ -344,6 +350,7 @@ async function readTranscript(file) {
 	return {
 		title: customTitle || aiTitle,
 		titles,
+		entrypoint,
 		model,
 		modelAt,
 		pickedModel,
@@ -666,6 +673,12 @@ function subagentsFor(projectDir, sessionId, now = Date.now()) {
 // none), which dates the background tasks that process can still own.
 function liveSessionIds() {
 	const ids = new Map();
+	// Sessions every record of which names a front end other than Claude
+	// Code's VS Code extension (a `claude -p` run, a terminal chat). The
+	// record knows from process start; the transcript only from its first
+	// user turn.
+	ids.foreign = new Set();
+	const fromVscode = new Set();
 	const dir = path.join(claudeConfigDir(), 'sessions');
 	let names;
 	try { names = fs.readdirSync(dir); } catch (_) { return ids; }
@@ -677,8 +690,11 @@ function liveSessionIds() {
 			const started = Number(rec.startedAt) || 0;
 			const known = ids.get(rec.sessionId);
 			ids.set(rec.sessionId, known === undefined ? started : Math.min(known, started));
+			if (rec.entrypoint && rec.entrypoint !== 'claude-vscode') ids.foreign.add(rec.sessionId);
+			else fromVscode.add(rec.sessionId);
 		} catch (_) { /* being written right now */ }
 	}
+	for (const id of fromVscode) ids.foreign.delete(id);
 	return ids;
 }
 
@@ -981,7 +997,10 @@ class TranscriptIndex {
 	// a chat that has a title would show it, so a titled transcript is not its
 	// own. `exclude` holds sessions known to run outside any tab (the side
 	// panel); without it a fresh "Claude Code" tab took the side-panel chat's
-	// row and the chat vanished from the list.
+	// row and the chat vanished from the list. A transcript written by another
+	// front end (a `claude -p` run, a terminal chat) is never a tab's own: an
+	// empty "Claude Code" tab borrowed the newest `claude -p` review a Codex
+	// chat had started, and showed it as running for days.
 	unclaimedSince(cutoffMs, claimed, live, { untitledOnly = false, exclude = null } = {}) {
 		let best = null;
 		const rank = (entry) => (live && live.has(entry.sessionId) ? 1 : 0);
@@ -989,6 +1008,8 @@ class TranscriptIndex {
 			if (claimed.has(entry.sessionId)) continue;
 			if (exclude && exclude.has(entry.sessionId)) continue;
 			if (untitledOnly && entry.title) continue;
+			if (entry.entrypoint && entry.entrypoint !== 'claude-vscode') continue;
+			if (live && live.foreign && live.foreign.has(entry.sessionId)) continue;
 			const isLive = live && live.has(entry.sessionId);
 			if (!isLive && (entry.title || entry.lastActivity < cutoffMs)) continue;
 			if (!best || rank(entry) > rank(best)
@@ -3229,7 +3250,7 @@ function register(context) {
 		if (credentialsDebounce) clearTimeout(credentialsDebounce);
 		credentialsDebounce = setTimeout(() => {
 			credentialsDebounce = null;
-			log('credentials changed, refetching Claude usage');
+			log('credentials changed');
 			usage.invalidate('claude');
 			usageView.render();
 		}, 1000);

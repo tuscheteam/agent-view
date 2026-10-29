@@ -169,7 +169,7 @@ ${rows}
 
 	_row(name, cls, usage, widths) {
 		if (!usage) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span><span class="muted">checking…</span></div></div>`;
-		if (usage.error) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span></div><div class="sub">${escapeHtml(usage.error)}</div></div>`;
+		if (usage.error) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span></div><div class="sub">${escapeHtml(failureText(usage))}</div></div>`;
 		if (!usage.windows.length) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span><span class="muted">no limits reported</span></div></div>`;
 
 		const lines = usage.windows
@@ -188,11 +188,43 @@ ${rows}
 			})
 			.join('\n');
 
+		const stale = usage.stale
+			? `\n\t<div class="sub" title="${escapeHtml(usage.stale.error)}">${escapeHtml(staleText(usage.stale))}</div>`
+			: '';
 		return `<div class="urow ${cls}">
 	<div class="head"><span class="uname">${name}</span><span class="sub">${escapeHtml(usage.plan || '')}</span></div>
-${lines}
+${lines}${stale}
 </div>`;
 	}
+}
+
+// "as of 12m · rate-limited, next try in 6m": the bars are the last good
+// answer, and the line says how old they are and when the next lookup runs.
+function staleText(stale) {
+	const age = stale.since ? ago(stale.since) : null;
+	const why = stale.status === 429 ? 'rate-limited'
+		: stale.auth && !stale.status ? 'waiting for a fresh Claude token'
+			: stale.auth ? `lookup refused (${stale.status})` : 'lookup failed';
+	const next = nextTry(stale.retryAt);
+	return [age ? `as of ${age}` : null, next ? `${why}, ${next}` : why].filter(Boolean).join(' · ');
+}
+function failureText(usage) {
+	const next = nextTry(usage.retryAt);
+	const text = usage.status === 429 ? 'Anthropic rate-limits the usage check'
+		: usage.auth && usage.status ? `Anthropic refused the usage check (${usage.status})` : usage.error;
+	return next ? `${text} · ${next}` : text;
+}
+function nextTry(at) {
+	const left = at ? formatReset(at) : null;
+	if (!left) return null;
+	return left === 'due' ? 'next try soon' : `next try in ${left}`;
+}
+function ago(ms) {
+	const mins = Math.round((Date.now() - ms) / 60000);
+	if (mins < 1) return 'just now';
+	if (mins < 60) return `${mins}m`;
+	const hours = Math.round(mins / 60);
+	return hours < 48 ? `${hours}h` : `${Math.round(hours / 24)}d`;
 }
 
 function clamp(pct) {
@@ -202,7 +234,7 @@ function clamp(pct) {
 function describe(usage) {
 	if (!usage) return 'pending';
 	if (usage.error) return `error(${usage.error})`;
-	return `${usage.windows.length} window(s)`;
+	return `${usage.windows.length} window(s)${usage.stale ? ' stale' : ''}`;
 }
 
 function escapeHtml(text) {
