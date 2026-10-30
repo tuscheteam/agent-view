@@ -289,12 +289,26 @@ async function readTranscript(file) {
 
 		const message = record.message;
 		let resultInfo = null;
+		// The launch message names the task's own output file; the record that
+		// follows the tool result says where. Read from the result text, not
+		// guessed from the project slug, which changes case between machines.
+		let resultOutputPath = null;
 		if (message && Array.isArray(message.content)) {
 			for (const block of message.content) {
+				if (block.type === 'tool_result') {
+					const text = typeof block.content === 'string' ? block.content
+						: Array.isArray(block.content) ? block.content.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('\n') : '';
+					const named = /Output is being written to:\s*(.+?)\.output/.exec(text);
+					if (named) resultOutputPath = `${named[1]}.output`;
+				}
 				if (block.type === 'tool_use') {
 					pending.set(block.id, block.name);
 					const input = block.input || {};
-					toolInputs.set(block.id, { name: block.name, description: input.description || null });
+					toolInputs.set(block.id, {
+						name: block.name,
+						description: input.description || null,
+						command: typeof input.command === 'string' ? input.command.slice(0, 4000) : null,
+					});
 					if (block.name === 'TaskStop' || block.name === 'KillShell') {
 						const stopped = input.task_id || input.shell_id;
 						if (stopped) { bgTasks.delete(stopped); bgFinished.add(stopped); }
@@ -307,7 +321,7 @@ async function readTranscript(file) {
 			}
 		}
 		if (resultInfo && record.toolUseResult) {
-			const task = backgroundLaunch(record.toolUseResult, resultInfo, stampOf(record, 0));
+			const task = backgroundLaunch(record.toolUseResult, resultInfo, stampOf(record, 0), resultOutputPath);
 			if (task && (task.resumed || !bgFinished.has(task.id))) {
 				if (task.resumed) {
 					bgFinished.delete(task.id);
@@ -377,11 +391,18 @@ async function readTranscript(file) {
 // A launch is recognised by the structured toolUseResult on the tool_result
 // record, never by result text: a transcript that merely prints another
 // chat's launch message must not gain a phantom task.
-function backgroundLaunch(result, info, at) {
+function backgroundLaunch(result, info, at, outputPath = null) {
 	if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
 	const description = info && info.description;
 	if (result.backgroundTaskId) {
-		return { id: String(result.backgroundTaskId), kind: 'shell', label: description || 'background command', startedAt: at };
+		return {
+			id: String(result.backgroundTaskId),
+			kind: 'shell',
+			label: description || 'background command',
+			command: (info && info.command) || null,
+			outputPath: outputPath || null,
+			startedAt: at,
+		};
 	}
 	if (result.status === 'async_launched' && result.agentId) {
 		return { id: String(result.agentId), kind: 'agent', label: result.description || description || 'background agent', startedAt: at };
@@ -445,12 +466,136 @@ function finishedTaskIds(record) {
 // bounds what a silent UI stop can leave behind; a persistent monitor is meant
 // to live as long as its session, so the cap skips it.
 const BG_TASK_MAX_AGE_MS = 24 * 3600000;
-function liveBackgroundTasks(data, processStartedAt, now = Date.now()) {
+
+// A shell's own end. Claude Code writes each background command's output to a
+// file it names in the launch message and appends the outcome as the last
+// line. A shell killed together with its supervisor never gets that line, and
+// its empty file read as "still running" for hours. So two checks: the line
+// ends the row at once, and a task whose session process has no live child
+// process at all cannot be running either — a background command IS a child
+// process.
+const TASK_END_RE = /\[(exited with code -?\d+|killed|terminated:[^\]]*|timed out[^\]]*)\]\s*$/;
+
+// Where a session's task files live: the folder the launch message named, or
+// — for a transcript that predates that message — any folder under the tmp
+// root that holds the session id. A miss is remembered for a minute: the tmp
+// root holds a folder per project the CLI ever ran in.
+const taskDirs = new Map();
+const TASK_DIR_MISS_MS = 60000;
+let tmpSlugs = { at: 0, names: [] };
+function taskDirsFor(sessionId) {
+	if (!sessionId) return [];
+	const known = taskDirs.get(sessionId);
+	if (known && (known.dirs.length || Date.now() - known.at < TASK_DIR_MISS_MS)) return known.dirs;
+	const root = path.join(os.tmpdir(), 'claude');
+	if (Date.now() - tmpSlugs.at > TASK_DIR_MISS_MS) {
+		try { tmpSlugs = { at: Date.now(), names: fs.readdirSync(root) }; } catch (_) { tmpSlugs = { at: Date.now(), names: [] }; }
+	}
+	const found = [];
+	for (const name of tmpSlugs.names) {
+		const dir = path.join(root, name, sessionId, 'tasks');
+		try {
+			if (fs.statSync(dir).isDirectory()) found.push(dir);
+		} catch (_) { /* another project's folder */ }
+	}
+	taskDirs.set(sessionId, { at: Date.now(), dirs: found });
+	return found;
+}
+
+// The task's output file: the path the launch message named, else the file of
+// that name in any of the session's task folders.
+function taskOutputFile(task, sessionId) {
+	if (task.outputPath) {
+		try { if (fs.statSync(task.outputPath).isFile()) return task.outputPath; } catch (_) { /* moved */ }
+	}
+	for (const dir of taskDirsFor(sessionId)) {
+		const file = path.join(dir, `${task.id}.output`);
+		try { if (fs.statSync(file).isFile()) return file; } catch (_) { /* another folder */ }
+	}
+	return null;
+}
+
+function shellTaskEnded(task, sessionId) {
+	const file = taskOutputFile(task, sessionId);
+	if (!file) return false;
+	let stat;
+	try { stat = fs.statSync(file); } catch (_) { return false; }
+	const size = Math.min(stat.size, 400);
+	if (!size) return false;
+	try {
+		const fd = fs.openSync(file, 'r');
+		try {
+			const buffer = Buffer.alloc(size);
+			fs.readSync(fd, buffer, 0, size, stat.size - size);
+			return TASK_END_RE.test(buffer.toString('utf8'));
+		} finally { fs.closeSync(fd); }
+	} catch (_) { return false; }
+}
+
+// One process tree for every row, refreshed in the background: a tree refresh
+// must not wait on PowerShell, and the last tree is close enough. Only pids
+// and parents are read — command lines differ in quoting and encoding between
+// the shell that runs a task and the transcript.
+const PROCESS_LIST_MS = 15000;
+const processList = { at: 0, takenAt: 0, procs: null, pending: false };
+function refreshProcessList() {
+	if (processList.pending || Date.now() - processList.at < PROCESS_LIST_MS) return;
+	processList.pending = true;
+	const done = (text) => {
+		const procs = new Map();
+		if (text) {
+			for (const line of text.split(/\r?\n/)) {
+				const m = /^(\d+)\|(\d+)$/.exec(line.trim());
+				if (m) procs.set(Number(m[1]), Number(m[2]));
+			}
+		}
+		processList.procs = procs.size ? procs : null;
+		processList.takenAt = Date.now();
+		processList.at = Date.now();
+		processList.pending = false;
+	};
+	const query = process.platform === 'win32'
+		? execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+			'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)|$($_.ParentProcessId)" }'],
+			{ timeout: 20000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }).then((r) => String(r.stdout || ''))
+		: execFileAsync('ps', ['-Ao', 'pid=,ppid='], { timeout: 10000, maxBuffer: 16 * 1024 * 1024 })
+			.then((r) => String(r.stdout || '').split('\n').map((l) => l.trim().split(/\s+/).reverse().join('|')).join('\n'));
+	query.then(done).catch(() => done(null));
+}
+
+// Does this process still have a child or grandchild? A background command is
+// one, however it was spelled. Null when the tree could not be read.
+function hasLiveDescendants(pid) {
+	if (!processList.procs) return null;
+	const seen = new Set();
+	const queue = [];
+	for (const [child, parent] of processList.procs) if (parent === pid) queue.push(child);
+	while (queue.length) {
+		const next = queue.pop();
+		if (seen.has(next)) continue;
+		seen.add(next);
+		for (const [child, parent] of processList.procs) if (parent === next) queue.push(child);
+	}
+	return seen.size > 0;
+}
+
+function shellTaskRunning(task, sessionId, sessionPid) {
+	if (shellTaskEnded(task, sessionId)) return false;
+	if (!sessionPid) return true;
+	// A tree read before the task started says nothing about it.
+	if (!processList.procs || processList.takenAt < task.startedAt) return true;
+	const kids = hasLiveDescendants(sessionPid);
+	return kids === null ? true : kids;
+}
+
+function liveBackgroundTasks(data, processStartedAt, now = Date.now(), ctx = {}) {
 	if (!data || !data.backgroundTasks || !data.backgroundTasks.length) return [];
 	if (processStartedAt === undefined || processStartedAt === null) return [];
+	if (data.backgroundTasks.some((t) => t.kind === 'shell')) refreshProcessList();
 	return data.backgroundTasks.filter((t) => t.startedAt >= processStartedAt
 		&& (t.persistent || now - t.startedAt < BG_TASK_MAX_AGE_MS)
-		&& (!t.until || now < t.until));
+		&& (!t.until || now < t.until)
+		&& (t.kind !== 'shell' || shellTaskRunning(t, data.sessionId, ctx.pid)));
 }
 
 // ── Subagents ──────────────────────────────────────────────────────────────
@@ -678,6 +823,9 @@ function liveSessionIds() {
 	// record knows from process start; the transcript only from its first
 	// user turn.
 	ids.foreign = new Set();
+	// sessionId -> pid of the registry record, the root of that session's
+	// process tree (a background command runs under it).
+	ids.pid = new Map();
 	const fromVscode = new Set();
 	const dir = path.join(claudeConfigDir(), 'sessions');
 	let names;
@@ -690,6 +838,7 @@ function liveSessionIds() {
 			const started = Number(rec.startedAt) || 0;
 			const known = ids.get(rec.sessionId);
 			ids.set(rec.sessionId, known === undefined ? started : Math.min(known, started));
+			if (rec.pid && !ids.pid.has(rec.sessionId)) ids.pid.set(rec.sessionId, Number(rec.pid));
 			if (rec.entrypoint && rec.entrypoint !== 'claude-vscode') ids.foreign.add(rec.sessionId);
 			else fromVscode.add(rec.sessionId);
 		} catch (_) { /* being written right now */ }
@@ -1692,7 +1841,7 @@ function moveTabToSideColumn(sessionId) {
 function chatIsBusy(sessionId, rec) {
 	if (rec.status !== 'idle') return true;
 	const entry = transcriptIndex && transcriptIndex.entryFor(sessionId);
-	return liveBackgroundTasks(entry, rec.startedAt).length > 0;
+	return liveBackgroundTasks(entry, rec.startedAt, Date.now(), { pid: rec.pid }).length > 0;
 }
 
 // Claude Code's side panel switches to a fresh, empty chat: the one way to
@@ -2442,7 +2591,7 @@ class ChatsProvider {
 			// A background agent, or a workflow's agents, still writing already
 			// have subagent rows; the task row takes over once they go quiet.
 			const tasks = data && settingOn('chats.showBackgroundTasks')
-				? liveBackgroundTasks(data, live.get(data.sessionId))
+				? liveBackgroundTasks(data, live.get(data.sessionId), Date.now(), { pid: live.pid && live.pid.get(data.sessionId) })
 					.filter((task) => !subagents.running.some((s) => (task.kind === 'agent' && s.id === task.id)
 						|| (task.kind === 'workflow' && task.runId && s.runId === task.runId)))
 				: [];
@@ -3690,6 +3839,7 @@ module.exports = {
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
 		liveSessionRecord, endClaudeProcess, claudeProcessOwner, processTools, sideColumnSessions, sideColumnIndex, claudeColumn, loadSideColumn, codexViewColumn, newCodexInTab, claudeState, ClaudeCodeState, titleMatches,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
+		shellTaskRunning, shellTaskEnded, taskOutputFile, taskDirsFor, taskDirs, processList, hasLiveDescendants,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,
 		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,
 		resolveCodexTarget, openCodexInSidebar, openCodexInEditor, newCodexChat,

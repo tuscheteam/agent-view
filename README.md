@@ -389,7 +389,7 @@ running there.
 | `openEditorsTools.closedChatHours` | `720` | How long closed Claude chats stay listed. 720 hours (30 days) matches how long Claude Code keeps a transcript. `0` hides them |
 | `openEditorsTools.recentFirst` | `false` | Move the editor you just activated to the top of its group |
 | `openEditorsTools.codexOpenTarget` | `auto` | Where a Codex row opens: `sidebar` panel, `editor` tab, or `auto` |
-| `openEditorsTools.chats.showBackgroundTasks` | `true` | Spinner rows for background shells, agents, workflows and monitors a chat waits on |
+| `openEditorsTools.chats.showBackgroundTasks` | `true` | Spinner rows for background shells, agents, workflows and monitors a chat waits on. A shell row goes when the command ends: Claude Code appends its outcome to the task's output file, and the shell process itself is checked, so a killed wait loop stops showing as running |
 | `openEditorsTools.chats.showCrossProviderSubagents` | `true` | Codex runs started from a Claude chat (and the reverse) as subagent rows |
 | `openEditorsTools.leaderboard.showDeepSeek` | `auto` | DeepSeek row on the leaderboard: `auto` (while the router is on), `always`, `never` |
 | `openEditorsTools.subagentRecommendation.enabled` | `true` | Write `~/.agent-view/subagent-recommendation.json` |
