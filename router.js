@@ -119,6 +119,9 @@ function replaceMedia(content, modelInfo = {}) {
 	return changed ? out : content;
 }
 
+// Claude Code's five effort levels as OpenRouter's three reasoning depths.
+const REASONING_EFFORT = { low: 'low', medium: 'medium', high: 'high', xhigh: 'high', max: 'high' };
+
 // Anthropic-only request features stripped before OpenRouter. Kept as one
 // function so the list follows what Claude Code actually sends (captured from
 // Claude Code 2.1.285).
@@ -166,6 +169,16 @@ function transformForOpenRouter(body, modelInfo = {}) {
 	// metadata.user_id carries the Anthropic account and device ids; OpenRouter
 	// gets the chat's session id as session_id instead.
 	delete out.metadata;
+	// Claude Code sends the panel's effort level as output_config.effort, an
+	// Anthropic-only field OpenRouter ignores. Translate it into the provider's
+	// reasoning depth, or the effort slider would be cosmetic for every
+	// OpenRouter model. Claude Code's five levels collapse onto the three
+	// OpenRouter knows (verified against its reasoning API on 2026-10-30).
+	if (out.output_config && typeof out.output_config.effort === 'string') {
+		const level = REASONING_EFFORT[out.output_config.effort] || 'medium';
+		delete out.output_config;
+		if (!out.reasoning) out.reasoning = { effort: level };
+	}
 	return out;
 }
 

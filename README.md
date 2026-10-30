@@ -160,6 +160,12 @@ to Anthropic unchanged. Requests for `vendor/model` names go to OpenRouter with:
   cache reads), and each chat stays on one provider so its cache stays warm. The
   check re-runs weekly in the background (a few cents).
 
+The composer's effort level reaches the provider as `reasoning.effort`.
+Claude Code sends it as `output_config.effort`, a field OpenRouter ignores, so the
+router copies it over and drops the original. OpenRouter knows three depths:
+`low`, `medium` and `high`. The levels `Extra high` and `max` both arrive as
+`high`.
+
 When no provider qualifies, a request is refused with a message instead of
 letting OpenRouter choose; **Model Router: Re-check OpenRouter Providers** runs
 the check again. A provider that rejects a request another provider then serves is skipped on
