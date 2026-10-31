@@ -511,12 +511,14 @@ function register(context, log, version) {
 			closed = true;
 			watchDefaultModel(false);
 			if (!router) return;
-			// A standby window leaves the menu rows to the window that serves;
-			// that window may sit in another VS Code profile, which hears no
-			// settings event from this one and would not put them back.
-			if (router.role !== 'standby') {
-				try { syncPickerRows([], log); } catch (_) { /* window closing */ }
-			}
+			// The menu rows stay: a reload closes this window and opens the next
+			// one a moment later, and a chat whose model menu was built in that
+			// gap kept a Claude-only list for the rest of its life — DeepSeek
+			// silently gone from one chat while another still offered it. The
+			// rows are only stripped when the router is switched off, and by the
+			// uninstaller. A chat sending in the gap gets a connection error,
+			// which says what is wrong; a missing menu row does not.
+			// (No window strips them here, serving or standby.)
 			await Promise.race([syncing.catch(() => {}), new Promise((r) => setTimeout(r, 1000))]);
 			const port = router ? router.port : routerPort();
 			// The port is freed before the entry goes, so a waiting window that
