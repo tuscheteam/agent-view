@@ -3019,10 +3019,9 @@ class ChatsProvider {
 	_closedClaudeItem(data, live = false, inSidePanel = false) {
 		const item = new vscode.TreeItem(data.title, vscode.TreeItemCollapsibleState.None);
 		item.id = `closed:${data.sessionId}`;
-		// Codicon, not the logo — closed rows should read as a different class
-		// of thing at a glance. A chat whose process runs without a tab here
-		// keeps the logo: it is open, in the side panel or somewhere else.
-		item.iconPath = live ? this.icon : new vscode.ThemeIcon('history');
+		// The logo, open or closed — a row says which agent it is before it
+		// says how old it is; "closed" in the description carries the state.
+		item.iconPath = this.icon;
 		item.contextValue = 'closedClaudeChat';
 		const where = inSidePanel ? "in Claude's side panel" : live ? 'open elsewhere' : 'closed';
 		item.description = [formatAge(data.lastActivity), where, formatCost(data.cost)].join(' · ');
@@ -3802,7 +3801,7 @@ function register(context) {
 			if (!name || !sessionId) return;
 			// -t: an interactive claude needs a terminal on the far side.
 			// cd first: resume is scoped to the directory the chat ran in.
-			const remote = (cwd ? `cd ${shellQuote(String(cwd))} && ` : '') + `claude --resume ${shellQuote(String(sessionId))}`;
+			const remote = `export IS_SANDBOX=1; ${cwd ? `cd ${shellQuote(String(cwd))} && ` : ''}claude --resume ${shellQuote(String(sessionId))}`;
 			const terminal = vscode.window.createTerminal({ name: `${name} · ${String(sessionId).slice(0, 8)}`, shellPath: 'ssh', shellArgs: ['-t', name, remote] });
 			terminal.show();
 		}),
