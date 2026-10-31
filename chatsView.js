@@ -622,6 +622,15 @@ const SUBAGENT_ACTIVE_MS = 120000;
 // only when a watcher or the sweep happened to fire. So now: each tick
 // repaints ONE parent row, round-robin, and while a root refresh is pending
 // or running the tick fires nothing at all (see spinnerTick).
+const REFRESH_COALESCE_MS = 120;
+// A transcript is re-parsed at most this often while it keeps growing. The
+// wait grows with the file: parsing a 30 MB transcript costs seconds, and one
+// active chat rewrites its file on every message.
+const RERAPARSE_MS = 4000;
+function reparseWait(size) {
+	const mb = Math.max(0, Number(size) || 0) / 1e6;
+	return RERAPARSE_MS + Math.min(56000, Math.round(mb) * 1500);
+}
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SPINNER_INTERVAL_MS = 200;
 // A requested root refresh that never lands (a throw inside getChildren, a
@@ -1053,6 +1062,15 @@ function entryCarries(entry, key) {
 // Cached by mtime+size so a refresh only re-reads transcripts that actually
 // changed; without it every tab switch would re-parse the whole store.
 class TranscriptIndex {
+	// What the list is built from, in one string: cheap enough on every file
+	// event, exact enough to know when nothing moved.
+	stamp() {
+		const parts = [];
+		for (const [file, entry] of this.byFile) parts.push(`${file}:${entry.mtimeMs}:${entry.size}`);
+		parts.sort();
+		return `${parts.join('|')}#${this.byFile.size}`;
+	}
+
 	constructor() {
 		this.byFile = new Map();
 		this.byTitle = new Map();
@@ -1085,10 +1103,16 @@ class TranscriptIndex {
 
 			const cached = this.byFile.get(file);
 			let entry;
+			// Parsing is the expensive part of a render, and an active chat
+			// rewrites its transcript on every message. A file that changed a
+			// moment ago waits for the next pass.
+			const tooSoon = cached && Date.now() - (cached.parsedAt || 0) < reparseWait(stat.size);
 			// A chat that used OpenRouter models is re-read when the router's
 			// cost log moves on, since its billed costs land there after the reply.
 			if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size
 				&& !(cached.routed && routerCosts().mtimeMs !== cached.ledgerMtimeMs)) {
+				entry = cached;
+			} else if (tooSoon && !(cached.routed && routerCosts().mtimeMs !== cached.ledgerMtimeMs)) {
 				entry = cached;
 			} else {
 				try {
@@ -1099,9 +1123,11 @@ class TranscriptIndex {
 				entry.ledgerMtimeMs = entry.routed ? routerCosts().mtimeMs : 0;
 				entry.mtimeMs = stat.mtimeMs;
 				entry.size = stat.size;
+				entry.parsedAt = Date.now();
 				entry.sessionId = name.replace(/\.jsonl$/, '');
 				this.byFile.set(file, entry);
 			}
+			entry.file = file;
 			entry.lastActivity = stat.mtimeMs;
 
 			// Index under every title the session ever carried, so a tab whose
@@ -2431,7 +2457,9 @@ const sectionStore = {
 		Promise.resolve(store.update(SECTIONS_KEY, this.state)).catch(() => {});
 	},
 	newSection(name) {
-		const id = `s${Date.now().toString(36)}`;
+		// A stamp alone collides: two sections made in the same millisecond got
+		// one id, and a drop then moved the wrong one — or none at all.
+		const id = `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 		this.state.sections.push({ id, name });
 		this.save();
 		return id;
@@ -2448,6 +2476,16 @@ const sectionStore = {
 		for (const [key, val] of Object.entries(this.state.assign)) if (val === id) delete this.state.assign[key];
 		this.save();
 	},
+	move(id, beforeId) {
+		const from = this.state.sections.findIndex((x) => x.id === id);
+		const to = this.state.sections.findIndex((x) => x.id === beforeId);
+		if (from === -1 || to === -1 || from === to) return false;
+		const [sec] = this.state.sections.splice(from, 1);
+		this.state.sections.splice(to, 0, sec);
+		this.save();
+		return true;
+	},
+	byId(id) { return this.state.sections.find((x) => x.id === id) || null; },
 	assign(key, id) {
 		if (!key) return;
 		if (!id) delete this.state.assign[key];
@@ -2482,6 +2520,61 @@ const remoteNames = {
 		else delete this.state[key];
 		const store = this.context && this.context.workspaceState;
 		if (store) Promise.resolve(store.update(REMOTE_NAMES_KEY, this.state)).catch(() => {});
+	},
+};
+
+// Names given to chats that run here. A local chat is renamed by the same
+// custom-title record Claude Code writes itself, so the tab title follows; the
+// store is the fallback that keeps the row right when the transcript is gone.
+const CHAT_NAMES_KEY = 'openEditorsTools.chatNames';
+const chatNames = {
+	state: {},
+	context: null,
+	load(context) {
+		if (context) this.context = context;
+		const raw = this.context && this.context.workspaceState ? this.context.workspaceState.get(CHAT_NAMES_KEY) : null;
+		this.state = raw && typeof raw === 'object' ? { ...raw } : {};
+		return this.state;
+	},
+	get(key) { return (key && this.state[key]) || null; },
+	set(key, name) {
+		if (!key) return;
+		if (name) this.state[key] = name;
+		else delete this.state[key];
+		const store = this.context && this.context.workspaceState;
+		if (store) Promise.resolve(store.update(CHAT_NAMES_KEY, this.state)).catch(() => {});
+	},
+};
+
+// Hidden chats. Claude Code archives a chat by id in its own state; a chat on
+// another host, a Codex thread and a local chat all get the same treatment
+// here, keyed by the row key, and the title bar can show them again.
+const ARCHIVED_KEY = 'openEditorsTools.archivedChats';
+const archivedChats = {
+	state: [],
+	context: null,
+	shown: false,
+	load(context) {
+		if (context) this.context = context;
+		const raw = this.context && this.context.workspaceState ? this.context.workspaceState.get(ARCHIVED_KEY) : null;
+		this.state = Array.isArray(raw) ? raw.filter((x) => typeof x === 'string') : [];
+		return this.state;
+	},
+	has(key) { return Boolean(key) && this.state.includes(key); },
+	add(key) {
+		if (!key || this.has(key)) return;
+		this.state.push(key);
+		this.save();
+	},
+	remove(key) {
+		const i = this.state.indexOf(key);
+		if (i === -1) return;
+		this.state.splice(i, 1);
+		this.save();
+	},
+	save() {
+		const store = this.context && this.context.workspaceState;
+		if (store) Promise.resolve(store.update(ARCHIVED_KEY, this.state)).catch(() => {});
 	},
 };
 
@@ -2535,12 +2628,28 @@ class ChatsProvider {
 		this.onDidRender = this._onDidRender.event;
 	}
 
+	// A file write that changes nothing visible costs a render, and an active
+	// chat writes constantly. Compare what the list is built from first.
+	refreshIfChanged() {
+		const stamp = typeof this.index.stamp === 'function' ? this.index.stamp() : null;
+		if (stamp !== null && stamp === this._lastStamp) return;
+		this._lastStamp = stamp;
+		this.refresh();
+	}
+
 	refresh() {
 		// The one place a root refresh is requested. Marking it before the
-		// fire() lets spinnerTick yield until the render lands.
+		// fire() lets spinnerTick yield until the render lands. Calls that
+		// arrive within a moment of each other collapse into one render: a
+		// burst of file events used to queue a render per event, and the tree
+		// sat with its progress bar on while they drained.
 		this._rootPending = true;
 		this._rootPendingSince = Date.now();
-		this._onDidChangeTreeData.fire();
+		if (this._refreshTimer) return;
+		this._refreshTimer = setTimeout(() => {
+			this._refreshTimer = null;
+			this._onDidChangeTreeData.fire();
+		}, REFRESH_COALESCE_MS);
 	}
 
 	// Advance the shared frame and rewrite every child label in place, then
@@ -2614,9 +2723,14 @@ class ChatsProvider {
 			// drop receives text nothing can be filed from.
 			handleDrag(items, dataTransfer) {
 				try { dataTransfer.set(mime, new vscode.DataTransferItem(items)); } catch (_) { /* older host */ }
+				// VS Code may put its own opaque payload on the transfer instead
+				// of ours; the drop then has nothing to read, so keep the items
+				// it handed us here.
+				provider.lastDragged = items;
+				setTimeout(() => { if (provider.lastDragged === items) provider.lastDragged = null; }, 30000);
 			},
 			handleDrop: async (target, dataTransfer) => {
-				if (!target || target.contextValue !== 'chatSection' || !target.sectionId) return;
+				if (!target || !target.contextValue || !target.contextValue.startsWith('chatSection')) return;
 				const store = sectionStore;
 				// The tree's own mime type carries the dragged items.
 				let dragged = [];
@@ -2625,9 +2739,15 @@ class ChatsProvider {
 					const value = payload && payload.value;
 					dragged = Array.isArray(value) ? value : [];
 				} catch (_) { dragged = []; }
-				if (!dragged.length) return;
+				if (!dragged.length) dragged = provider.lastDragged || [];
 				let changed = false;
 				for (const item of dragged) {
+					// A section dropped on a section takes that place in the order.
+					if (item && item.sectionId) {
+						if (item.sectionId === target.sectionId) continue;
+						changed = store.move(item.sectionId, target.sectionId) || changed;
+						continue;
+					}
 					if (!item || !item.rowKey) continue;
 					store.assign(item.rowKey, target.sectionId);
 					changed = true;
@@ -2948,10 +3068,18 @@ class ChatsProvider {
 		// assigned to one leaves the flat list; unassigned chats stay where
 		// they were, so a list without sections looks exactly as before.
 		const sections = sectionStore.state;
-		const keyed = items.map((x, i) => { const key = chatRowKey(rows[i]); x.item.rowKey = key; return { item: x.item, key }; });
+		const keyed = items.map((x, i) => {
+			const row = rows[i];
+			const key = chatRowKey(row);
+			x.item.rowKey = key;
+			x.item.contextValue = archivedChats.has(key) ? `${x.item.contextValue}Archived` : x.item.contextValue;
+			return { item: x.item, key };
+		});
+		// Archived chats leave the list unless the title bar asks for them.
+		const visible = archivedChats.shown ? keyed : keyed.filter((k) => !archivedChats.has(k.key));
 		const placed = new Set();
 		const sectionItems = sections.sections.map((sec) => {
-			const children = keyed.filter((k) => k.key && sections.assign[k.key] === sec.id).map((k) => { placed.add(k.key); return k.item; });
+			const children = visible.filter((k) => k.key && sections.assign[k.key] === sec.id).map((k) => { placed.add(k.key); return k.item; });
 			const node = new vscode.TreeItem(sec.name, children.length ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
 			node.id = `section:${sec.id}`;
 			node.contextValue = 'chatSection';
@@ -2965,7 +3093,7 @@ class ChatsProvider {
 			node.sectionId = sec.id;
 			return node;
 		});
-		const rootChats = keyed.filter((k) => !(k.key && placed.has(k.key))).map((k) => k.item);
+		const rootChats = visible.filter((k) => !(k.key && placed.has(k.key))).map((k) => k.item);
 		this.items = [...sectionItems, ...rootChats];
 		this.itemByTab = new Map(items.filter((x) => x.tab).map((x) => [x.tab, x.item]));
 		const foldItem = items.find((x) => x.item.id === 'claude-hidden');
@@ -3044,8 +3172,9 @@ class ChatsProvider {
 	}
 
 	_closedClaudeItem(data, live = false, inSidePanel = false) {
-		const item = new vscode.TreeItem(data.title, vscode.TreeItemCollapsibleState.None);
+		const item = new vscode.TreeItem(chatNames.get(`claude:${data.sessionId}`) || data.title, vscode.TreeItemCollapsibleState.None);
 		item.id = `closed:${data.sessionId}`;
+		item.chatData = data;
 		// The logo, open or closed — a row says which agent it is before it
 		// says how old it is; "closed" in the description carries the state.
 		item.iconPath = this.icon;
@@ -3158,7 +3287,7 @@ class ChatsProvider {
 	}
 
 	_closedCodexItem(row) {
-		const item = new vscode.TreeItem(row.data.title, vscode.TreeItemCollapsibleState.None);
+		const item = new vscode.TreeItem(chatNames.get(`codex:${row.conversationId}`) || row.data.title, vscode.TreeItemCollapsibleState.None);
 		item.id = `codex-closed:${row.conversationId}`;
 		item.conversationId = row.conversationId;
 		// The Codex logo, not the history codicon — a row should say which
@@ -3259,8 +3388,11 @@ class ChatsProvider {
 		const collapse = hasSubs
 			? vscode.TreeItemCollapsibleState.Expanded
 			: vscode.TreeItemCollapsibleState.None;
-		const item = new vscode.TreeItem(tab.label, collapse);
+		const given = chatNames.get(chatRowKey(row));
+		const item = new vscode.TreeItem(given || tab.label, collapse);
 		item.id = `chat:${data ? data.sessionId : `${groupIndex}:${tabIndex}`}`;
+		// The rename command writes to the transcript this row was read from.
+		item.chatData = data || null;
 		if (hasSubs) {
 			item.subagentItems = [];
 			if (subs) {
@@ -3507,6 +3639,8 @@ function register(context) {
 	const provider = new ChatsProvider(index, context.extensionUri, decorations, seen);
 	sectionStore.load(context);
 	remoteNames.load(context);
+	chatNames.load(context);
+	archivedChats.load(context);
 	// Hosts whose Claude Code chats join this list. The index fills in the
 	// background; the panel never waits on ssh.
 	provider.remote = new RemoteChats({
@@ -3591,7 +3725,7 @@ function register(context) {
 	let pending = null;
 	const scheduleRefresh = () => {
 		if (pending) clearTimeout(pending);
-		pending = setTimeout(() => { pending = null; provider.refresh(); }, 1500);
+		pending = setTimeout(() => { pending = null; provider.refreshIfChanged(); }, 1500);
 	};
 
 	const watchers = [];
@@ -3836,22 +3970,65 @@ function register(context) {
 
 		// A chat on another host: the name is kept here, and the host gets the
 		// same custom-title record Claude Code writes when you rename there.
-		vscode.commands.registerCommand('openEditorsTools.renameRemoteChat', async (item) => {
-			const data = item && item.remoteRow;
-			if (!data) return;
-			const current = remoteNames.get(data.host, data.sessionId) || data.title || '';
-			const name = await vscode.window.showInputBox({ prompt: `Name for this chat on ${data.host}`, value: current });
+		// One rename for every row: a chat here, a Codex thread, a chat on a
+		// host. The row shows the new name at once; the store behind it is
+		// best effort, so an offline host or a missing transcript never blocks.
+		vscode.commands.registerCommand('openEditorsTools.renameChat', async (item) => {
+			const key = item && item.rowKey;
+			if (!key) return;
+			const remote = item.remoteRow;
+			const data = item.chatData;
+			const current = (remote ? remoteNames.get(remote.host, remote.sessionId) : chatNames.get(key))
+				|| (item.label && String(item.label)) || '';
+			const name = await vscode.window.showInputBox({ prompt: 'Name for this chat', value: current });
 			if (name === undefined) return;
 			const trimmed = name.trim();
-			remoteNames.set(data.host, data.sessionId, trimmed || null);
-			provider.refresh();
-			// Best effort: the row already shows the new name. The host only
-			// needs the record for its own resume list and its next reader.
-			if (trimmed && data.rel && provider.remote) {
-				provider.remote.run(data.host, renameCommand(data.rel, trimmed, data.sessionId))
-					.then((out) => { if (out === null) log(`remote ${data.host}: could not save the new name there`); })
-					.catch(() => {});
+			if (remote) {
+				remoteNames.set(remote.host, remote.sessionId, trimmed || null);
+				if (trimmed && remote.rel && provider.remote) {
+					provider.remote.run(remote.host, renameCommand(remote.rel, trimmed, remote.sessionId))
+						.then((out) => { if (out === null) log(`remote ${remote.host}: could not save the new name there`); })
+						.catch(() => {});
+				}
+			} else {
+				chatNames.set(key, trimmed || null);
+				// A local Claude chat is renamed where Claude Code keeps the
+				// name: one custom-title record in its transcript, the same
+				// record its own rename writes.
+				if (trimmed && data && data.file) {
+					try {
+						fs.appendFileSync(data.file, `${JSON.stringify({ type: 'custom-title', customTitle: trimmed, sessionId: data.sessionId })}
+`);
+					} catch (_) { /* read-only transcript: the row name still holds */ }
+				}
 			}
+			provider.refresh();
+		}),
+
+		vscode.commands.registerCommand('openEditorsTools.archiveChat', async (item) => {
+			const key = item && item.rowKey;
+			if (!key) return;
+			archivedChats.add(key);
+			provider.refresh();
+		}),
+
+		vscode.commands.registerCommand('openEditorsTools.unarchiveChat', async (item) => {
+			const key = item && item.rowKey;
+			if (!key) return;
+			archivedChats.remove(key);
+			provider.refresh();
+		}),
+
+		vscode.commands.registerCommand('openEditorsTools.toggleArchivedChats', () => {
+			archivedChats.shown = !archivedChats.shown;
+			provider.refresh();
+		}),
+
+		vscode.commands.registerCommand('openEditorsTools.removeFromSection', async (item) => {
+			const key = item && item.rowKey;
+			if (!key) return;
+			sectionStore.assign(key, null);
+			provider.refresh();
 		}),
 
 		vscode.commands.registerCommand('openEditorsTools.newSection', async () => {
@@ -4149,7 +4326,7 @@ module.exports = {
 		readTranscript, currentModelOf, claudeDefaultModel, pickerModelIds, codexInWindow, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
 		liveSessionRecord, endClaudeProcess, claudeProcessOwner, processTools, sideColumnSessions, sideColumnIndex, claudeColumn, loadSideColumn, codexViewColumn, newCodexInTab, claudeState, ClaudeCodeState, titleMatches,
-		chatRowKey, sectionStore, SECTIONS_KEY, remoteNames, RemoteChats, shellQuote, renameCommand,
+		chatRowKey, sectionStore, SECTIONS_KEY, remoteNames, chatNames, archivedChats, RemoteChats, shellQuote, renameCommand,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		shellTaskRunning, shellTaskEnded, taskOutputFile, taskDirsFor, taskDirs, processList, hasLiveDescendants,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,

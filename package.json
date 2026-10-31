@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.15.17",
+  "version": "0.15.18",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -413,8 +413,29 @@
         "category": "Agent View"
       },
       {
-        "command": "openEditorsTools.renameRemoteChat",
+        "command": "openEditorsTools.renameChat",
         "title": "Rename Chat…",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.archiveChat",
+        "title": "Archive Chat",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.unarchiveChat",
+        "title": "Unarchive Chat",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.toggleArchivedChats",
+        "title": "Show Archived Chats",
+        "category": "Agent View",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "openEditorsTools.removeFromSection",
+        "title": "Remove from Section",
         "category": "Agent View"
       }
     ],
@@ -511,24 +532,39 @@
           "group": "open@2"
         },
         {
+          "command": "openEditorsTools.renameChat",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|closedClaudeChat|codexChat|closedCodexChat|codexLiveChat|codexClosedChat|remoteChat|claudeChatArchived|closedClaudeChatArchived|codexChatArchived|closedCodexChatArchived|codexLiveChatArchived|codexClosedChatArchived|remoteChatArchived)$/",
+          "group": "section@0"
+        },
+        {
           "command": "openEditorsTools.moveChatToSection",
           "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|closedClaudeChat|codexChat|closedCodexChat|codexLiveChat|codexClosedChat|remoteChat)$/",
           "group": "section@1"
         },
         {
+          "command": "openEditorsTools.removeFromSection",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|closedClaudeChat|codexChat|closedCodexChat|codexLiveChat|codexClosedChat|remoteChat|claudeChatArchived|closedClaudeChatArchived|codexChatArchived|closedCodexChatArchived|codexLiveChatArchived|codexClosedChatArchived|remoteChatArchived)$/",
+          "group": "section@2"
+        },
+        {
+          "command": "openEditorsTools.archiveChat",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|closedClaudeChat|codexChat|closedCodexChat|codexLiveChat|codexClosedChat|remoteChat)$/",
+          "group": "section@3"
+        },
+        {
+          "command": "openEditorsTools.unarchiveChat",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChatArchived|closedClaudeChatArchived|codexChatArchived|closedCodexChatArchived|codexLiveChatArchived|codexClosedChatArchived|remoteChatArchived)$/",
+          "group": "section@4"
+        },
+        {
           "command": "openEditorsTools.renameSection",
-          "when": "view == openEditorsTools.chats && viewItem == chatSection",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(chatSection)$/",
           "group": "section@1"
         },
         {
           "command": "openEditorsTools.deleteSection",
-          "when": "view == openEditorsTools.chats && viewItem == chatSection",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(chatSection)$/",
           "group": "section@2"
-        },
-        {
-          "command": "openEditorsTools.renameRemoteChat",
-          "when": "view == openEditorsTools.chats && viewItem == remoteChat",
-          "group": "section@0"
         }
       ],
       "view/title": [
@@ -596,6 +632,11 @@
           "command": "openEditorsTools.newSection",
           "when": "view == openEditorsTools.chats",
           "group": "navigation@6"
+        },
+        {
+          "command": "openEditorsTools.toggleArchivedChats",
+          "when": "view == openEditorsTools.chats",
+          "group": "navigation@7"
         }
       ]
     }
