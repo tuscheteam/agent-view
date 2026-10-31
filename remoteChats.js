@@ -86,7 +86,7 @@ class RemoteChats {
 		const out = [];
 		for (const rec of this.cache.values()) {
 			if (!rec.entry || !rec.host) continue;
-			out.push({ ...rec.entry, host: rec.host, sessionId: rec.sessionId, lastActivity: rec.mtime, remote: true });
+			out.push({ ...rec.entry, host: rec.host, sessionId: rec.sessionId, rel: rec.rel, lastActivity: rec.mtime, remote: true });
 		}
 		return out;
 	}
@@ -179,7 +179,7 @@ class RemoteChats {
 			const text = await this.run(host, `cd ~/.claude/projects 2>/dev/null && ${read}`);
 			const entry = text ? await this.parse(host, file, text) : null;
 			if (entry && headOnly) entry.partial = true;
-			this.cache.set(file.key, { host, entry, mtime: file.mtime, size: file.size, sessionId: path.basename(file.rel, '.jsonl') });
+			this.cache.set(file.key, { host, entry, rel: file.rel, mtime: file.mtime, size: file.size, sessionId: path.basename(file.rel, '.jsonl') });
 			changed = true;
 		}
 		if (changed) this.save(host);
@@ -224,7 +224,7 @@ class RemoteChats {
 			try { parsed = JSON.parse(fs.readFileSync(this.cacheFile(host), 'utf8')); } catch (_) { continue; }
 			for (const [rel, rec] of Object.entries(parsed || {})) {
 				if (!rec || !rec.mtime) continue;
-				this.cache.set(`${host}:${rel}`, { host, entry: rec.entry || null, mtime: rec.mtime, size: rec.size || 0, sessionId: rec.sessionId || path.basename(rel, '.jsonl') });
+				this.cache.set(`${host}:${rel}`, { host, entry: rec.entry || null, rel, mtime: rec.mtime, size: rec.size || 0, sessionId: rec.sessionId || path.basename(rel, '.jsonl') });
 			}
 		}
 	}
@@ -250,4 +250,12 @@ function shellQuote(text) {
 	return `'${String(text).replace(/'/g, `'\\''`)}'`;
 }
 
-module.exports = { RemoteChats, shellQuote };
+// Appending a custom-title record is how Claude Code renames a chat: its own
+// resume picker reads the last one. One short line appended to the end of the
+// transcript, so the host's list and this one agree.
+function renameCommand(rel, name, sessionId) {
+	const line = JSON.stringify({ type: 'custom-title', customTitle: String(name), sessionId: String(sessionId) });
+	return `cd ~/.claude/projects 2>/dev/null && printf '%s\\n' ${shellQuote(line)} >> ${shellQuote(rel)}`;
+}
+
+module.exports = { RemoteChats, shellQuote, renameCommand };

@@ -6,7 +6,7 @@ const readline = require('readline');
 const { promisify } = require('util');
 const execFileAsync = promisify(require('child_process').execFile);
 const { UsageCache, watchCredentials } = require('./usage');
-const { RemoteChats, shellQuote } = require('./remoteChats');
+const { RemoteChats, shellQuote, renameCommand } = require('./remoteChats');
 const restyle = require('./restyle');
 const claudeFix = require('./claudeFix');
 const { UsageViewProvider } = require('./usageView');
@@ -2460,6 +2460,31 @@ const sectionStore = {
 	},
 };
 
+// Names given to chats that run elsewhere. Kept here rather than only on the
+// host: the row must read the same when the host is off, and the host gets the
+// record too so Claude Code's own resume list agrees.
+const REMOTE_NAMES_KEY = 'openEditorsTools.remoteNames';
+const remoteNames = {
+	state: {},
+	context: null,
+	load(context) {
+		if (context) this.context = context;
+		const raw = this.context && this.context.workspaceState ? this.context.workspaceState.get(REMOTE_NAMES_KEY) : null;
+		this.state = raw && typeof raw === 'object' ? { ...raw } : {};
+		return this.state;
+	},
+	get(host, sessionId) {
+		return this.state[`${host}:${sessionId}`] || null;
+	},
+	set(host, sessionId, name) {
+		const key = `${host}:${sessionId}`;
+		if (name) this.state[key] = name;
+		else delete this.state[key];
+		const store = this.context && this.context.workspaceState;
+		if (store) Promise.resolve(store.update(REMOTE_NAMES_KEY, this.state)).catch(() => {});
+	},
+};
+
 // The key a chat keeps across renders and restarts. A session id is stable;
 // a tab's position is not, so the key never comes from the tab.
 function chatRowKey(row) {
@@ -2985,10 +3010,12 @@ class ChatsProvider {
 	// where its work runs.
 	_remoteItem(row) {
 		const data = row.data;
-		const title = data.title || `chat ${String(data.sessionId).slice(0, 8)}`;
+		const title = remoteNames.get(data.host, data.sessionId) || data.title || `chat ${String(data.sessionId).slice(0, 8)}`;
 		const item = new vscode.TreeItem(title, vscode.TreeItemCollapsibleState.None);
 		item.id = `remote:${data.host}:${data.sessionId}`;
 		item.contextValue = 'remoteChat';
+		// The rename command needs the row's own record, not the item.
+		item.remoteRow = data;
 		item.iconPath = new vscode.ThemeIcon('vm');
 		// A transcript too big to read in full has no trustworthy token figures;
 		// the row shows the host and the age instead of a made-up number.
@@ -3479,6 +3506,7 @@ function register(context) {
 	const seen = new SeenStore(context.globalState);
 	const provider = new ChatsProvider(index, context.extensionUri, decorations, seen);
 	sectionStore.load(context);
+	remoteNames.load(context);
 	// Hosts whose Claude Code chats join this list. The index fills in the
 	// background; the panel never waits on ssh.
 	provider.remote = new RemoteChats({
@@ -3806,6 +3834,26 @@ function register(context) {
 			terminal.show();
 		}),
 
+		// A chat on another host: the name is kept here, and the host gets the
+		// same custom-title record Claude Code writes when you rename there.
+		vscode.commands.registerCommand('openEditorsTools.renameRemoteChat', async (item) => {
+			const data = item && item.remoteRow;
+			if (!data) return;
+			const current = remoteNames.get(data.host, data.sessionId) || data.title || '';
+			const name = await vscode.window.showInputBox({ prompt: `Name for this chat on ${data.host}`, value: current });
+			if (name === undefined) return;
+			const trimmed = name.trim();
+			remoteNames.set(data.host, data.sessionId, trimmed || null);
+			provider.refresh();
+			// Best effort: the row already shows the new name. The host only
+			// needs the record for its own resume list and its next reader.
+			if (trimmed && data.rel && provider.remote) {
+				provider.remote.run(data.host, renameCommand(data.rel, trimmed, data.sessionId))
+					.then((out) => { if (out === null) log(`remote ${data.host}: could not save the new name there`); })
+					.catch(() => {});
+			}
+		}),
+
 		vscode.commands.registerCommand('openEditorsTools.newSection', async () => {
 			const name = await vscode.window.showInputBox({ prompt: 'Section name', placeHolder: 'e.g. DHL, Slopes, Research' });
 			const trimmed = (name || '').trim();
@@ -4101,7 +4149,7 @@ module.exports = {
 		readTranscript, currentModelOf, claudeDefaultModel, pickerModelIds, codexInWindow, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
 		liveSessionRecord, endClaudeProcess, claudeProcessOwner, processTools, sideColumnSessions, sideColumnIndex, claudeColumn, loadSideColumn, codexViewColumn, newCodexInTab, claudeState, ClaudeCodeState, titleMatches,
-		chatRowKey, sectionStore, SECTIONS_KEY, RemoteChats, shellQuote,
+		chatRowKey, sectionStore, SECTIONS_KEY, remoteNames, RemoteChats, shellQuote, renameCommand,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		shellTaskRunning, shellTaskEnded, taskOutputFile, taskDirsFor, taskDirs, processList, hasLiveDescendants,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,

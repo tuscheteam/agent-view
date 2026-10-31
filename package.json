@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.15.15",
+  "version": "0.15.16",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -411,6 +411,11 @@
         "command": "openEditorsTools.openRemoteChat",
         "title": "Continue Remote Chat",
         "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.renameRemoteChat",
+        "title": "Rename Chat…",
+        "category": "Agent View"
       }
     ],
     "viewsContainers": {
@@ -519,6 +524,11 @@
           "command": "openEditorsTools.deleteSection",
           "when": "view == openEditorsTools.chats && viewItem == chatSection",
           "group": "section@2"
+        },
+        {
+          "command": "openEditorsTools.renameRemoteChat",
+          "when": "view == openEditorsTools.chats && viewItem == remoteChat",
+          "group": "section@0"
         }
       ],
       "view/title": [

@@ -55,6 +55,10 @@ hosts, the chats those hosts ran (Claude Code transcripts under
 one and it opens `claude --resume` on that host in a terminal, so the chat
 continues where the work runs.
 
+A remote chat can be renamed: right-click it, **Rename Chat…**. The name is kept
+here, so it shows even when the host is off, and the host gets the same
+`custom-title` record Claude Code writes itself, so its own resume list agrees.
+
 Transcripts are read over ssh once a minute, in the background — a render
 never waits on the network. A file that changed is fetched once; one untouched
 is not fetched again. A transcript too large to read in full still answers with
