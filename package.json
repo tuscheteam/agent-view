@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.15.13",
+  "version": "0.15.14",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -175,6 +175,15 @@
           "type": "string",
           "default": "claude-sonnet-5",
           "description": "Claude model that runs web search for chats on an OpenRouter model (OpenRouter models cannot run Anthropic's server tools).",
+          "scope": "application"
+        },
+        "openEditorsTools.remoteHosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "ssh hosts whose Claude Code chats join this list. A host needs the claude command on PATH and a key-based ssh login. Transcripts are read over ssh once a minute; clicking a row opens a resume session there in a terminal.",
           "scope": "application"
         }
       }
@@ -376,6 +385,32 @@
         "command": "openEditorsTools.openChatInSidePanel",
         "title": "Open in Side Panel",
         "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.newSection",
+        "title": "New Section",
+        "category": "Agent View",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "openEditorsTools.renameSection",
+        "title": "Rename Section",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.deleteSection",
+        "title": "Delete Section",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.moveChatToSection",
+        "title": "Move to Section…",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.openRemoteChat",
+        "title": "Continue Remote Chat",
+        "category": "Agent View"
       }
     ],
     "viewsContainers": {
@@ -469,6 +504,21 @@
           "command": "openEditorsTools.openChatInSidePanel",
           "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|closedClaudeChat|codexChat|closedCodexChat)$/",
           "group": "open@2"
+        },
+        {
+          "command": "openEditorsTools.moveChatToSection",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|closedClaudeChat|codexChat|closedCodexChat|codexLiveChat|codexClosedChat|remoteChat)$/",
+          "group": "section@1"
+        },
+        {
+          "command": "openEditorsTools.renameSection",
+          "when": "view == openEditorsTools.chats && viewItem == chatSection",
+          "group": "section@1"
+        },
+        {
+          "command": "openEditorsTools.deleteSection",
+          "when": "view == openEditorsTools.chats && viewItem == chatSection",
+          "group": "section@2"
         }
       ],
       "view/title": [
@@ -531,6 +581,11 @@
           "command": "openEditorsTools.unpin",
           "when": "view == workbench.explorer.openEditorsView && activeEditorIsPinned",
           "group": "navigation@2"
+        },
+        {
+          "command": "openEditorsTools.newSection",
+          "when": "view == openEditorsTools.chats",
+          "group": "navigation@6"
         }
       ]
     }

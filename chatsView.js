@@ -6,6 +6,7 @@ const readline = require('readline');
 const { promisify } = require('util');
 const execFileAsync = promisify(require('child_process').execFile);
 const { UsageCache, watchCredentials } = require('./usage');
+const { RemoteChats, shellQuote } = require('./remoteChats');
 const restyle = require('./restyle');
 const claudeFix = require('./claudeFix');
 const { UsageViewProvider } = require('./usageView');
@@ -2398,6 +2399,77 @@ function uriFor(sessionId) {
 	return vscode.Uri.parse(`${CHAT_SCHEME}:/${sessionId}`);
 }
 
+// ── Sections ───────────────────────────────────────────────────────────────
+// The list is one history, newest first. Sections are folders on top of it:
+// a chat dropped into one leaves the flat list and sits under the section.
+// Nothing is moved on disk — this is a view, so a section outlives a chat
+// being closed and reopened, and a stale entry is ignored rather than shown.
+const SECTIONS_KEY = 'openEditorsTools.chatSections';
+const sectionStore = {
+	state: { sections: [], assign: {} },
+	context: null,
+	load(context) {
+		if (context) this.context = context;
+		const raw = this.context && this.context.workspaceState ? this.context.workspaceState.get(SECTIONS_KEY) : undefined;
+		const state = raw && typeof raw === 'object' ? raw : {};
+		const sections = Array.isArray(state.sections)
+			? state.sections.filter((x) => x && x.id && x.name).map((x) => ({ id: String(x.id), name: String(x.name) }))
+			: [];
+		const ids = new Set(sections.map((x) => x.id));
+		const assign = {};
+		for (const [key, id] of Object.entries(state.assign || {})) {
+			// A chat pointing at a section that no longer exists goes back to the
+			// list instead of vanishing.
+			if (ids.has(String(id))) assign[key] = String(id);
+		}
+		this.state = { sections, assign };
+		return this.state;
+	},
+	save() {
+		const store = this.context && this.context.workspaceState;
+		if (!store) return;
+		Promise.resolve(store.update(SECTIONS_KEY, this.state)).catch(() => {});
+	},
+	newSection(name) {
+		const id = `s${Date.now().toString(36)}`;
+		this.state.sections.push({ id, name });
+		this.save();
+		return id;
+	},
+	rename(id, name) {
+		const sec = this.state.sections.find((x) => x.id === id);
+		if (!sec) return false;
+		sec.name = name;
+		this.save();
+		return true;
+	},
+	remove(id) {
+		this.state.sections = this.state.sections.filter((x) => x.id !== id);
+		for (const [key, val] of Object.entries(this.state.assign)) if (val === id) delete this.state.assign[key];
+		this.save();
+	},
+	assign(key, id) {
+		if (!key) return;
+		if (!id) delete this.state.assign[key];
+		else this.state.assign[key] = id;
+		this.save();
+	},
+	sectionOf(key) {
+		const id = key && this.state.assign[key];
+		return id && this.state.sections.some((x) => x.id === id) ? id : null;
+	},
+};
+
+// The key a chat keeps across renders and restarts. A session id is stable;
+// a tab's position is not, so the key never comes from the tab.
+function chatRowKey(row) {
+	if (!row) return null;
+	if ((row.kind === 'claude' || row.kind === 'claude-closed') && row.data && row.data.sessionId) return `claude:${row.data.sessionId}`;
+	if (row.conversationId) return `codex:${row.conversationId}`;
+	if (row.kind === 'remote' && row.data) return `remote:${row.data.host}:${row.data.sessionId}`;
+	return null;
+}
+
 class ChatsProvider {
 	constructor(index, extensionUri, decorations, seen) {
 		this.index = index;
@@ -2455,11 +2527,15 @@ class ChatsProvider {
 		this._spinnerFrame = (this._spinnerFrame + 1) % SPINNER_FRAMES.length;
 		const frame = SPINNER_FRAMES[this._spinnerFrame];
 		const parents = [];
-		for (const item of this.items) {
-			if (!item.subagentItems || !item.subagentItems.length) continue;
+		const visit = (item) => {
+			// A section holds chat rows, not subagents: the rows inside it are
+			// the parents the spinner rotates through.
+			if (item.contextValue === 'chatSection') { for (const child of item.subagentItems || []) visit(child); return; }
+			if (!item.subagentItems || !item.subagentItems.length) return;
 			parents.push(item);
 			for (const child of item.subagentItems) child.label = `${frame} ${child.baseLabel}`;
-		}
+		};
+		for (const item of this.items) visit(item);
 		if (this._rootPending && Date.now() - this._rootPendingSince > ROOT_PENDING_MAX_MS) {
 			this._rootPending = false;
 			if (this.log) this.log('spinner: root refresh watchdog cleared');
@@ -2473,7 +2549,15 @@ class ChatsProvider {
 	// Called after every root render: the interval runs only while a child
 	// row is on screen, so an idle tree costs nothing.
 	updateSpinner() {
-		const rows = this.items.filter((it) => it.subagentItems && it.subagentItems.length).length;
+		// A section holds chats, not subagents: counting it would run the
+		// timer for a list that has nothing to animate.
+		const parents = [];
+		const visit = (item) => {
+			if (item.contextValue === 'chatSection') { for (const child of item.subagentItems || []) visit(child); return; }
+			if (item.subagentItems && item.subagentItems.length) parents.push(item);
+		};
+		for (const item of this.items) visit(item);
+		const rows = parents.length;
 		if (rows && !this._spinnerTimer) {
 			this._spinnerTimer = setInterval(() => this.spinnerTick(), SPINNER_INTERVAL_MS);
 			if (this.log) this.log(`spinner on: ${rows} row(s)`);
@@ -2491,11 +2575,49 @@ class ChatsProvider {
 
 	getTreeItem(element) { return element; }
 
+	// Drag a chat onto a section node to file it there. VS Code fills the
+	// payload itself for the tree's own mime type, so no handleDrag is needed;
+	// a drop on a chat row is ignored rather than guessed at.
+	sectionDragAndDrop() {
+		const mime = 'application/vnd.code.tree.openEditorsTools.chats';
+		const provider = this;
+		return {
+			dragMimeTypes: [mime],
+			dropMimeTypes: [mime],
+			// VS Code's built-in tree payload is an opaque string; the
+			// controller has to put the items on the transfer itself, or a
+			// drop receives text nothing can be filed from.
+			handleDrag(items, dataTransfer) {
+				try { dataTransfer.set(mime, new vscode.DataTransferItem(items)); } catch (_) { /* older host */ }
+			},
+			handleDrop: async (target, dataTransfer) => {
+				if (!target || target.contextValue !== 'chatSection' || !target.sectionId) return;
+				const store = sectionStore;
+				// The tree's own mime type carries the dragged items.
+				let dragged = [];
+				try {
+					const payload = dataTransfer && dataTransfer.get ? dataTransfer.get(mime) : null;
+					const value = payload && payload.value;
+					dragged = Array.isArray(value) ? value : [];
+				} catch (_) { dragged = []; }
+				if (!dragged.length) return;
+				let changed = false;
+				for (const item of dragged) {
+					if (!item || !item.rowKey) continue;
+					store.assign(item.rowKey, target.sectionId);
+					changed = true;
+				}
+				if (changed && provider.refresh) provider.refresh();
+			},
+		};
+	}
+
 	// reveal() walks upward from the target, so children must name their row.
 	getParent(element) { return element.parentItem || null; }
 
 	async getChildren(element) {
-		// Child level: the running subagents attached to a chat row.
+		// Child level: the subagents attached to a chat row, or the chats a
+		// section holds.
 		if (element) return element.subagentItems || [];
 
 		// Root render underway: a spinner tick that fired now would hand
@@ -2748,6 +2870,18 @@ class ChatsProvider {
 			if (codexHidden) rows.push({ kind: 'codex-hidden', count: codexHidden, days: codexDays });
 		}
 
+		// Chats from the hosts in openEditorsTools.remoteHosts join the history
+		// before it is sorted, so they take their place by age like any other
+		// row. The cache fills in the background; this pass only reads it.
+		if (this.remote) {
+			this.remote.tick();
+			const remoteCutoff = hours > 0 ? Date.now() - hours * 3600000 : 0;
+			for (const entry of this.remote.entries()) {
+				if (entry.lastActivity < remoteCutoff) continue;
+				rows.push({ kind: 'remote', data: entry });
+			}
+		}
+
 		// Tabs without a transcript have nothing to show in a history: an empty
 		// new chat, or a chat whose transcript is no longer on this machine.
 		// They fold into one row at the bottom, which shows them on a click.
@@ -2780,11 +2914,34 @@ class ChatsProvider {
 				: row.kind === 'codex-hidden' ? this._hiddenCodexItem(row)
 				: row.kind === 'claude-hidden' ? this._hiddenClaudeItem(row)
 					: row.kind === 'codex-closed' ? this._closedCodexItem(row)
+				: row.kind === 'remote' ? this._remoteItem(row)
 				: this._item(row);
 			item.expandable = Boolean(item.subagentItems && item.subagentItems.length);
 			return { item, tab: row.tab };
 		});
-		this.items = items.map((x) => x.item);
+		// Sections sit above the history, in the order they were made. A chat
+		// assigned to one leaves the flat list; unassigned chats stay where
+		// they were, so a list without sections looks exactly as before.
+		const sections = sectionStore.state;
+		const keyed = items.map((x, i) => { const key = chatRowKey(rows[i]); x.item.rowKey = key; return { item: x.item, key }; });
+		const placed = new Set();
+		const sectionItems = sections.sections.map((sec) => {
+			const children = keyed.filter((k) => k.key && sections.assign[k.key] === sec.id).map((k) => { placed.add(k.key); return k.item; });
+			const node = new vscode.TreeItem(sec.name, children.length ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+			node.id = `section:${sec.id}`;
+			node.contextValue = 'chatSection';
+			node.iconPath = new vscode.ThemeIcon('folder');
+			node.description = children.length ? String(children.length) : 'empty';
+			node.tooltip = `${sec.name} — ${children.length} chat(s). Drag a chat onto this section to file it here, or right-click a chat and choose Move to Section.`;
+			// reveal() walks upward from a chat, so a filed chat names its section.
+			for (const child of children) child.parentItem = node;
+			node.subagentItems = children;
+			node.expandable = children.length > 0;
+			node.sectionId = sec.id;
+			return node;
+		});
+		const rootChats = keyed.filter((k) => !(k.key && placed.has(k.key))).map((k) => k.item);
+		this.items = [...sectionItems, ...rootChats];
 		this.itemByTab = new Map(items.filter((x) => x.tab).map((x) => [x.tab, x.item]));
 		const foldItem = items.find((x) => x.item.id === 'claude-hidden');
 		if (foldItem && !this.showTranscriptless) for (const r of transcriptless) this.itemByTab.set(r.tab, foldItem.item);
@@ -2821,6 +2978,42 @@ class ChatsProvider {
 		if (key === this._lastUnrecognised) return;
 		this._lastUnrecognised = key;
 		if (key && this.log) this.log(`unrecognised tabs: ${key}`);
+	}
+
+	// A chat on another machine. Nothing local can show it in a tab, so a
+	// click opens the same session there in a terminal: the chat continues
+	// where its work runs.
+	_remoteItem(row) {
+		const data = row.data;
+		const title = data.title || `chat ${String(data.sessionId).slice(0, 8)}`;
+		const item = new vscode.TreeItem(title, vscode.TreeItemCollapsibleState.None);
+		item.id = `remote:${data.host}:${data.sessionId}`;
+		item.contextValue = 'remoteChat';
+		item.iconPath = new vscode.ThemeIcon('vm');
+		// A transcript too big to read in full has no trustworthy token figures;
+		// the row shows the host and the age instead of a made-up number.
+		item.description = [data.host, formatAge(data.lastActivity), data.partial ? null : formatTokens(data.contextTokens), data.partial ? null : formatCost(data.cost)].filter(Boolean).join(' · ');
+		const md = new vscode.MarkdownString();
+		md.appendMarkdown(`**${title}** _(${data.host})_\n\n`);
+		md.appendMarkdown(`| | |\n|---|---|\n`);
+		md.appendMarkdown(`| Host | ${data.host} |\n`);
+		md.appendMarkdown(`| Session | \`${data.sessionId}\` |\n`);
+		if (data.model) md.appendMarkdown(`| Model | \`${data.model}\` |\n`);
+		md.appendMarkdown(`| Last activity | ${formatAge(data.lastActivity)} |\n`);
+		if (data.messages) md.appendMarkdown(`| Replies | ${data.messages} |\n`);
+		if (data.partial) md.appendMarkdown(`| Transcript | too large to read in full; token figures unavailable |\n`);
+		else {
+			md.appendMarkdown(`| Context | ${formatTokens(data.contextTokens)} |\n`);
+			md.appendMarkdown(`| Cost | ${formatCost(data.cost)} |\n`);
+		}
+		md.appendMarkdown(`\n_Click to continue this chat in a terminal on ${data.host}._`);
+		item.tooltip = md;
+		item.command = {
+			command: 'openEditorsTools.openRemoteChat',
+			title: 'Continue on the host',
+			arguments: [data.host, data.sessionId, data.cwd],
+		};
+		return item;
 	}
 
 	_closedClaudeItem(data, live = false, inSidePanel = false) {
@@ -3286,6 +3479,16 @@ function register(context) {
 	const decorations = new ChatDecorations();
 	const seen = new SeenStore(context.globalState);
 	const provider = new ChatsProvider(index, context.extensionUri, decorations, seen);
+	sectionStore.load(context);
+	// Hosts whose Claude Code chats join this list. The index fills in the
+	// background; the panel never waits on ssh.
+	provider.remote = new RemoteChats({
+		hosts: () => vscode.workspace.getConfiguration('openEditorsTools').get('remoteHosts', []),
+		dir: path.join((context.globalStorageUri && context.globalStorageUri.fsPath) || os.tmpdir(), 'agent-view-remote'),
+		readTranscript,
+		log,
+		onChange: () => provider.refresh(),
+	});
 	provider.log = log;
 	// One cache feeds the bars; it repaints them itself whenever a lookup lands.
 	const usage = new UsageCache(() => { usageView.render(); if (!usageView.isVisible()) leaderboardView.render(); }, log);
@@ -3309,6 +3512,12 @@ function register(context) {
 		context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((e) => {
 			if (e.affectsConfiguration('openEditorsTools.leaderboard') || e.affectsConfiguration('openEditorsTools.modelRouter')) leaderboardView.render();
 			if (e.affectsConfiguration('openEditorsTools.chats') || e.affectsConfiguration('openEditorsTools.codexClosedDays') || e.affectsConfiguration('openEditorsTools.closedChatHours')) provider.refresh();
+			if (e.affectsConfiguration('openEditorsTools.remoteHosts') && provider.remote) {
+				provider.remote.prune();
+				provider.remote.lastIndexAt = 0;
+				provider.remote.refresh();
+				provider.refresh();
+			}
 		}));
 	}
 	// While the Usage pane is collapsed or hidden its bars ride on top of the
@@ -3325,6 +3534,7 @@ function register(context) {
 	const view = vscode.window.createTreeView('openEditorsTools.chats', {
 		treeDataProvider: provider,
 		showCollapseAll: false,
+		dragAndDropController: provider.sectionDragAndDrop(),
 	});
 
 	// Point the selection at the chat that is actually open. Selection is not
@@ -3585,6 +3795,60 @@ function register(context) {
 		// chats drifted into the file or Codex group. Focus the Claude column
 		// first, then open. No arguments on purpose — an argument would be
 		// taken as a session id.
+		// Continue a remote chat where it runs. A terminal, not a tab: the
+		// session lives on that host, and `claude --resume` picks it up there.
+		vscode.commands.registerCommand('openEditorsTools.openRemoteChat', async (host, sessionId, cwd) => {
+			const name = String(host || '').trim();
+			if (!name || !sessionId) return;
+			// -t: an interactive claude needs a terminal on the far side.
+			// cd first: resume is scoped to the directory the chat ran in.
+			const remote = (cwd ? `cd ${shellQuote(String(cwd))} && ` : '') + `claude --resume ${shellQuote(String(sessionId))}`;
+			const terminal = vscode.window.createTerminal({ name: `${name} · ${String(sessionId).slice(0, 8)}`, shellPath: 'ssh', shellArgs: ['-t', name, remote] });
+			terminal.show();
+		}),
+
+		vscode.commands.registerCommand('openEditorsTools.newSection', async () => {
+			const name = await vscode.window.showInputBox({ prompt: 'Section name', placeHolder: 'e.g. DHL, Slopes, Research' });
+			const trimmed = (name || '').trim();
+			if (!trimmed) return;
+			sectionStore.newSection(trimmed);
+			provider.refresh();
+		}),
+
+		vscode.commands.registerCommand('openEditorsTools.renameSection', async (item) => {
+			const id = item && item.sectionId;
+			const sec = sectionStore.state.sections.find((x) => x.id === id);
+			if (!sec) return;
+			const name = await vscode.window.showInputBox({ prompt: 'Section name', value: sec.name });
+			const trimmed = (name || '').trim();
+			if (!trimmed || trimmed === sec.name) return;
+			sectionStore.rename(id, trimmed);
+			provider.refresh();
+		}),
+
+		// The chats are not touched: deleting a folder only releases what was
+		// filed in it, and every chat returns to the history list.
+		vscode.commands.registerCommand('openEditorsTools.deleteSection', async (item) => {
+			const id = item && item.sectionId;
+			const sec = sectionStore.state.sections.find((x) => x.id === id);
+			if (!sec) return;
+			sectionStore.remove(id);
+			provider.refresh();
+		}),
+
+		// The keyboard route to what a drag does, for a chat whose row is
+		// scrolled out of reach.
+		vscode.commands.registerCommand('openEditorsTools.moveChatToSection', async (item) => {
+			const key = item && item.rowKey;
+			if (!key) return;
+			const options = sectionStore.state.sections.map((sec) => ({ label: sec.name, id: sec.id }));
+			options.push({ label: '$(close) No section', id: null, alwaysShow: true });
+			const pick = await vscode.window.showQuickPick(options, { placeHolder: 'Move this chat to a section' });
+			if (!pick) return;
+			sectionStore.assign(key, pick.id);
+			provider.refresh();
+		}),
+
 		vscode.commands.registerCommand('openEditorsTools.newClaudeChat', async () => {
 			if (!vscode.extensions.getExtension('Anthropic.claude-code')) {
 				vscode.window.showWarningMessage('This needs the Claude Code extension, which is not installed.');
@@ -3838,6 +4102,7 @@ module.exports = {
 		readTranscript, currentModelOf, claudeDefaultModel, pickerModelIds, codexInWindow, projectDirFor, ratesFor, usageContribution, isRoutedModel, formatAge, formatTokens, formatCost,
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
 		liveSessionRecord, endClaudeProcess, claudeProcessOwner, processTools, sideColumnSessions, sideColumnIndex, claudeColumn, loadSideColumn, codexViewColumn, newCodexInTab, claudeState, ClaudeCodeState, titleMatches,
+		chatRowKey, sectionStore, SECTIONS_KEY, RemoteChats, shellQuote,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		shellTaskRunning, shellTaskEnded, taskOutputFile, taskDirsFor, taskDirs, processList, hasLiveDescendants,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,

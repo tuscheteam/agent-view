@@ -35,6 +35,36 @@ Claude Code itself. A chat at work sorts as current even while its transcript si
 still through a long tool call. Chats that Claude Code's history archives are left
 out unless they run right now.
 
+## Sections
+
+The list is one history by recency. Sections are folders on top of it: drag a
+chat onto a section node, or right-click it and pick **Move to Section…**, and
+the chat leaves the flat list and sits under that section. Every other chat
+stays where it was, so a list without sections looks exactly as before.
+
+**New Section** in the view's title bar creates one. Right-click a section to
+rename or delete it; deleting a section puts its chats back in the history and
+touches nothing else. A section outlives its chats: close a chat and reopen it
+and it returns to its section.
+
+## Chats on another machine
+
+Long jobs belong on a server. With `openEditorsTools.remoteHosts` set to ssh
+hosts, the chats those hosts ran (Claude Code transcripts under
+`~/.claude/projects` there) join this list with their host in the row. Click
+one and it opens `claude --resume` on that host in a terminal, so the chat
+continues where the work runs.
+
+Transcripts are read over ssh once a minute, in the background — a render
+never waits on the network. A file that changed is fetched once; one untouched
+is not fetched again. A transcript too large to read in full still answers with
+its title, host and age, without token figures. A host that is off backs off and
+is tried again — the row keeps its last known state meanwhile.
+
+The host needs `claude` on `PATH`, a key-based ssh login, and one working
+Claude login of its own. Running as root needs `IS_SANDBOX=1` in the
+environment (Claude Code refuses bypass-permissions as root otherwise).
+
 ## Layout
 
 On first run the extension moves the panel to the left of the editor and opens
@@ -386,6 +416,7 @@ running there.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `openEditorsTools.codexClosedDays` | `30` | Codex chats quiet for this many days collapse into one "older Codex chats hidden" row (click it to show all). `0` lists every Codex chat |
+| `openEditorsTools.remoteHosts` | `[]` | ssh hosts whose Claude Code chats join this list. Read once a minute in the background; a click opens `claude --resume` there |
 | `openEditorsTools.closedChatHours` | `720` | How long closed Claude chats stay listed. 720 hours (30 days) matches how long Claude Code keeps a transcript. `0` hides them |
 | `openEditorsTools.recentFirst` | `false` | Move the editor you just activated to the top of its group |
 | `openEditorsTools.codexOpenTarget` | `auto` | Where a Codex row opens: `sidebar` panel, `editor` tab, or `auto` |
