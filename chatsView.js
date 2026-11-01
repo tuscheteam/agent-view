@@ -2787,7 +2787,10 @@ class ChatsProvider {
 		for (const row of rows) {
 			if (row.kind !== 'claude' && row.kind !== 'claude-closed') continue;
 			if (!row.data || !row.data.sessionId) continue;
-			const model = row.data.model;
+			// A /model pick is an explicit choice and arrives before the reply
+			// that would otherwise overwrite it.
+			const picked = row.data.pickedModel && row.data.pickedAt > row.data.modelAt ? row.data.pickedModel : null;
+			const model = picked || row.data.model;
 			if (!model) continue;
 			known.push(row.data.sessionId);
 			if (!isRoutedModel(model)) { pins[row.data.sessionId] = null; continue; }

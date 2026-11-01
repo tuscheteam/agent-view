@@ -552,9 +552,12 @@ class ModelRouter {
 		if (!json || !requested) return requested;
 		const sessionId = sessionIdOf(json);
 		if (!sessionId) return requested;
-		const previous = this.sessionModel.get(sessionId);
-		const explicit = Boolean(previous) && previous !== requested;
-		const pin = explicit ? null : this._pinFor(sessionId);
+		// The pin wins while it exists. Claude Code resends its default model on
+		// every request, so "the model changed" is not a usable signal: a chat
+		// we rewrote once would come back on the default on the very next call.
+		// The extension is the judge — it clears the pin the moment the chat's
+		// transcript (or a /model pick) says a Claude model.
+		const pin = this._pinFor(sessionId);
 		const effective = pin && pin !== requested ? pin : requested;
 		this.sessionModel.set(sessionId, effective);
 		if (effective === requested) return requested;

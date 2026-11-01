@@ -458,6 +458,19 @@ class ClaudeUsageState {
 	}
 }
 
+// The stored shape the panel expects. Bumped when the bars or the plan text
+// changed, so a cached value from an older version is rewritten rather than
+// shown as it was.
+const USAGE_VALUE_VERSION = 2;
+const ACCOUNT_WINDOW = new Set(['5h', 'week', 'opus', 'sonnet', 'apps', 'cowork', 'oauth apps']);
+
+function normalizeClaudeValue(value) {
+	if (!value || typeof value !== 'object') return value;
+	const plan = value.plan === 'max 20x' ? 'Ultra' : value.plan;
+	const windows = Array.isArray(value.windows) ? value.windows.filter((w) => ACCOUNT_WINDOW.has(String(w && w[0]))) : [];
+	return { ...value, plan, windows: windows.length ? windows : value.windows || [], v: USAGE_VALUE_VERSION };
+}
+
 function backoffMs(failures, cap = BACKOFF_MAX_MS) {
 	const base = Math.min(cap, BACKOFF_BASE_MS * 2 ** Math.max(0, failures - 1));
 	// A little jitter keeps several machines on one account from lining up.
@@ -537,6 +550,13 @@ class UsageCache {
 	// fail; an error alone only when there never was a good answer.
 	_claudeView(st) {
 		const pending = this._pendingWait(st) || null;
+		if (st.value && st.value.v !== USAGE_VALUE_VERSION) {
+			// A value stored before the panel dropped model-scoped bars would
+			// keep one on screen for the whole rate-limit wait. Normalise it
+			// once and write it back.
+			st = { ...st, value: normalizeClaudeValue(st.value) };
+			this.claudeState.write(st);
+		}
 		if (st.value) {
 			if (!st.lastError) return st.value;
 			return { ...st.value, stale: { since: st.lastGoodAt || null, error: st.lastError, status: st.lastStatus || null, auth: !!st.auth, retryAt: pending } };
@@ -571,7 +591,7 @@ class UsageCache {
 				let next;
 				if (!result.error) {
 					const { tokenId, ...bars } = result;
-					next = { value: bars, lastGoodAt: now, lastAttemptAt: now, lastError: null, lastStatus: null, auth: false, tokenId: tokenId || null, failures: 0, retryAt: 0 };
+					next = { value: { ...bars, v: USAGE_VALUE_VERSION }, lastGoodAt: now, lastAttemptAt: now, lastError: null, lastStatus: null, auth: false, tokenId: tokenId || null, failures: 0, retryAt: 0 };
 				} else if (result.local) {
 					// No request went out: recheck the token in a minute, and
 					// leave the backoff count to real requests.
