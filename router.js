@@ -130,6 +130,14 @@ function replaceMedia(content, modelInfo = {}) {
 	return changed ? out : content;
 }
 
+// Whether a request carries a block of this type anywhere a person put one.
+function hasBlock(messages, type) {
+	if (!Array.isArray(messages)) return false;
+	return messages.some((m) => Array.isArray(m && m.content)
+		&& m.content.some((b) => b && (b.type === type
+			|| (b.type === 'tool_result' && Array.isArray(b.content) && b.content.some((i) => i && i.type === type)))));
+}
+
 // Claude Code's five effort levels as OpenRouter's three reasoning depths.
 const REASONING_EFFORT = { low: 'low', medium: 'medium', high: 'high', xhigh: 'high', max: 'high' };
 
@@ -689,6 +697,9 @@ class ModelRouter {
 		const model = resolveAliasedModel(bareModel(json.model));
 		let modelInfo = { images: false, documents: false };
 		try { modelInfo = (await this.getModelInfo(model)) || modelInfo; } catch (_) { /* text-only */ }
+		if (!modelInfo.images && hasBlock(json.messages, 'image')) {
+			this.log(`media: image replaced for ${model} (model card: ${modelInfo.source || 'unknown'})`);
+		}
 		if (req.url.startsWith('/v1/messages/count_tokens')) {
 			// OpenRouter has no token counter for these models; a rough
 			// four-characters-per-token estimate keeps Claude Code's context

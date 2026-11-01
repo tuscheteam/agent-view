@@ -348,19 +348,25 @@ async function rankingFor(model, { fetchImpl = globalThis.fetch, ignore = [], re
 }
 
 // What a model reads besides text, from OpenRouter's model card. Cached for a
-// day; offline it answers text-only and asks again an hour later.
+// day. A card that cannot be read must not turn a model text-only for an hour:
+// the last known answer stands, and a model the picker lists with vision keeps
+// it (the card was read once, 2026-11-01).
+const KNOWN_MEDIA = {
+	'deepseek/deepseek-v4.1-flash': { images: true, documents: false },
+};
 const infoCache = new Map();
-async function modelInfo(model, { fetchImpl = globalThis.fetch, now = Date.now() } = {}) {
+async function modelInfo(model, { fetchImpl = globalThis.fetch, now = Date.now(), key = null } = {}) {
 	const hit = infoCache.get(model);
 	if (hit && now < hit.until) return hit.info;
 	try {
-		const body = await getJson(fetchImpl, `${API}/models/${model}/endpoints`);
+		const body = await getJson(fetchImpl, `${API}/models/${model}/endpoints`, key);
 		const mods = (body && body.data && body.data.architecture && body.data.architecture.input_modalities) || [];
-		const info = { images: mods.includes('image'), documents: mods.includes('file') };
+		const info = { images: mods.includes('image'), documents: mods.includes('file'), source: 'card' };
 		infoCache.set(model, { info, until: now + 24 * 3600e3 });
 		return info;
 	} catch (_) {
-		const info = hit ? hit.info : { images: false, documents: false };
+		const known = hit ? hit.info : KNOWN_MEDIA[model];
+		const info = known ? { ...known, source: 'known' } : { images: false, documents: false, source: 'unknown' };
 		infoCache.set(model, { info, until: now + 3600e3 });
 		return info;
 	}

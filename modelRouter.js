@@ -402,7 +402,13 @@ function register(context, log, version) {
 			}
 			if (!router) {
 				router = new ModelRouter({ port, getKey, getPolicy: policyFor, log, version, onUsage: appendLedger,
-					getModelInfo: (model) => ranking.modelInfo(model),
+					// Authenticated: the unauthenticated model card is rate limited
+				// by IP, and one failed read must not cost an hour of images.
+				getModelInfo: async (model) => {
+					let key = null;
+					try { key = await getKey(); } catch (_) { /* card is public */ }
+					return ranking.modelInfo(model, { key });
+				},
 					secret: routerSecret(),
 					onReject: (model, slug, why) => { ranking.demote(model, slug, why); log(`model router: ${slug} dropped for ${model}: ${why}`); },
 					// The port came free (its owner window closed, or another
