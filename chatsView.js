@@ -7,6 +7,7 @@ const { promisify } = require('util');
 const execFileAsync = promisify(require('child_process').execFile);
 const { UsageCache, watchCredentials } = require('./usage');
 const { RemoteChats, shellQuote, renameCommand } = require('./remoteChats');
+const { writePins } = require('./modelPins');
 const restyle = require('./restyle');
 const claudeFix = require('./claudeFix');
 const { UsageViewProvider } = require('./usageView');
@@ -2776,6 +2777,28 @@ class ChatsProvider {
 		this.onDidRender = this._onDidRender.event;
 	}
 
+	// The last model each chat ran on, for the router's pin file. A chat that
+	// moved back to a Claude model loses its pin, so the next reload follows
+	// the switch instead of undoing it.
+	rememberModels(rows) {
+		if (!rows || !rows.length) return;
+		const pins = {};
+		const known = [];
+		for (const row of rows) {
+			if (row.kind !== 'claude' && row.kind !== 'claude-closed') continue;
+			if (!row.data || !row.data.sessionId) continue;
+			const model = row.data.model;
+			if (!model) continue;
+			known.push(row.data.sessionId);
+			if (!isRoutedModel(model)) { pins[row.data.sessionId] = null; continue; }
+			// The picker id carries the context window ("[1m]"); the transcript
+			// only knows what the provider answered with.
+			const picker = pickerModelIds().find((m) => bareModelId(m) === bareModelId(model));
+			pins[row.data.sessionId] = picker || model;
+		}
+		if (known.length) writePins(pins);
+	}
+
 	// A file write that changes nothing visible costs a render, and an active
 	// chat writes constantly. Compare what the list is built from first.
 	refreshIfChanged() {
@@ -3243,6 +3266,7 @@ class ChatsProvider {
 		});
 		const rootChats = visible.filter((k) => !(k.key && placed.has(k.key))).map((k) => k.item);
 		this.items = [...sectionItems, ...rootChats];
+		this.rememberModels(rows);
 		this.itemByTab = new Map(items.filter((x) => x.tab).map((x) => [x.tab, x.item]));
 		const foldItem = items.find((x) => x.item.id === 'claude-hidden');
 		if (foldItem && !this.showTranscriptless) for (const r of transcriptless) this.itemByTab.set(r.tab, foldItem.item);

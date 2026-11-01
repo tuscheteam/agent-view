@@ -10,6 +10,9 @@
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { StringDecoder } = require('string_decoder');
 
 const ROUTER_ID = 'agent-view-model-router';
@@ -41,6 +44,13 @@ function routeFor(model) {
 // names): they resolve to the cheap text-only flash at the router. The
 // vision-capable v4.1-flash stays an explicit picker model for orchestrator
 // chats.
+// The model a chat ran on, written by the extension (modelPins.js). Claude
+// Code keeps no model per chat, so a restored session arrives on the
+// default from settings.json; the pinned model is put back here.
+function pinsFile() {
+	return path.join(os.homedir(), '.agent-view', 'model-pins.json');
+}
+
 const RESOLVE_ALIASES = { deepseek: 'deepseek/deepseek-v4-flash-0731' };
 
 function resolveAliasedModel(model) {
@@ -445,6 +455,10 @@ class ModelRouter {
 		// to owner), so the window can write its environment entries again.
 		this.onRoleChange = options.onRoleChange || (() => {});
 		this.stats = { anthropic: 0, openrouter: 0, errors: 0, last: [] };
+		// What each session actually ran on, so an explicit /model can be
+		// told apart from the default a restored chat starts with.
+		this.sessionModel = new Map();
+		this.pinCache = { at: 0, pins: {} };
 	}
 
 	// Several VS Code windows each run Agent View; the first one to bind the
@@ -518,6 +532,37 @@ class ModelRouter {
 		return { role: this.role, port: this.port, lastError: this.lastError || null, ...this.stats, last: this.stats.last.slice(-10) };
 	}
 
+	// The pin for a session, re-read every few seconds.
+	_pinFor(sessionId) {
+		const now = Date.now();
+		if (now - this.pinCache.at > 5000) {
+			let pins = {};
+			try { pins = JSON.parse(fs.readFileSync(pinsFile(), 'utf8')) || {}; } catch (_) { pins = {}; }
+			this.pinCache = { at: now, pins };
+		}
+		const pin = this.pinCache.pins[sessionId];
+		return typeof pin === 'string' && pin.includes('/') ? pin : null;
+	}
+
+	// A request whose model differs from what this session last used is a
+	// choice and passes through. One that repeats the default gets its pin
+	// back. The body is rewritten in place, so every later step sees the
+	// effective model.
+	_applyModelPin(json, requested) {
+		if (!json || !requested) return requested;
+		const sessionId = sessionIdOf(json);
+		if (!sessionId) return requested;
+		const previous = this.sessionModel.get(sessionId);
+		const explicit = Boolean(previous) && previous !== requested;
+		const pin = explicit ? null : this._pinFor(sessionId);
+		const effective = pin && pin !== requested ? pin : requested;
+		this.sessionModel.set(sessionId, effective);
+		if (effective === requested) return requested;
+		json.model = effective;
+		this.log(`model router: ${sessionId.slice(0, 8)} back on ${bareModel(effective)}`);
+		return effective;
+	}
+
 	_note(entry) {
 		this.stats.last.push({ at: new Date().toISOString(), ...entry });
 		if (this.stats.last.length > 50) this.stats.last.shift();
@@ -554,7 +599,14 @@ class ModelRouter {
 			delete headers.host;
 			let headersOut = headers;
 			let onDone = null;
-			const model = json && json.model;
+			// A restored chat arrives on the default model; its pin wins unless
+			// this request is itself a switch.
+			const requestedModel = json && json.model;
+			const model = this._applyModelPin(json, requestedModel);
+			if (json && model !== requestedModel) {
+				rawOut = Buffer.from(JSON.stringify(json));
+				jsonOut = json;
+			}
 			if (routeFor(model) === 'openrouter' && req.method === 'POST' && req.url.startsWith('/v1/messages')) {
 				if (!isServerToolRequest(json)) return this._toOpenRouter(req, res, json);
 				// Web search from an OpenRouter chat: Anthropic runs it on a Claude
