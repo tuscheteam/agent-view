@@ -2899,49 +2899,81 @@ class ChatsProvider {
 
 	getTreeItem(element) { return element; }
 
-	// Drag a chat onto a section node to file it there. VS Code fills the
-	// payload itself for the tree's own mime type, so no handleDrag is needed;
-	// a drop on a chat row is ignored rather than guessed at.
+	// Drag a chat onto a section to file it there. VS Code puts the dragged
+	// elements on the transfer under the tree's own mime type, whose spelling
+	// is the view id lowercased; that payload is the only one that survives
+	// the drop. Anything the controller sets in handleDrag is a fallback.
 	sectionDragAndDrop() {
-		const mime = 'application/vnd.code.tree.openEditorsTools.chats';
+		const mime = 'application/vnd.code.tree.openeditorstools.chats';
+		const ownMime = 'application/vnd.code.tree.openEditorsTools.chats';
 		const provider = this;
+		const log = (line) => { if (provider.log) provider.log(line); };
+		const read = (dataTransfer, type) => {
+			try {
+				const item = dataTransfer && dataTransfer.get ? dataTransfer.get(type) : null;
+				const value = item && item.value;
+				if (Array.isArray(value)) return value.filter(Boolean);
+				if (typeof value === 'string') {
+					const parsed = JSON.parse(value);
+					return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+				}
+				return [];
+			} catch (_) { return []; }
+		};
+		// The section a drop lands in. A section node is the section; a chat row
+		// inside one counts as that section, so the whole block is a target and
+		// not only the one header line; a chat row at the root is "back to the
+		// list".
+		const sectionOfTarget = (target) => {
+			if (!target) return null;
+			if (target.sectionId) return { id: target.sectionId, node: target };
+			const parent = target.parentItem;
+			if (parent && parent.sectionId) return { id: parent.sectionId, node: parent };
+			if (target.rowKey) return { id: null, node: null };
+			return null;
+		};
 		return {
-			dragMimeTypes: [mime],
-			dropMimeTypes: [mime],
-			// VS Code's built-in tree payload is an opaque string; the
-			// controller has to put the items on the transfer itself, or a
-			// drop receives text nothing can be filed from.
+			dragMimeTypes: [mime, ownMime],
+			dropMimeTypes: [mime, ownMime],
 			handleDrag(items, dataTransfer) {
-				try { dataTransfer.set(mime, new vscode.DataTransferItem(items)); } catch (_) { /* older host */ }
-				// VS Code may put its own opaque payload on the transfer instead
-				// of ours; the drop then has nothing to read, so keep the items
-				// it handed us here.
+				// Kept so a drop still has something to file when VS Code hands
+				// over its own payload instead of this one.
 				provider.lastDragged = items;
+				// VS Code relays this transfer to the drop as strings, so the
+				// dragged rows travel as JSON, not as objects the host would
+				// flatten to "[object Object]".
+				const refs = items.filter(Boolean).map((i) => (i.sectionId ? { sectionId: i.sectionId } : { rowKey: i.rowKey }));
+				try { dataTransfer.set(ownMime, new vscode.DataTransferItem(JSON.stringify(refs))); } catch (_) { /* older host */ }
+				const names = items.map((i) => (i && i.sectionId) ? `section:${i.sectionId}` : (i && i.rowKey) || '?');
+				log(`drag: ${names.join(', ')}`);
 				setTimeout(() => { if (provider.lastDragged === items) provider.lastDragged = null; }, 30000);
 			},
 			handleDrop: async (target, dataTransfer) => {
-				if (!target || !target.contextValue || !target.contextValue.startsWith('chatSection')) return;
-				const store = sectionStore;
-				// The tree's own mime type carries the dragged items.
-				let dragged = [];
-				try {
-					const payload = dataTransfer && dataTransfer.get ? dataTransfer.get(mime) : null;
-					const value = payload && payload.value;
-					dragged = Array.isArray(value) ? value : [];
-				} catch (_) { dragged = []; }
+				const dest = sectionOfTarget(target);
+				if (!dest) { log('drop: no target'); return; }
+				let dragged = read(dataTransfer, mime);
+				if (!dragged.length) dragged = read(dataTransfer, ownMime);
 				if (!dragged.length) dragged = provider.lastDragged || [];
+				provider.lastDragged = null;
+				if (!dragged.length) { log('drop: nothing on the transfer'); return; }
 				let changed = false;
+				const done = [];
 				for (const item of dragged) {
+					if (!item) continue;
 					// A section dropped on a section takes that place in the order.
-					if (item && item.sectionId) {
-						if (item.sectionId === target.sectionId) continue;
-						changed = store.move(item.sectionId, target.sectionId) || changed;
+					if (item.sectionId) {
+						if (!dest.id || item.sectionId === dest.id) continue;
+						if (sectionStore.move(item.sectionId, dest.id)) { changed = true; done.push(`section ${item.sectionId} before ${dest.id}`); }
 						continue;
 					}
-					if (!item || !item.rowKey) continue;
-					store.assign(item.rowKey, target.sectionId);
+					if (!item.rowKey) continue;
+					// A chat already where it was dropped is a no-op, not a refresh.
+					if (sectionStore.state.assign[item.rowKey] === dest.id || (!dest.id && !sectionStore.state.assign[item.rowKey])) continue;
+					sectionStore.assign(item.rowKey, dest.id);
 					changed = true;
+					done.push(`${item.rowKey} -> ${dest.id || 'list'}`);
 				}
+				log(`drop on ${dest.id ? `section:${dest.id}` : 'list'}: ${done.length ? done.join(', ') : 'no change'}`);
 				if (changed && provider.refresh) provider.refresh();
 			},
 		};
