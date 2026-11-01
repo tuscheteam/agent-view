@@ -224,60 +224,78 @@ function stampOf(record, fallback) {
 	return Number.isNaN(ms) ? fallback : ms;
 }
 
-async function readTranscript(file) {
-	const tally = new UsageTally();
+// ── Transcript parsing ─────────────────────────────────────────────────────
+// A transcript only ever grows, and the biggest ones here run to tens of
+// megabytes; parsing them whole on every render cost seconds. The state below
+// is everything a parse learns, so the next pass reads only what was added
+// since — and it is written to disk, so a window reload carries on from where
+// the last one stopped.
+const PARSE_STATE_VERSION = 1;
+
+function freshParseState() {
+	return {
+		// Totals of everything parsed in earlier passes, so a resumed parse
+		// still reports the whole chat.
+		base: null,
+		tally: new UsageTally(),
+		pending: new Map(),
+		titles: new Set(),
+		customTitle: null,
+		aiTitle: null,
+		model: null,
+		entrypoint: null,
+		modelAt: 0,
+		pickedModel: null,
+		pickedAt: 0,
+		contextTokens: 0,
+		lastStop: null,
+		lastReplyAt: 0,
+		lastUserAt: 0,
+		bgTasks: new Map(),
+		bgFinished: new Set(),
+		bgLabels: new Map(),
+		toolInputs: new Map(),
+		offset: 0,
+		leftover: '',
+	};
+}
+
+function addTotals(a, b) {
+	return {
+		input: (a.input || 0) + (b.input || 0),
+		output: (a.output || 0) + (b.output || 0),
+		cacheRead: (a.cacheRead || 0) + (b.cacheRead || 0),
+		write5m: (a.write5m || 0) + (b.write5m || 0),
+		write1h: (a.write1h || 0) + (b.write1h || 0),
+	};
+}
+
+function tallyResult(st) {
+	const now = st.tally.result();
+	if (!st.base) return now;
+	return {
+		totals: addTotals(st.base.totals, now.totals),
+		cost: (st.base.cost || 0) + now.cost,
+		messages: (st.base.messages || 0) + now.messages,
+		routed: Boolean(st.base.routed) || now.routed,
+	};
+}
+
+// The records of one pass, applied to the state. Every field here survives a
+// pass, which is what lets the next pass start at the byte offset.
+function parseRecords(st, lines) {
 	// tool_use id -> tool name, cleared when the matching tool_result lands.
 	// Whatever is still here at EOF is what the agent is waiting on.
-	const pending = new Map();
-	// Every title the session ever carried. A rename appends a new record, but
-	// resume can replay stale ones after it — one real transcript ended on the
-	// OLD title while its tab showed the new one. The last record is therefore
-	// not authoritative; any recorded title may be the one on the tab.
-	const titles = new Set();
-	let customTitle = null;
-	let aiTitle = null;
-	let model = null;
-	// Which Claude Code front end last wrote the transcript: "claude-vscode"
-	// for an editor tab, "sdk-cli" for `claude -p` runs that other tools start
-	// (a Codex chat running reviews), "cli" for a terminal. The last one
-	// counts: a terminal chat resumed in a tab continues as claude-vscode.
-	let entrypoint = null;
-	// When the last reply's model landed, and the last model switch Claude
-	// Code confirmed ("Set model to `x`"). currentModelOf() weighs both
-	// against the process start: Claude Code keeps no model per chat, so a
-	// chat restarted by a window reload runs the global default again.
-	let modelAt = 0;
-	let pickedModel = null;
-	let pickedAt = 0;
-	let contextTokens = 0;
-	let lastStop = null;
-	// When the agent last finished speaking, and when you last spoke. Both drive
-	// the unread mark: a reply newer than your own last turn is one you have not
-	// answered, and typing is proof you had read what came before it.
-	let lastReplyAt = 0;
-	let lastUserAt = 0;
-	// Background work the chat launched and has not heard back from, keyed by
-	// task id. See backgroundLaunch() for what counts as a launch.
-	const bgTasks = new Map();
-	const bgFinished = new Set();
-	const bgLabels = new Map();
-	// tool_use id -> { name, description }, kept until the tool_result lands,
-	// so a launch result can be labelled with the call's own description.
-	const toolInputs = new Map();
+	const { pending, titles, bgTasks, bgFinished, bgLabels, toolInputs } = st;
 
-	const rl = readline.createInterface({
-		input: fs.createReadStream(file, { encoding: 'utf8' }),
-		crlfDelay: Infinity,
-	});
-
-	for await (const line of rl) {
+	for (const line of lines) {
 		if (!line) continue;
 		let record;
 		try { record = JSON.parse(line); } catch (_) { continue; }
 
-		if (record.entrypoint) entrypoint = record.entrypoint;
-		if (record.type === 'custom-title' && record.customTitle) { customTitle = record.customTitle; titles.add(record.customTitle); }
-		else if (record.type === 'ai-title' && record.aiTitle) { aiTitle = record.aiTitle; titles.add(record.aiTitle); }
+		if (record.entrypoint) st.entrypoint = record.entrypoint;
+		if (record.type === 'custom-title' && record.customTitle) { st.customTitle = record.customTitle; titles.add(record.customTitle); }
+		else if (record.type === 'ai-title' && record.aiTitle) { st.aiTitle = record.aiTitle; titles.add(record.aiTitle); }
 
 		// A confirmed model switch arrives as a user message or as a system
 		// record, both carrying Claude Code's own stdout line.
@@ -285,7 +303,7 @@ async function readTranscript(file) {
 			const text = typeof record.content === 'string' ? record.content
 				: record.message && typeof record.message.content === 'string' ? record.message.content : '';
 			const picked = /<local-command-stdout>Set model to `([^`]+)`/.exec(text);
-			if (picked) { pickedModel = picked[1]; pickedAt = stampOf(record, pickedAt); }
+			if (picked) { st.pickedModel = picked[1]; st.pickedAt = stampOf(record, st.pickedAt); }
 		}
 
 		const message = record.message;
@@ -297,9 +315,9 @@ async function readTranscript(file) {
 		if (message && Array.isArray(message.content)) {
 			for (const block of message.content) {
 				if (block.type === 'tool_result') {
-					const text = typeof block.content === 'string' ? block.content
+					const inner = typeof block.content === 'string' ? block.content
 						: Array.isArray(block.content) ? block.content.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('\n') : '';
-					const named = /Output is being written to:\s*(.+?)\.output/.exec(text);
+					const named = /Output is being written to:\s*(.+?)\.output/.exec(inner);
 					if (named) resultOutputPath = `${named[1]}.output`;
 				}
 				if (block.type === 'tool_use') {
@@ -337,14 +355,14 @@ async function readTranscript(file) {
 			for (const id of finishedTaskIds(record)) { bgTasks.delete(id); bgFinished.add(id); }
 		}
 		if (message && message.role === 'assistant' && message.stop_reason !== undefined) {
-			lastStop = message.stop_reason;
-			if (message.stop_reason === 'end_turn') lastReplyAt = stampOf(record, lastReplyAt);
+			st.lastStop = message.stop_reason;
+			if (message.stop_reason === 'end_turn') st.lastReplyAt = stampOf(record, st.lastReplyAt);
 		}
 		// A real turn you typed. Tool results and injected context also arrive as
 		// role "user", so they are excluded — they prove nothing about reading.
 		if (record.type === 'user' && !record.isMeta && !record.isSidechain && message
 			&& !(Array.isArray(message.content) && message.content.some((b) => b.type === 'tool_result'))) {
-			lastUserAt = stampOf(record, lastUserAt);
+			st.lastUserAt = stampOf(record, st.lastUserAt);
 		}
 
 		const usage = message && message.usage;
@@ -353,35 +371,129 @@ async function readTranscript(file) {
 		// Last one wins, so the row follows a mid-chat model switch. `<synthetic>`
 		// marks a replayed turn, not a model, and must not overwrite it. A
 		// sidechain record is a SUBAGENT turn: it does not speak for the chat.
-		if (!record.isSidechain && message.model && message.model !== '<synthetic>') { model = message.model; modelAt = stampOf(record, modelAt); }
-		const c = tally.add(message);
+		if (!record.isSidechain && message.model && message.model !== '<synthetic>') { st.model = message.model; st.modelAt = stampOf(record, st.modelAt); }
+		const c = st.tally.add(message);
 
 		// Context in play is whatever the most recent request carried, not the
 		// running total — cache reads replay the same prefix every turn.
-		contextTokens = c.input + c.cacheRead + c.writeTotal;
+		st.contextTokens = c.input + c.cacheRead + c.writeTotal;
 	}
+}
 
-	const sums = tally.result();
+function transcriptSummary(st) {
+	const sums = tallyResult(st);
 	return {
-		title: customTitle || aiTitle,
-		titles,
-		entrypoint,
-		model,
-		modelAt,
-		pickedModel,
-		pickedAt,
-		contextTokens,
-		contextLimit: ratesFor(model).ctx,
+		title: st.customTitle || st.aiTitle,
+		titles: st.titles,
+		entrypoint: st.entrypoint,
+		model: st.model,
+		modelAt: st.modelAt,
+		pickedModel: st.pickedModel,
+		pickedAt: st.pickedAt,
+		contextTokens: st.contextTokens,
+		contextLimit: ratesFor(st.model).ctx,
 		cost: sums.cost,
 		messages: sums.messages,
 		totals: sums.totals,
 		routed: sums.routed,
-		lastStop,
-		lastReplyAt,
-		lastUserAt,
-		pendingTools: [...pending.values()],
-		backgroundTasks: [...bgTasks.values()],
+		lastStop: st.lastStop,
+		lastReplyAt: st.lastReplyAt,
+		lastUserAt: st.lastUserAt,
+		pendingTools: [...st.pending.values()],
+		backgroundTasks: [...st.bgTasks.values()],
 	};
+}
+
+// Parse a transcript, from the beginning or from where its state left off.
+// The returned summary carries the state for the next pass.
+async function readTranscript(file, seed) {
+	const st = seed || freshParseState();
+	let size = 0;
+	try { size = fs.statSync(file).size; } catch (_) { /* gone */ }
+	if (size < st.offset) {
+		// The file shrank: rotated or rewritten. Start over rather than
+		// stitching two unrelated histories together.
+		const fresh = freshParseState();
+		for (const key of Object.keys(fresh)) st[key] = fresh[key];
+	}
+	let chunk = '';
+	if (size > st.offset) {
+		try {
+			const fd = fs.openSync(file, 'r');
+			try {
+				const buffer = Buffer.alloc(size - st.offset);
+				fs.readSync(fd, buffer, 0, buffer.length, st.offset);
+				chunk = buffer.toString('utf8');
+			} finally { fs.closeSync(fd); }
+		} catch (_) { chunk = ''; }
+	}
+	st.offset = size;
+	const all = st.leftover + chunk;
+	const lines = all.split('\n');
+	// A half-written last line waits for the next pass.
+	st.leftover = lines.pop() || '';
+	parseRecords(st, lines);
+	const summary = transcriptSummary(st);
+	summary.parseState = st;
+	return summary;
+}
+
+// What a state looks like on disk: the tallies collapse into their sums, the
+// maps into pairs.
+function serializeState(st) {
+	const sums = tallyResult(st);
+	return {
+		v: PARSE_STATE_VERSION,
+		totals: sums.totals,
+		cost: sums.cost,
+		messages: sums.messages,
+		routed: sums.routed,
+		titles: [...st.titles],
+		customTitle: st.customTitle,
+		aiTitle: st.aiTitle,
+		model: st.model,
+		entrypoint: st.entrypoint,
+		modelAt: st.modelAt,
+		pickedModel: st.pickedModel,
+		pickedAt: st.pickedAt,
+		contextTokens: st.contextTokens,
+		lastStop: st.lastStop,
+		lastReplyAt: st.lastReplyAt,
+		lastUserAt: st.lastUserAt,
+		pending: [...st.pending],
+		bgTasks: [...st.bgTasks],
+		bgFinished: [...st.bgFinished],
+		bgLabels: [...st.bgLabels],
+		toolInputs: [...st.toolInputs],
+		offset: st.offset,
+		leftover: st.leftover,
+	};
+}
+
+function hydrateState(saved) {
+	if (!saved || saved.v !== PARSE_STATE_VERSION) return null;
+	const st = freshParseState();
+	st.base = { totals: saved.totals, cost: saved.cost, messages: saved.messages, routed: saved.routed };
+	st.titles = new Set(saved.titles || []);
+	st.customTitle = saved.customTitle || null;
+	st.aiTitle = saved.aiTitle || null;
+	st.model = saved.model || null;
+	st.entrypoint = saved.entrypoint || null;
+	st.modelAt = saved.modelAt || 0;
+	st.pickedModel = saved.pickedModel || null;
+	st.pickedAt = saved.pickedAt || 0;
+	st.contextTokens = saved.contextTokens || 0;
+	st.lastStop = saved.lastStop || null;
+	st.lastReplyAt = saved.lastReplyAt || 0;
+	st.lastUserAt = saved.lastUserAt || 0;
+	st.pending = new Map(saved.pending || []);
+	st.bgTasks = new Map(saved.bgTasks || []);
+	st.bgFinished = new Set(saved.bgFinished || []);
+	st.bgLabels = new Map(saved.bgLabels || []);
+	st.toolInputs = new Map(saved.toolInputs || []);
+	st.offset = saved.offset || 0;
+	st.leftover = saved.leftover || '';
+	return st;
 }
 
 // ── Background tasks ───────────────────────────────────────────────────────
@@ -623,14 +735,7 @@ const SUBAGENT_ACTIVE_MS = 120000;
 // repaints ONE parent row, round-robin, and while a root refresh is pending
 // or running the tick fires nothing at all (see spinnerTick).
 const REFRESH_COALESCE_MS = 120;
-// A transcript is re-parsed at most this often while it keeps growing. The
-// wait grows with the file: parsing a 30 MB transcript costs seconds, and one
-// active chat rewrites its file on every message.
-const RERAPARSE_MS = 4000;
-function reparseWait(size) {
-	const mb = Math.max(0, Number(size) || 0) / 1e6;
-	return RERAPARSE_MS + Math.min(56000, Math.round(mb) * 1500);
-}
+
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SPINNER_INTERVAL_MS = 200;
 // A requested root refresh that never lands (a throw inside getChildren, a
@@ -638,6 +743,7 @@ const SPINNER_INTERVAL_MS = 200;
 // pending flag is treated as stale and dropped.
 const ROOT_PENDING_MAX_MS = 10000;
 const subagentCache = new Map();
+let subagentDirty = false;
 
 // Claude Code writes agent-<id>.meta.json next to each subagent transcript at
 // spawn time: {"agentType","description","workflowPhase","model",...}. The
@@ -744,6 +850,7 @@ function readSubagentSummary(file, stat) {
 	summary.ledgerMtimeMs = sums.routed ? routerCosts().mtimeMs : 0;
 
 	subagentCache.set(file, summary);
+	subagentDirty = true;
 	return summary;
 }
 
@@ -1062,6 +1169,44 @@ function entryCarries(entry, key) {
 // Cached by mtime+size so a refresh only re-reads transcripts that actually
 // changed; without it every tab switch would re-parse the whole store.
 class TranscriptIndex {
+	// Parsing states survive a reload: a window that starts again reads only
+	// what the transcripts gained while it was gone.
+	setStateFile(file) {
+		this.stateFile = file;
+		try {
+			const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+			if (saved && saved.v === PARSE_STATE_VERSION && saved.files) this.states = new Map(Object.entries(saved.files));
+			if (saved && saved.v === PARSE_STATE_VERSION && saved.sub) {
+				for (const [file, summary] of Object.entries(saved.sub)) subagentCache.set(file, summary);
+			}
+		} catch (_) { /* first run, or a file another version wrote */ }
+	}
+
+	rememberState(file, state) {
+		if (!state || !this.states) return;
+		this.states.set(file, serializeState(state));
+		this.stateDirty = true;
+	}
+
+	// Called at the end of a scan: a few hundred kilobytes, a few
+	// milliseconds, and the next window starts warm.
+	flushStates() {
+		if (!this.stateDirty && !subagentDirty) return;
+		this.stateDirty = false;
+		subagentDirty = false;
+		this.saveStates();
+	}
+
+	saveStates() {
+		if (!this.stateFile || !this.states) return;
+		try {
+			fs.mkdirSync(path.dirname(this.stateFile), { recursive: true });
+			const tmp = `${this.stateFile}.${process.pid}.tmp`;
+			fs.writeFileSync(tmp, JSON.stringify({ v: PARSE_STATE_VERSION, files: Object.fromEntries(this.states), sub: Object.fromEntries(subagentCache) }));
+			fs.renameSync(tmp, this.stateFile);
+		} catch (_) { /* the in-memory states still serve this window */ }
+	}
+
 	// What the list is built from, in one string: cheap enough on every file
 	// event, exact enough to know when nothing moved.
 	stamp() {
@@ -1075,6 +1220,10 @@ class TranscriptIndex {
 		this.byFile = new Map();
 		this.byTitle = new Map();
 		this.scanning = null;
+		// Parsing states, by file: what a resumed parse starts from.
+		this.states = new Map();
+		this.stateFile = null;
+		this.stateTimer = null;
 	}
 
 	async refresh(workspacePath) {
@@ -1103,27 +1252,24 @@ class TranscriptIndex {
 
 			const cached = this.byFile.get(file);
 			let entry;
-			// Parsing is the expensive part of a render, and an active chat
-			// rewrites its transcript on every message. A file that changed a
-			// moment ago waits for the next pass.
-			const tooSoon = cached && Date.now() - (cached.parsedAt || 0) < reparseWait(stat.size);
 			// A chat that used OpenRouter models is re-read when the router's
 			// cost log moves on, since its billed costs land there after the reply.
 			if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size
 				&& !(cached.routed && routerCosts().mtimeMs !== cached.ledgerMtimeMs)) {
 				entry = cached;
-			} else if (tooSoon && !(cached.routed && routerCosts().mtimeMs !== cached.ledgerMtimeMs)) {
-				entry = cached;
 			} else {
 				try {
-					entry = await readTranscript(file);
+				// Only the bytes added since the last pass are parsed. The state
+				// comes from this window if it has it, else from the disk cache a
+				// previous window wrote.
+					entry = await readTranscript(file, (cached && cached.parseState) || (this.states && hydrateState(this.states.get(file))) || undefined);
 				} catch (_) {
 					continue; // half-written line during an active session
 				}
 				entry.ledgerMtimeMs = entry.routed ? routerCosts().mtimeMs : 0;
 				entry.mtimeMs = stat.mtimeMs;
 				entry.size = stat.size;
-				entry.parsedAt = Date.now();
+				this.rememberState(file, entry.parseState);
 				entry.sessionId = name.replace(/\.jsonl$/, '');
 				this.byFile.set(file, entry);
 			}
@@ -1139,6 +1285,8 @@ class TranscriptIndex {
 				if (!existing || entry.lastActivity > existing.lastActivity) titles.set(key, entry);
 			}
 		}
+		this.flushStates();
+
 		this.byTitle = titles;
 	}
 
@@ -3599,6 +3747,8 @@ function register(context) {
 	firstRun(context);
 	gatherOnce(context);
 	const index = new TranscriptIndex();
+	// Where a reload picks up: the parse cache from the last window.
+	if (context.globalStorageUri && context.globalStorageUri.fsPath) index.setStateFile(path.join(context.globalStorageUri.fsPath, 'parse-cache.json'));
 	transcriptIndex = index;
 	loadSideColumn(context.workspaceState);
 	claudeState.configure(
@@ -4327,6 +4477,7 @@ module.exports = {
 		stateOf, liveSessionIds, CodexIndex, codexConversationId,
 		liveSessionRecord, endClaudeProcess, claudeProcessOwner, processTools, sideColumnSessions, sideColumnIndex, claudeColumn, loadSideColumn, codexViewColumn, newCodexInTab, claudeState, ClaudeCodeState, titleMatches,
 		chatRowKey, sectionStore, SECTIONS_KEY, remoteNames, chatNames, archivedChats, RemoteChats, shellQuote, renameCommand,
+		serializeState, hydrateState, freshParseState,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		shellTaskRunning, shellTaskEnded, taskOutputFile, taskDirsFor, taskDirs, processList, hasLiveDescendants,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,
