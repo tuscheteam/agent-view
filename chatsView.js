@@ -643,6 +643,16 @@ function taskOutputFile(task, sessionId) {
 	return null;
 }
 
+// A shell that is still alive but has not written a byte for minutes is a
+// wait loop, not work. A DeepSeek orchestrator leaves those behind: the
+// process tree says "running" for hours while nothing happens.
+const TASK_QUIET_MS = 180000;
+function taskQuietFor(task, sessionId, now = Date.now()) {
+	const file = taskOutputFile(task, sessionId);
+	if (!file) return 0;
+	try { return Math.max(0, now - fs.statSync(file).mtimeMs); } catch (_) { return 0; }
+}
+
 function shellTaskEnded(task, sessionId) {
 	const file = taskOutputFile(task, sessionId);
 	if (!file) return false;
@@ -3694,10 +3704,15 @@ class ChatsProvider {
 			}
 			const now = Date.now();
 			for (const task of tasks) {
-				const tchild = new vscode.TreeItem(`${SPINNER_FRAMES[this._spinnerFrame]} ${task.label}`, vscode.TreeItemCollapsibleState.None);
+				const quiet = taskQuietFor(task, data && data.sessionId, now);
+				const stalled = quiet > TASK_QUIET_MS;
+				const icon = stalled ? '⏸' : SPINNER_FRAMES[this._spinnerFrame];
+				const tchild = new vscode.TreeItem(`${icon} ${task.label}`, vscode.TreeItemCollapsibleState.None);
 				tchild.baseLabel = task.label;
 				tchild.contextValue = 'backgroundTask';
-				tchild.description = `${task.kind} · ${formatSpan(now - task.startedAt)}`;
+				tchild.description = [`${task.kind} · ${formatSpan(now - task.startedAt)}`,
+					stalled ? `no output ${formatSpan(quiet)}` : null].filter(Boolean).join(' · ');
+				if (stalled) tchild.iconPath = new vscode.ThemeIcon('debug-pause');
 				const tmd = new vscode.MarkdownString();
 				tmd.appendMarkdown(`**${task.label}** _(background ${task.kind})_\n\n`);
 				tmd.appendMarkdown(`| | |\n|---|---|\n`);
@@ -3705,7 +3720,10 @@ class ChatsProvider {
 				tmd.appendMarkdown(`| Task ID | \`${task.id}\` |\n`);
 				tmd.appendMarkdown(`| Running for | ${formatSpan(now - task.startedAt)} |\n`);
 				if (task.until) tmd.appendMarkdown(`| Times out in | ${formatSpan(task.until - now)} |\n`);
-				tmd.appendMarkdown(`\n_The chat continues when this task reports back. The row disappears then._`);
+				if (stalled) tmd.appendMarkdown(`| Output | nothing written for ${formatSpan(quiet)} |\n`);
+				tmd.appendMarkdown(`\n_${stalled
+					? 'The process is still alive but has written nothing for minutes, which is usually a wait loop that will never end. Ending the task does not stop the chat.'
+					: 'The chat continues when this task reports back. The row disappears then.'}_`);
 				tchild.tooltip = tmd;
 				tchild.id = `${item.id}:task:${task.id}`;
 				tchild.parentItem = item;
@@ -3749,9 +3767,13 @@ class ChatsProvider {
 		const worked = turnDuration(data, state === 'running' || tasks.length > 0, subagents);
 		const totalAgentCount = (subs ? subs.length : 0) + xprovSubs.length;
 		const live = state === 'running' || hasSubs;
+		// Every task silent: the chat is not working, whatever the processes say.
+		const quietAges = data && data.sessionId ? tasks.map((t) => taskQuietFor(t, data.sessionId)) : [];
+		const allQuiet = tasks.length > 0 && quietAges.every((q) => q > TASK_QUIET_MS);
+		const quietFor = allQuiet ? Math.min(...quietAges) : 0;
 		item.description = [
 			totalAgentCount ? `${totalAgentCount} agent${totalAgentCount > 1 ? 's' : ''}` : null,
-			tasks.length ? `${tasks.length} task${tasks.length > 1 ? 's' : ''}` : null,
+			tasks.length ? `${tasks.length} task${tasks.length > 1 ? 's' : ''}${allQuiet ? ` silent ${formatSpan(quietFor)}` : ''}` : null,
 			worked ? (live ? `⏱ ${worked}` : `${worked} turn`) : formatAge(data.lastActivity),
 			`${formatTokens(data.contextTokens)}/${formatTokens(data.contextLimit)}`,
 			formatCost(totalCost),
@@ -4572,6 +4594,7 @@ module.exports = {
 		serializeState, hydrateState, freshParseState,
 		backgroundLaunch, finishedTaskIds, liveBackgroundTasks, formatSpan, BG_TASK_MAX_AGE_MS,
 		shellTaskRunning, shellTaskEnded, taskOutputFile, taskDirsFor, taskDirs, processList, hasLiveDescendants,
+		taskQuietFor, TASK_QUIET_MS,
 		subagentsFor, promptLabel, readSubagentSummary, threadLabel, SUBAGENT_ACTIVE_MS,
 		columnOf, claudeColumn, codexColumn, claudeTabs, codexTabs,
 		resolveCodexTarget, openCodexInSidebar, openCodexInEditor, newCodexChat,
