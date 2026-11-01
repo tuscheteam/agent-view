@@ -41,7 +41,8 @@ const DEFAULT_IGNORED_PROVIDERS = ['deepseek', 'tencent', 'baidu', 'nex-agi', 'x
 // v4.1-flash reads images (orchestrator chats); 0731 is the cheaper text-only
 // flash that bare "deepseek" subagents run. Both listed, so the default-model
 // guard also catches a 0731 pick.
-const DEFAULT_PICKER_MODELS = ['deepseek/deepseek-v4.1-flash', 'deepseek/deepseek-v4-flash-0731'];
+// v4-pro is text only: images and PDFs in a pro chat become a note.
+const DEFAULT_PICKER_MODELS = ['deepseek/deepseek-v4.1-flash', 'deepseek/deepseek-v4-flash-0731', 'deepseek/deepseek-v4-pro'];
 
 function readRegistryEnv(name) {
 	if (process.platform !== 'win32') return Promise.resolve('');

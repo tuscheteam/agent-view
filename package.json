@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.15.26",
+  "version": "0.15.27",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -166,7 +166,8 @@
           },
           "default": [
             "deepseek/deepseek-v4.1-flash",
-            "deepseek/deepseek-v4-flash-0731"
+            "deepseek/deepseek-v4-flash-0731",
+            "deepseek/deepseek-v4-pro"
           ],
           "description": "OpenRouter models listed in Claude Code's model menu while the router runs.",
           "scope": "application"
