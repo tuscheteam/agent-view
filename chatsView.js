@@ -7,7 +7,7 @@ const { promisify } = require('util');
 const execFileAsync = promisify(require('child_process').execFile);
 const { UsageCache, watchCredentials } = require('./usage');
 const { RemoteChats, shellQuote, renameCommand } = require('./remoteChats');
-const { writePins } = require('./modelPins');
+const { writePins, fingerprintOfText } = require('./modelPins');
 const restyle = require('./restyle');
 const claudeFix = require('./claudeFix');
 const { UsageViewProvider } = require('./usageView');
@@ -231,7 +231,9 @@ function stampOf(record, fallback) {
 // is everything a parse learns, so the next pass reads only what was added
 // since — and it is written to disk, so a window reload carries on from where
 // the last one stopped.
-const PARSE_STATE_VERSION = 1;
+// 2: the state also carries the chat's first user message, which names the
+// chat for the model pin.
+const PARSE_STATE_VERSION = 2;
 
 function freshParseState() {
 	return {
@@ -258,6 +260,9 @@ function freshParseState() {
 		toolInputs: new Map(),
 		offset: 0,
 		leftover: '',
+		// What the person typed first. It names the chat when a reload gives
+		// the session a new id, which is what the model pin hangs on.
+		firstUser: null,
 	};
 }
 
@@ -364,6 +369,12 @@ function parseRecords(st, lines) {
 		if (record.type === 'user' && !record.isMeta && !record.isSidechain && message
 			&& !(Array.isArray(message.content) && message.content.some((b) => b.type === 'tool_result'))) {
 			st.lastUserAt = stampOf(record, st.lastUserAt);
+			if (!st.firstUser) {
+				const first = typeof message.content === 'string' ? message.content
+					: Array.isArray(message.content) ? message.content.filter((b) => b && b.type === 'text').map((b) => b.text || '').join(' ') : '';
+				const cleaned = String(first).replace(/\s+/g, ' ').trim();
+				if (cleaned) st.firstUser = cleaned.slice(0, 400);
+			}
 		}
 
 		const usage = message && message.usage;
@@ -400,6 +411,7 @@ function transcriptSummary(st) {
 		lastStop: st.lastStop,
 		lastReplyAt: st.lastReplyAt,
 		lastUserAt: st.lastUserAt,
+		firstUser: st.firstUser,
 		pendingTools: [...st.pending.values()],
 		backgroundTasks: [...st.bgTasks.values()],
 	};
@@ -461,6 +473,7 @@ function serializeState(st) {
 		lastStop: st.lastStop,
 		lastReplyAt: st.lastReplyAt,
 		lastUserAt: st.lastUserAt,
+		firstUser: st.firstUser || null,
 		pending: [...st.pending],
 		bgTasks: [...st.bgTasks],
 		bgFinished: [...st.bgFinished],
@@ -487,6 +500,7 @@ function hydrateState(saved) {
 	st.lastStop = saved.lastStop || null;
 	st.lastReplyAt = saved.lastReplyAt || 0;
 	st.lastUserAt = saved.lastUserAt || 0;
+	st.firstUser = saved.firstUser || null;
 	st.pending = new Map(saved.pending || []);
 	st.bgTasks = new Map(saved.bgTasks || []);
 	st.bgFinished = new Set(saved.bgFinished || []);
@@ -2782,7 +2796,7 @@ class ChatsProvider {
 	// the switch instead of undoing it.
 	rememberModels(rows) {
 		if (!rows || !rows.length) return;
-		const pins = {};
+		const pins = { sessions: {}, chats: {} };
 		const known = [];
 		for (const row of rows) {
 			if (row.kind !== 'claude' && row.kind !== 'claude-closed') continue;
@@ -2793,11 +2807,13 @@ class ChatsProvider {
 			const model = picked || row.data.model;
 			if (!model) continue;
 			known.push(row.data.sessionId);
-			if (!isRoutedModel(model)) { pins[row.data.sessionId] = null; continue; }
+			const fp = fingerprintOfText(row.data.firstUser);
+			if (!isRoutedModel(model)) { pins.sessions[row.data.sessionId] = null; if (fp) pins.chats[fp] = null; continue; }
 			// The picker id carries the context window ("[1m]"); the transcript
 			// only knows what the provider answered with.
 			const picker = pickerModelIds().find((m) => bareModelId(m) === bareModelId(model));
-			pins[row.data.sessionId] = picker || model;
+			pins.sessions[row.data.sessionId] = picker || model;
+			if (fp) pins.chats[fp] = picker || model;
 		}
 		if (known.length) writePins(pins);
 	}

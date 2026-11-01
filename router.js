@@ -13,6 +13,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { fingerprint } = require('./modelPins');
 const { StringDecoder } = require('string_decoder');
 
 const ROUTER_ID = 'agent-view-model-router';
@@ -533,15 +534,35 @@ class ModelRouter {
 	}
 
 	// The pin for a session, re-read every few seconds.
-	_pinFor(sessionId) {
+	_pinFor(sessionId, chatFingerprint) {
 		const now = Date.now();
 		if (now - this.pinCache.at > 5000) {
 			let pins = {};
 			try { pins = JSON.parse(fs.readFileSync(pinsFile(), 'utf8')) || {}; } catch (_) { pins = {}; }
-			this.pinCache = { at: now, pins };
+			// Version 1 was a flat session map; version 2 keeps a chat
+			// fingerprint too, because a reload can hand the session a new id.
+			const v2 = pins.v === 2;
+			this.pinCache = { at: now, pins: v2 ? (pins.sessions || {}) : pins, chats: v2 ? (pins.chats || {}) : {} };
 		}
-		const pin = this.pinCache.pins[sessionId];
-		return typeof pin === 'string' && pin.includes('/') ? pin : null;
+		const fromChat = chatFingerprint && this.pinCache.chats ? this.pinCache.chats[chatFingerprint] : null;
+		for (const pin of [fromChat, sessionId ? this.pinCache.pins[sessionId] : null]) {
+			if (typeof pin === 'string' && pin.includes('/')) return pin;
+		}
+		return null;
+	}
+
+	// A request log next to the pins: which model came in, which went out and
+	// whether the chat had a pin. Reading it is the only way to tell a broken
+	// pin from a model the CLI picked itself.
+	_logRoute(entry) {
+		try {
+			const file = path.join(os.homedir(), '.agent-view', 'router.log');
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			let size = 0;
+			try { size = fs.statSync(file).size; } catch (_) { size = 0; }
+			if (size > 1024 * 1024) fs.writeFileSync(file, '');
+			fs.appendFileSync(file, `${new Date().toISOString()} ${entry}\n`);
+		} catch (_) { /* logging must never break a request */ }
 	}
 
 	// A request whose model differs from what this session last used is a
@@ -551,18 +572,27 @@ class ModelRouter {
 	_applyModelPin(json, requested) {
 		if (!json || !requested) return requested;
 		const sessionId = sessionIdOf(json);
-		if (!sessionId) return requested;
+		const chatFingerprint = fingerprint(json.messages);
+		if (!sessionId && !chatFingerprint) {
+			this._logRoute(`session=- chat=- in=${requested} out=same (no identity)`);
+			return requested;
+		}
 		// The pin wins while it exists. Claude Code resends its default model on
 		// every request, so "the model changed" is not a usable signal: a chat
 		// we rewrote once would come back on the default on the very next call.
 		// The extension is the judge — it clears the pin the moment the chat's
 		// transcript (or a /model pick) says a Claude model.
-		const pin = this._pinFor(sessionId);
+		const pin = this._pinFor(sessionId, chatFingerprint);
 		const effective = pin && pin !== requested ? pin : requested;
-		this.sessionModel.set(sessionId, effective);
-		if (effective === requested) return requested;
+		if (sessionId) this.sessionModel.set(sessionId, effective);
+		const head = `session=${String(sessionId || '-').slice(0, 8)} chat=${chatFingerprint || '-'} in=${requested}`;
+		if (effective === requested) {
+			this._logRoute(`${head} out=same pin=${pin || '-'}`);
+			return requested;
+		}
 		json.model = effective;
-		this.log(`model router: ${sessionId.slice(0, 8)} back on ${bareModel(effective)}`);
+		this._logRoute(`${head} out=${effective} PINNED`);
+		this.log(`model router: ${String(sessionId || chatFingerprint).slice(0, 8)} back on ${bareModel(effective)}`);
 		return effective;
 	}
 
