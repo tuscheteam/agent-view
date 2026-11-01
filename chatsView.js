@@ -2648,6 +2648,16 @@ const sectionStore = {
 		this.save();
 		return true;
 	},
+	// The last place in the order: a section dropped on the chat list below
+	// the sections goes to the bottom.
+	moveToEnd(id) {
+		const from = this.state.sections.findIndex((x) => x.id === id);
+		if (from === -1 || from === this.state.sections.length - 1) return false;
+		const [sec] = this.state.sections.splice(from, 1);
+		this.state.sections.push(sec);
+		this.save();
+		return true;
+	},
 	byId(id) { return this.state.sections.find((x) => x.id === id) || null; },
 	assign(key, id) {
 		if (!key) return;
@@ -2960,10 +2970,17 @@ class ChatsProvider {
 				const done = [];
 				for (const item of dragged) {
 					if (!item) continue;
-					// A section dropped on a section takes that place in the order.
+					// A section dropped on a section takes that place in the order;
+					// on the chat list below the sections it goes to the bottom.
+					// The chats filed in it stay where they are.
 					if (item.sectionId) {
-						if (!dest.id || item.sectionId === dest.id) continue;
-						if (sectionStore.move(item.sectionId, dest.id)) { changed = true; done.push(`section ${item.sectionId} before ${dest.id}`); }
+						if (item.sectionId === dest.id) continue;
+						if (dest.id) {
+							if (sectionStore.move(item.sectionId, dest.id)) { changed = true; done.push(`section ${item.sectionId} before ${dest.id}`); }
+						} else if (sectionStore.moveToEnd(item.sectionId)) {
+							changed = true;
+							done.push(`section ${item.sectionId} to the end`);
+						}
 						continue;
 					}
 					if (!item.rowKey) continue;
