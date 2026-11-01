@@ -188,11 +188,12 @@ ${rows}
 			})
 			.join('\n');
 
-		const stale = usage.stale
-			? `\n\t<div class="sub" title="${escapeHtml(usage.stale.error)}">${escapeHtml(staleText(usage.stale))}</div>`
-			: '';
+		// No line under the bars for a lookup that merely waited: the age and
+		// the next try stay in the row tooltip, where they explain the numbers
+		// without reading as a defect on a healthy panel.
+		const stale = '';
 		return `<div class="urow ${cls}">
-	<div class="head"><span class="uname">${name}</span><span class="sub">${escapeHtml(usage.plan || '')}</span></div>
+	<div class="head"><span class="uname">${name}</span><span class="sub" title="${escapeHtml(usage.stale ? staleText(usage.stale) : usage.plan || '')}">${escapeHtml(usage.plan || '')}</span></div>
 ${lines}${stale}
 </div>`;
 	}

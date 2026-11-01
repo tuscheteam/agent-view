@@ -145,7 +145,12 @@ function claudeBars(body, creds) {
 	// Here it says so outright: kind `weekly_scoped` carries
 	// scope.model.display_name = "Fable".
 	if (Array.isArray(body.limits) && body.limits.length) {
-		const windows = body.limits
+		// A scoped limit is one model's own weekly bar ("Fable" and friends).
+		// The account-wide bars already carry the number that matters, so the
+		// per-model ones stay out of the panel.
+		const scoped = body.limits.filter((limit) => limit && limit.scope && limit.scope.model);
+		const flat = body.limits.filter((limit) => !(limit && limit.scope && limit.scope.model));
+		const windows = (flat.length ? flat : scoped)
 			.filter((limit) => limit && typeof limit.percent === 'number')
 			.map((limit) => [
 				limitLabel(limit),
@@ -232,7 +237,9 @@ function codexExtensionRoot() {
 function planLabel(creds) {
 	const tier = creds.rateLimitTier;
 	if (typeof tier === 'string' && tier) {
-		const known = { default_claude_max_20x: 'max 20x', default_claude_max_5x: 'max 5x' };
+		// Anthropic renamed the top plan: the tier is still default_claude_max_20x,
+		// the product is Claude Ultra.
+		const known = { default_claude_max_20x: 'Ultra', default_claude_max_5x: 'max 5x' };
 		if (known[tier]) return known[tier];
 		// An unknown tier is still worth showing: strip the prefix the known
 		// ones share and let the rest read as-is, rather than falling back to
