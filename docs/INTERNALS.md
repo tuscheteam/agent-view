@@ -36,6 +36,43 @@ Two things that cost real debugging:
   Adding this one gives both panes their own 22 px header, and the container's minimum expanded
   height goes from 120 px to ~284 px.
 
+## Accounts panel
+
+Opt-in (`openEditorsTools.accounts.enabled`); code in `accounts.js` (vscode-free) and
+`accountsView.js`. Measured with Claude Code 2.1.322 on 2026-11-11:
+
+- **`/login` with a second account forks every chat.** Each transcript carries a
+  `{"type":"session-owner","accountUuid":…}` line. After a login as another account, an old
+  chat refuses to send ("This session belongs to another account, so nothing was sent") and
+  offers Change login or "Copy to … and continue", which creates a duplicate.
+- **`CLAUDE_CODE_OAUTH_TOKEN` avoids that.** In the `env` block of `~/.claude/settings.json` it
+  replaces the stored login: a wrong token failed with 401, a good one answered. While it is
+  set, Claude Code's owner check has no current account (`GC()` returns false with the
+  variable set, so `NDe()` yields nothing) and old chats continue on the token's account.
+- **A setup-token is inference-only.** Claude Code's own text says so ("limited to
+  inference-only", no Remote Control, no claude.ai connectors). The free check is
+  `POST /v1/messages/count_tokens`: 200 for a `/login` token, and the reply names the
+  organization in `anthropic-organization-id`. On 2026-11-23 the add flow turned down a fresh
+  setup-token twice (read from the terminal, then pasted) on that check. Since 0.16.2 a token
+  count_tokens does not accept gets `claude -p "Reply with just: ok"` with the token as
+  `CLAUDE_CODE_OAUTH_TOKEN` (`--setting-sources project --strict-mcp-config
+  --no-session-persistence`, in the temp dir, about 4 s, one tiny Haiku turn on that account).
+  Only that run may refuse a token: a wrong one answered "API Error: 401 OAuth access token is
+  invalid". A plain `/v1/messages` call with an OAuth bearer answers 429 outside Claude Code,
+  so it is no test.
+- **The weekly figure rides on every reply.** Claude Code's replies carry
+  `anthropic-ratelimit-unified-7d-utilization=0.34` (a fraction), `-7d-reset=1794888000`
+  (epoch seconds) and `-7d-status` (`allowed`, `allowed_warning`, `rejected`). A verified Ultra
+  account sends no 5-hour headers. The router records them per token fingerprint in
+  `~/.agent-view/account-usage.json` (8 days, 20 entries: the `/login` access token has the
+  same `sk-ant-oat01-` prefix and rotates).
+- **Reading the token from `setup-token`.** Shell integration's `executeCommand` +
+  `read()` returns the raw output. A narrow terminal wraps the token, so
+  `tokenCandidates` offers joined and unjoined variants and the checks above pick the one that
+  works. The terminal is disposed once the token is stored; when nothing was stored it stays
+  open, because the token may be on screen there and nowhere else. The token never reaches a
+  log.
+
 
 ## The CHATS view
 
@@ -109,26 +146,64 @@ suppresses its closed row.
 
 ### Status dots
 
-Two states earn a badge, both meaning the chat wants something:
-
 | Badge | Meaning |
 | --- | --- |
-| orange `?` | The agent asked a multiple-choice question and is blocked on your answer |
-| blue `●` | The agent is working right now |
+| orange `?` | The agent asked a multiple-choice question (`AskUserQuestion`) or shows a plan to approve (`ExitPlanMode`) and is blocked on your answer |
+| blue `●` | The agent is working right now (`running`), or its turn ended while background agents, workflows or monitors it waits for still run (`background`) |
+| green `●` | A reply you have not read (`unread`), or a chat you set to **Mark as Unread** (`marked`) |
 
-A finished chat stays unmarked — it is the resting state, and badging it would put a mark on
-every row.
+A read, finished chat stays unmarked: it is the resting state.
 
-State is derived from three signals, all of which are needed:
+**Mark as Unread** (right-click an open Claude chat) stores `{ at, armed, label }` per session in
+globalState (`openEditorsTools.markedUnread`, newest 500). The mark is set unarmed, so reading on
+in the tab you marked it from does not clear it. It is armed when another tab comes to the front
+of the active group (a tab event, which also fires while the Chats view is hidden; `label` is the
+tab's label for that), when a render finds the chat's tab not in front, or when the chat has no tab
+here (closed). A window that only lost focus arms nothing. Looking at the tab again (in front,
+window focused) after that clears the mark, and so does a reply you type (`lastTypedAt` after the
+mark). A running chat or an open question still shows its own badge. globalState is shared by
+every window, so a flush applies only this window's changed marks onto what is stored and adopts
+the result: one window clearing or setting a mark does not undo another's.
 
-- The **last assistant message's `stop_reason`**. `tool_use` means the turn is mid-flight;
-  `end_turn` means it closed. This is the discriminator, because an aborted turn leaves its
-  `tool_use` blocks unanswered forever — an aborted session had two orphaned `Bash` calls that read as
-  "running" until `stop_reason` was brought in.
-- **Unanswered `tool_use` blocks** — each `tool_use` id is cleared when its `tool_result` lands.
-  An unanswered `AskUserQuestion` is what a pending multiple-choice question looks like.
+State is derived from these signals (`parseRecords`, `stateOf`, `withBackground`):
+
+- **Only the conversation's own records count.** Claude Code 2.1.330 also logs every request
+  body as an `api-request-blob` record: the conversation so far, old `tool_use` blocks included.
+  Read as calls, those replays reopened answered questions. Across 107 transcripts (2026-11-24)
+  that showed a stale `?` for 53 h while the agents worked. Records with `isSidechain` belong to
+  a subagent and are skipped too.
+- **Open calls belong to the newest answer.** Each `tool_use` id clears when its `tool_result`
+  lands. Every call is answered before the next request, so calls of an older answer (`message.id`)
+  that are still open are leftovers of an aborted turn and are dropped. A prompt or an interrupt
+  (`[Request interrupted by user`) also clears them.
+- **Awake.** An answer is written only once it is complete, so after a prompt the first record of
+  the turn can be minutes away. The parser keeps `awake`: true after any input (prompt, task
+  notification, injected context, hook feedback, tool result), an `api-request` record (a request
+  sent) or a `system` `api_error` (a retry); false after an answer with a final stop reason
+  (`end_turn`, `stop_sequence`, `max_tokens`, `refusal`), an interrupt or a local command
+  (`system` `local_command`, `<local-command-stdout>`). A slash command's echo and the
+  local-command caveat change nothing. Before this, a chat showed "done" for 25 h of work in the
+  same 107 transcripts (mostly the thinking time after a prompt and compaction).
+- **Background.** A turn that ended while the chat's background agents, workflows, tasks or
+  monitors still run reads `background` (blue): the agent goes on when they report back. A
+  subagent counts only when it wrote after the chat's last reply (a foreground agent finishes
+  before it). Background shells and persistent monitors stay out, since they never report back.
 - **`~/.claude/sessions/<pid>.json`**, which exists only while a session's process is alive. A
-  closed or crashed chat is idle no matter what its transcript's last turn looked like.
+  closed or crashed chat is idle no matter what its transcript's last turn looked like. Claude
+  Code 2.1.330 also keeps its own word there: `status` `busy` (a request or delegated work
+  running), `idle`, or `waiting` with `waitingFor` (a dialog, a permission, an input it needs),
+  stamped `statusUpdatedAt`. `waiting` reads as `?`. `busy` and `idle` count only when stamped
+  after the transcript's last write: `idle` then ends a turn the transcript left open (a killed
+  request, a failed retry), `busy` covers what writes no record (a stop hook running). `idle`
+  never hides an open question.
+
+`node tests/tools/status-replay.js [days]` replays the transcripts of the last days record by
+record through `readTranscript` and `stateOf` and compares the badge with what the whole transcript
+proves afterwards. On 2026-11-24, 107 transcripts and 1233 h on screen: 0.16.3 showed the right
+state 93.4 % of the time (53 h stale `?`, 25.6 h "done" while working), 0.16.4 99.7 %; most of the
+rest is blue for sessions a reload killed, which the live-process check turns idle.
+`tests/statustest.js` holds one synthetic case per rule. The saved parse states are version 3;
+states saved by version 2 still hold replayed calls and are read again from the start.
 
 Status rides as a `FileDecorationProvider` badge on a synthetic `claude-chat:` URI rather than a
 tinted icon, because the row icon is the Claude asterisk — an SVG VS Code renders as-is and will

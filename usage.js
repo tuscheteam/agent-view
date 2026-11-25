@@ -658,4 +658,4 @@ function watchCredentials(onChange) {
 	}
 }
 
-module.exports = { UsageCache, formatReset, planLabel, readClaudeUsage, readCodexUsage, codexExecutable, watchCredentials, retryAfterMs, tokenFingerprint };
+module.exports = { UsageCache, formatReset, planLabel, readClaudeUsage, readCodexUsage, codexExecutable, watchCredentials, retryAfterMs, tokenFingerprint, claudeBars };

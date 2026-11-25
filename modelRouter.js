@@ -403,6 +403,8 @@ function register(context, log, version) {
 			}
 			if (!router) {
 				router = new ModelRouter({ port, getKey, getPolicy: policyFor, log, version, onUsage: appendLedger,
+					// Weekly figures of added Claude accounts (accountsView.js).
+					observeAccounts: () => config().get('accounts.enabled', false),
 					// Authenticated: the unauthenticated model card is rate limited
 				// by IP, and one failed read must not cost an hour of images.
 				getModelInfo: async (model) => {

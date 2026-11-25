@@ -13,6 +13,8 @@
 // - model-menu rows marked "via Agent View" in ~/.claude/settings.json, and
 //   the global default model when it is one of those rows (a user's own
 //   vendor model stays);
+// - env.CLAUDE_CODE_OAUTH_TOKEN in ~/.claude/settings.json when the Accounts
+//   panel wrote it (~/.agent-view/accounts-written.json holds its fingerprint);
 // A settings file that does not parse as plain JSON (JSONC comments) is left
 // untouched; the README's manual steps cover that case.
 const fs = require('fs');
@@ -97,6 +99,16 @@ try {
 		try { if (stripRouterEnv(file)) console.log(`agent-view uninstall: removed router environment entries from ${file}`); } catch (_) { /* locked or read-only */ }
 	}
 	try { if (stripPickerRows()) console.log('agent-view uninstall: removed Agent View rows from the Claude Code model menu'); } catch (_) { /* locked or read-only */ }
+	// An added Claude account the Accounts panel put into Claude Code's
+	// settings: back to the /login account. A token the user set by hand stays.
+	try {
+		const accounts = require('./accounts');
+		const token = accounts.activeToken();
+		if (token && accounts.wroteToken(token)) {
+			accounts.writeActiveToken(null);
+			console.log('agent-view uninstall: Claude Code runs on the /login account again');
+		}
+	} catch (_) { /* locked or read-only */ }
 	// Without the router a bare "deepseek" subagent has nowhere to go: give
 	// Claude Code its original Agent tool model list back.
 	try { require('./tools/patch-claude.cjs').main(['--undo']); } catch (_) { /* binary in use or gone */ }

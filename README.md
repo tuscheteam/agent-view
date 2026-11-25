@@ -12,9 +12,9 @@ your account's rate-limit windows drawn as bars above them.
 | --- | --- |
 | `450k/1.0M` | Context in play vs the model's window — the last request's input + cache |
 | `$12.34` | What the session's tokens (subagents included) would bill at list API rates. A Claude subscription is not billed this way; it is a what-if figure |
-| blue `●` badge | The agent is working right now |
-| orange `?` badge | The agent asked a question and is blocked on your answer |
-| green `●` badge | The agent replied and you have not read it yet. Clears when you look at the tab, or when you reply |
+| blue `●` badge | The agent is working right now: from your message on (also while it still thinks before the first word), through tool calls, retries and hook feedback, and while background agents, workflows or monitors it waits for still run |
+| orange `?` badge | The agent asked a question (or shows a plan to approve) and is blocked on your answer. Answered questions clear at once |
+| green `●` badge | The agent replied and you have not read it yet. Clears when you look at the tab, or when you reply. Right-click an open chat → **Mark as Unread** makes a read chat green again, to answer later: it stays green until you open it again (after switching to another tab) or reply in it |
 | `⠹` child rows | Subagents working in the last 2 minutes, named by their spawn description, with model, total tokens, age and cost. Codex subagents appear the same way, named by the nickname Codex gave them |
 | `🕘` rows | Chats whose tab was closed; click to reopen the session. A chat still running without a tab here reads "open elsewhere", or "in Claude's side panel" when Claude Code's own side panel shows it. Tabs in the side column read "side panel" |
 | "N tabs without a transcript" | Open Claude tabs with nothing to list: a new chat with no message sent yet, or a chat whose transcript is no longer on this machine (Claude Code deletes chats idle longer than `cleanupPeriodDays`, 30 days unless set). Click to show or hide them |
@@ -41,6 +41,13 @@ The list is one history by recency. Sections are folders on top of it: drag a
 chat onto a section node, or right-click it and pick **Move to Section…**, and
 the chat leaves the flat list and sits under that section. Every other chat
 stays where it was, so a list without sections looks exactly as before.
+
+**Archive Chat** (right-click) takes a chat out of the list. A row at the bottom,
+"N archived chats", shows them again; right-click one and choose **Unarchive
+Chat** to keep it. An archived chat also comes back by itself when you type a
+message in it (a Codex thread: when it is used again), or when you open it
+from **Open Claude Session** or the Codex thread picker. Task notifications and
+compaction summaries do not count as a message.
 
 **New Section** in the view's title bar creates one. Right-click a section to
 rename or delete it; deleting a section puts its chats back in the history and
@@ -248,6 +255,53 @@ Every feature beyond the chat list has a switch in Settings (search
 (`leaderboard.showDeepSeek` `auto`). Set `leaderboard.showDeepSeek` to
 `never` to hide it even while the router runs.
 
+## Accounts: several Claude subscriptions (optional, off by default)
+
+For people with more than one Claude subscription, for example a second Ultra
+account for the days after the first one has used its week. With one account
+leave it off: there is nothing to switch.
+
+Turn on **`openEditorsTools.accounts.enabled`** (or run **Agent View: Show
+Accounts Panel**). The **Accounts** panel lists the account you signed in with
+(`/login`) and every account you added, each with its weekly bar. The account
+in use carries an orange rule on its left. The panel itself has no buttons:
+**+** (Add Claude Account), the eye and **Refresh** sit in its title bar, and a
+right-click on an account opens **Use This Account**, **Rename Account...** and
+**Remove Account...**.
+
+- **+** opens a terminal that runs `claude setup-token`. Sign in in
+  the browser with the account to add. Agent View reads the token from the
+  terminal, checks it with Anthropic, stores it in VS Code's credential store
+  and closes the terminal. Where the terminal output cannot be read, a password
+  box asks you to paste the token. **Cancel** stops a sign-in you abandoned.
+  When no token could be stored, the terminal stays open with the token in it.
+- **Use This Account** switches every Claude Code chat to that account. Agent View writes the
+  token as `CLAUDE_CODE_OAUTH_TOKEN` into the `env` block of
+  `~/.claude/settings.json`; using the `/login` account takes it out again. New
+  chats start on the new account at once, open chats after **Reload Window**
+  (a reload stops replies that are still running). Chats, skills, settings and
+  memory stay where they are: nothing is copied, and old chats continue on the
+  new account.
+- When the account in use has spent its week (or its 5-hour window), the panel
+  says so and offers an account that still has room.
+- **Rename Account...** and **Remove Account...** exist for added accounts.
+  Remove does not revoke the token; it stays valid for its year.
+- The eye in the title bar blurs every account name (for a screenshot or a
+  shared screen) until it is pressed again. The blurred rows hold placeholder
+  text, so the names cannot be read back from the pixels; the Usage bars say
+  "Added account" meanwhile.
+- A token you put into the settings by hand shows as "not in this list", with
+  **Add it to the list**; a switch asks before it would overwrite it.
+- Turning the panel off, or uninstalling Agent View, leaves Claude Code on the
+  account in use; Agent View offers to go back to `/login`, and an uninstall
+  removes a token the panel wrote.
+
+While an added account is in use, the Claude bar in Usage and Leaderboard shows
+that account. A token from `claude setup-token` may only run chats; Anthropic
+may refuse it the usage lookup. Its bar then comes from the rate-limit figures
+on its replies, which the model router records; without the router it fills in
+once the usage lookup answers. A token lasts one year.
+
 ## Quiet timeline (optional)
 
 **Agent View: Restyle Claude Panel** collapses Claude Code's chat timeline the
@@ -433,6 +487,7 @@ running there.
 | `openEditorsTools.subagentRecommendation.enabled` | `true` | Write `~/.agent-view/subagent-recommendation.json` |
 | `openEditorsTools.subagentExcludeModels` | `["claude-fable-5-1", "gpt-6-astra"]` | Models never recommended as subagents |
 | `openEditorsTools.claudeCodeAutoRepair` | `true` | Re-apply the chat-rename fix to new Claude Code installs at startup |
+| `openEditorsTools.accounts.enabled` | `false` | Accounts panel: switch all Claude Code chats between several Claude subscriptions |
 | `openEditorsTools.modelRouter.enabled` | `false` | Run the model router (OpenRouter models in Claude Code) |
 | `openEditorsTools.modelRouter.pickerModels` | `["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-pro"]` | OpenRouter models listed in Claude Code's model menu |
 | `openEditorsTools.modelRouter.requireZeroDataRetention` | `true` | `false` also admits non-ZDR providers into the ranking and probes (re-check provider order for it to take effect) |
@@ -465,6 +520,13 @@ Everything runs locally. Concretely, the extension:
   per-reply costs to `~/.agent-view/router-usage.jsonl` and provider checks to
   `~/.agent-view/router-providers.json`; `~/.agent-view/router-secret` lets the routers of
   several VS Code windows recognise each other. Your Claude login is never sent to OpenRouter;
+- with the Accounts panel on: keeps the tokens of added Claude accounts in VS Code's credential
+  store, writes the one in use into `~/.claude/settings.json`, checks a token with
+  `https://api.anthropic.com/v1/messages/count_tokens` (free) or, when that check does not
+  accept a setup-token, with one short `claude -p` turn on that account, and asks
+  `https://api.anthropic.com/api/oauth/profile` and `/api/oauth/usage` for its name and usage.
+  The model router stores the rate-limit figures of replies per token fingerprint (never the
+  token) in `~/.agent-view/account-usage.json`;
 - sends nothing anywhere else.
 
 ## Trademarks

@@ -3,7 +3,7 @@
   "displayName": "Agent View",
   "description": "One panel for every Claude Code and Codex chat: live status, context, cost, running subagents and account usage.",
   "publisher": "tuscheteam",
-  "version": "0.15.28",
+  "version": "0.16.5",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -186,6 +186,12 @@
           "default": [],
           "description": "ssh hosts whose Claude Code chats join this list. A host needs the claude command on PATH and a key-based ssh login. Transcripts are read over ssh once a minute; clicking a row opens a resume session there in a terminal.",
           "scope": "application"
+        },
+        "openEditorsTools.accounts.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "Show the **Accounts** panel: switch every Claude Code chat between several Claude subscriptions (for example a second Ultra account when the first one has used its week) without `/login`. Off by default: with one Claude account there is nothing to switch. **Add account** runs `claude setup-token`; the tokens of added accounts stay in VS Code’s credential store, and the one in use is also written to `~/.claude/settings.json` (`env.CLAUDE_CODE_OAUTH_TOKEN`), where Claude Code reads it."
         }
       }
     },
@@ -419,6 +425,11 @@
         "category": "Agent View"
       },
       {
+        "command": "openEditorsTools.markChatUnread",
+        "title": "Mark as Unread",
+        "category": "Agent View"
+      },
+      {
         "command": "openEditorsTools.archiveChat",
         "title": "Archive Chat",
         "category": "Agent View"
@@ -438,6 +449,54 @@
         "command": "openEditorsTools.removeFromSection",
         "title": "Remove from Section",
         "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.showAccounts",
+        "title": "Show Accounts Panel",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.addClaudeAccount",
+        "title": "Add Claude Account",
+        "category": "Agent View",
+        "icon": "$(add)",
+        "enablement": "config.openEditorsTools.accounts.enabled"
+      },
+      {
+        "command": "openEditorsTools.refreshAccounts",
+        "title": "Refresh Claude Accounts",
+        "category": "Agent View",
+        "icon": "$(refresh)",
+        "enablement": "config.openEditorsTools.accounts.enabled"
+      },
+      {
+        "command": "openEditorsTools.useClaudeAccount",
+        "title": "Use This Account",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.renameClaudeAccount",
+        "title": "Rename Account...",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.removeClaudeAccount",
+        "title": "Remove Account...",
+        "category": "Agent View"
+      },
+      {
+        "command": "openEditorsTools.hideAccountNames",
+        "title": "Hide Account Names",
+        "category": "Agent View",
+        "icon": "$(eye-closed)",
+        "enablement": "config.openEditorsTools.accounts.enabled"
+      },
+      {
+        "command": "openEditorsTools.showAccountNames",
+        "title": "Show Account Names",
+        "category": "Agent View",
+        "icon": "$(eye)",
+        "enablement": "config.openEditorsTools.accounts.enabled"
       }
     ],
     "viewsContainers": {
@@ -468,6 +527,13 @@
           "type": "webview",
           "initialSize": 2,
           "visibility": "visible"
+        },
+        {
+          "id": "openEditorsTools.accounts",
+          "name": "Accounts",
+          "type": "webview",
+          "initialSize": 1,
+          "when": "config.openEditorsTools.accounts.enabled"
         }
       ]
     },
@@ -519,6 +585,55 @@
         {
           "command": "openEditorsTools.openChatInSidePanel",
           "when": "false"
+        },
+        {
+          "command": "openEditorsTools.markChatUnread",
+          "when": "false"
+        },
+        {
+          "command": "openEditorsTools.addClaudeAccount",
+          "when": "config.openEditorsTools.accounts.enabled"
+        },
+        {
+          "command": "openEditorsTools.refreshAccounts",
+          "when": "config.openEditorsTools.accounts.enabled"
+        },
+        {
+          "command": "openEditorsTools.useClaudeAccount",
+          "when": "false"
+        },
+        {
+          "command": "openEditorsTools.renameClaudeAccount",
+          "when": "false"
+        },
+        {
+          "command": "openEditorsTools.removeClaudeAccount",
+          "when": "false"
+        },
+        {
+          "command": "openEditorsTools.hideAccountNames",
+          "when": "config.openEditorsTools.accounts.enabled && !openEditorsTools.accountNamesHidden"
+        },
+        {
+          "command": "openEditorsTools.showAccountNames",
+          "when": "config.openEditorsTools.accounts.enabled && openEditorsTools.accountNamesHidden"
+        }
+      ],
+      "webview/context": [
+        {
+          "command": "openEditorsTools.useClaudeAccount",
+          "when": "webviewId == 'openEditorsTools.accounts' && webviewSection == 'account' && !accountActive && !accountsBusy",
+          "group": "1_use@1"
+        },
+        {
+          "command": "openEditorsTools.renameClaudeAccount",
+          "when": "webviewId == 'openEditorsTools.accounts' && webviewSection == 'account' && accountKind == 'token' && !accountsBusy",
+          "group": "2_edit@1"
+        },
+        {
+          "command": "openEditorsTools.removeClaudeAccount",
+          "when": "webviewId == 'openEditorsTools.accounts' && webviewSection == 'account' && accountKind == 'token' && !accountsBusy",
+          "group": "2_edit@2"
         }
       ],
       "view/item/context": [
@@ -546,6 +661,11 @@
           "command": "openEditorsTools.removeFromSection",
           "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|closedClaudeChat|codexChat|closedCodexChat|codexLiveChat|codexClosedChat|remoteChat|claudeChatArchived|closedClaudeChatArchived|codexChatArchived|closedCodexChatArchived|codexLiveChatArchived|codexClosedChatArchived|remoteChatArchived)$/",
           "group": "section@2"
+        },
+        {
+          "command": "openEditorsTools.markChatUnread",
+          "when": "view == openEditorsTools.chats && viewItem =~ /^(claudeChat|claudeChatArchived)$/",
+          "group": "read@1"
         },
         {
           "command": "openEditorsTools.archiveChat",
@@ -638,6 +758,26 @@
           "command": "openEditorsTools.toggleArchivedChats",
           "when": "view == openEditorsTools.chats",
           "group": "navigation@7"
+        },
+        {
+          "command": "openEditorsTools.addClaudeAccount",
+          "when": "view == openEditorsTools.accounts",
+          "group": "navigation@0"
+        },
+        {
+          "command": "openEditorsTools.hideAccountNames",
+          "when": "view == openEditorsTools.accounts && !openEditorsTools.accountNamesHidden",
+          "group": "navigation@1"
+        },
+        {
+          "command": "openEditorsTools.showAccountNames",
+          "when": "view == openEditorsTools.accounts && openEditorsTools.accountNamesHidden",
+          "group": "navigation@1"
+        },
+        {
+          "command": "openEditorsTools.refreshAccounts",
+          "when": "view == openEditorsTools.accounts",
+          "group": "navigation@2"
         }
       ]
     }

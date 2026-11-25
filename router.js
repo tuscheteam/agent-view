@@ -14,6 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { fingerprint } = require('./modelPins');
+const { recordObserved } = require('./accounts');
 const { StringDecoder } = require('string_decoder');
 
 const ROUTER_ID = 'agent-view-model-router';
@@ -270,7 +271,7 @@ function relayBreaks(upRes, res) {
 	upRes.on('close', broken);
 }
 
-function forward(base, req, res, body, headers, onDone) {
+function forward(base, req, res, body, headers, onDone, onHeaders) {
 	const target = new URL(base);
 	const pathPrefix = target.pathname.replace(/\/$/, '');
 	const lib = target.protocol === 'http:' ? http : https;
@@ -288,6 +289,7 @@ function forward(base, req, res, body, headers, onDone) {
 		for (const [k, v] of Object.entries(upRes.headers)) if (!HOP_BY_HOP.has(k)) resHeaders[k] = v;
 		res.writeHead(upRes.statusCode || 502, resHeaders);
 		relayBreaks(upRes, res);
+		if (onHeaders) { try { onHeaders(upRes.statusCode, upRes.headers); } catch (_) { /* bookkeeping never breaks a reply */ } }
 		if (onDone) {
 			const chunks = [];
 			upRes.on('data', (c) => { chunks.push(c); res.write(c); });
@@ -439,6 +441,11 @@ class ModelRouter {
 		this.getModelInfo = options.getModelInfo || (async () => ({ images: false, documents: false }));
 		this.log = options.log || (() => {});
 		this.onUsage = options.onUsage || (() => {});
+		// Where the weekly figures of setup-token accounts go (accounts.js); tests
+		// point it at a temp file.
+		this.observedFile = options.observedFile || undefined;
+		// Only while the Accounts panel is on; off by default.
+		this.observeAccounts = options.observeAccounts || (() => false);
 		// A provider rejected a request that another provider then served.
 		this.onReject = options.onReject || (() => {});
 		// Shared by every Agent View window of this user. A window trusts a
@@ -664,7 +671,10 @@ class ModelRouter {
 			}
 			this.stats.anthropic++;
 			const body = req.method === 'GET' || req.method === 'HEAD' ? null : anthropicBody(rawOut, jsonOut);
-			forward(this.anthropicBase, req, res, body, headersOut, onDone);
+			// The weekly figure of a setup-token account (Accounts panel): only
+			// replies sent with such a token are kept, by fingerprint.
+			const observe = (status, upHeaders) => { if ((status === 200 || status === 429) && this.observeAccounts()) recordObserved(headersOut, upHeaders, this.observedFile); };
+			forward(this.anthropicBase, req, res, body, headersOut, onDone, observe);
 		});
 	}
 

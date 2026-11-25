@@ -111,7 +111,27 @@ class UsageViewProvider {
 		font-size: var(--vscode-font-size);
 		color: var(--vscode-foreground);
 	}
-	.usage .urow + .urow { margin-top: 10px; }
+	${usageRules()}
+	${widthRules}
+</style>
+</head>
+<body>
+<div class="usage">
+${rows}
+</div>
+</body>
+</html>`;
+	}
+
+	_row(name, cls, usage, widths) {
+		return usageRow(name, cls, usage, widths);
+	}
+}
+
+// The bar rules, scoped under .usage. The Accounts panel draws its bars with
+// the same rules and markup, so both panels read alike.
+function usageRules() {
+	return `.usage .urow + .urow { margin-top: 10px; }
 	.usage .head {
 		display: flex;
 		align-items: baseline;
@@ -132,15 +152,13 @@ class UsageViewProvider {
 	}
 	.usage .win .label { color: var(--vscode-descriptionForeground); }
 	.usage .win .pct { text-align: right; font-variant-numeric: tabular-nums; }
+	/* Secondary text differs by colour alone, at the panel's own size, as in
+	   VS Code's trees: 0.9em made 11.7px out of the default 13px. */
 	.usage .win .reset {
 		text-align: right;
 		color: var(--vscode-descriptionForeground);
-		font-size: 0.9em;
 	}
-	.usage .sub {
-		color: var(--vscode-descriptionForeground);
-		font-size: 0.9em;
-	}
+	.usage .sub { color: var(--vscode-descriptionForeground); }
 	/* Spans, not divs, so they sit in the grid row — which means they need an
 	   explicit display or they collapse to inline height. */
 	.usage .track {
@@ -155,48 +173,40 @@ class UsageViewProvider {
 	.usage .codex .fill { background: ${CODEX_FILL_DARK}; }
 	/* White disappears on a light theme; fall back to the logo's own grey. */
 	body.vscode-light .usage .codex .fill { background: ${CODEX_FILL_LIGHT}; }
-	.usage .muted { color: var(--vscode-descriptionForeground); }
-	${widthRules}
-</style>
-</head>
-<body>
-<div class="usage">
-${rows}
-</div>
-</body>
-</html>`;
-	}
+	.usage .muted { color: var(--vscode-descriptionForeground); }`;
+}
 
-	_row(name, cls, usage, widths) {
-		if (!usage) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span><span class="muted">checking…</span></div></div>`;
-		if (usage.error) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span></div><div class="sub">${escapeHtml(failureText(usage))}</div></div>`;
-		if (!usage.windows.length) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span><span class="muted">no limits reported</span></div></div>`;
+// One product's (or account's) bars. widths collects the bar widths the
+// caller turns into .wN rules.
+function usageRow(name, cls, usage, widths) {
+	if (!usage) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span><span class="muted">checking…</span></div></div>`;
+	if (usage.error) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span></div><div class="sub">${escapeHtml(failureText(usage))}</div></div>`;
+	if (!usage.windows.length) return `<div class="urow ${cls}"><div class="head"><span class="uname">${name}</span><span class="muted">no limits reported</span></div></div>`;
 
-		const lines = usage.windows
-			.map(([label, w]) => {
-				const pct = clamp(w.pct);
-				widths.add(pct);
-				const reset = w.resetsAt ? formatReset(w.resetsAt) : '';
-				// title= gives a native tooltip, which spells out what the
-				// right-hand column means without spending a line on it.
-				return `<div class="win" title="${escapeHtml(label)} window · ${pct}% used${reset ? ` · resets in ${escapeHtml(reset)}` : ''}">
-		<span class="label">${escapeHtml(label)}</span>
-		<span class="track"><span class="fill w${pct}"></span></span>
-		<span class="pct">${pct}%</span>
-		<span class="reset">${escapeHtml(reset)}</span>
-	</div>`;
-			})
-			.join('\n');
+	const lines = usage.windows
+		.map(([label, w]) => {
+			const pct = clamp(w.pct);
+			widths.add(pct);
+			const reset = w.resetsAt ? formatReset(w.resetsAt) : '';
+			// title= gives a native tooltip, which spells out what the
+			// right-hand column means without spending a line on it.
+			return `<div class="win" title="${escapeHtml(label)} window · ${pct}% used${reset ? ` · resets in ${escapeHtml(reset)}` : ''}">
+	<span class="label">${escapeHtml(label)}</span>
+	<span class="track"><span class="fill w${pct}"></span></span>
+	<span class="pct">${pct}%</span>
+	<span class="reset">${escapeHtml(reset)}</span>
+</div>`;
+		})
+		.join('\n');
 
-		// No line under the bars for a lookup that merely waited: the age and
-		// the next try stay in the row tooltip, where they explain the numbers
-		// without reading as a defect on a healthy panel.
-		const stale = '';
-		return `<div class="urow ${cls}">
-	<div class="head"><span class="uname">${name}</span><span class="sub" title="${escapeHtml(usage.stale ? staleText(usage.stale) : usage.plan || '')}">${escapeHtml(usage.plan || '')}</span></div>
+	// No line under the bars for a lookup that merely waited: the age and
+	// the next try stay in the row tooltip, where they explain the numbers
+	// without reading as a defect on a healthy panel.
+	const stale = '';
+	return `<div class="urow ${cls}">
+<div class="head"><span class="uname">${name}</span><span class="sub" title="${escapeHtml(usage.stale ? staleText(usage.stale) : usage.plan || '')}">${escapeHtml(usage.plan || '')}</span></div>
 ${lines}${stale}
 </div>`;
-	}
 }
 
 // "as of 12m · rate-limited, next try in 6m": the bars are the last good
@@ -242,4 +252,4 @@ function escapeHtml(text) {
 	return String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
-module.exports = { UsageViewProvider };
+module.exports = { UsageViewProvider, usageRow, usageRules, escapeHtml, CLAUDE_FILL };
